@@ -1,0 +1,642 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>appclone GUI — 三屏高保真设计稿（libadwaita）</title>
+<!--
+  FLOW: appclone GUI 三屏完整版
+  SCREEN 1/3  应用列表页（默认 / 空态 / 错误横幅 三种状态，由顶部「状态演示」切换）
+  SCREEN 2/3  应用详情页（实例管理：启动 / 删除 / 内联重命名 / 新建分身）
+  SCREEN 3/3  discover 路径勾选对话框（AdwDialog，首次配置与新建分身两种入口模式）
+  组件映射：AdwWindow + AdwHeaderBar / AdwPreferencesPage + AdwPreferencesGroup + boxed AdwActionRow
+            （开关 = AdwActionRow + GtkSwitch suffix，GNOME Settings 通用模式）
+            AdwBanner / AdwStatusPage / AdwDialog / AdwToast(AdwToastOverlay) / GtkCheckButton prefix
+-->
+<style>
+  /* ============ Adwaita 主题变量（浅色 = libadwaita 默认；深色 = style.dark） ============ */
+  :root {
+    --win-bg:#fafafb; --view:#ffffff; --hb:#ffffff;
+    --fg:rgba(0,0,0,.8); --dim:rgba(0,0,0,.55); --faint:rgba(0,0,0,.38);
+    --border:rgba(0,0,0,.12); --hover:rgba(0,0,0,.035); --active:rgba(0,0,0,.08);
+    --accent:#3584e4; --accent-fg:#ffffff;
+    --destructive:#e01b24;
+    --switch-off:rgba(0,0,0,.18); --switch-knob:#ffffff;
+    --toast-bg:rgba(60,60,64,.96); --toast-fg:#ffffff;
+    --backdrop:rgba(0,0,0,.36);
+    --desktop:#c8c8cd;
+    --chip-blue-bg:rgba(53,132,228,.12); --chip-orange-bg:rgba(252,127,0,.12);
+    --chip-orange-fg:#c64600;
+  }
+  html.dark {
+    --win-bg:#222226; --view:#303034; --hb:#303034;
+    --fg:#ffffff; --dim:rgba(255,255,255,.6); --faint:rgba(255,255,255,.4);
+    --border:rgba(255,255,255,.12); --hover:rgba(255,255,255,.06); --active:rgba(255,255,255,.12);
+    --destructive:#ff938c;
+    --switch-off:rgba(255,255,255,.25);
+    --toast-bg:rgba(255,255,255,.96); --toast-fg:rgba(0,0,0,.8);
+    --backdrop:rgba(0,0,0,.44);
+    --desktop:#111114;
+    --chip-blue-bg:rgba(120,174,237,.14); --chip-orange-bg:rgba(252,127,0,.16);
+    --chip-orange-fg:#ffb17a;
+  }
+  * { box-sizing:border-box; margin:0; padding:0 }
+  body {
+    font-family:"Adwaita Sans","Cantarell",system-ui,-apple-system,"Segoe UI",sans-serif;
+    background:var(--desktop); color:var(--fg); min-height:100vh; padding:0 0 60px;
+    transition:background .3s;
+  }
+  :focus-visible { outline:2px solid var(--accent); outline-offset:2px; border-radius:6px }
+
+  /* ============ 设计稿控制条（非产品 UI） ============ */
+  .toolbar {
+    position:sticky; top:0; z-index:50; display:flex; align-items:center; gap:14px; flex-wrap:wrap;
+    padding:10px 18px; background:rgba(20,20,24,.92); color:#fff; backdrop-filter:blur(8px);
+  }
+  .toolbar .title { font-size:13px; font-weight:700; opacity:.9; margin-right:4px }
+  .toolbar .tabs { display:flex; gap:4px }
+  .toolbar .tab {
+    border:none; background:transparent; color:rgba(255,255,255,.65); font-size:13px;
+    padding:6px 12px; border-radius:7px; cursor:pointer;
+  }
+  .toolbar .tab:hover { background:rgba(255,255,255,.08); color:#fff }
+  .toolbar .tab[aria-selected="true"] { background:rgba(255,255,255,.16); color:#fff; font-weight:600 }
+  .toolbar .spacer { flex:1 }
+  .toolbar .chipbtn {
+    border:none; background:rgba(255,255,255,.08); color:rgba(255,255,255,.7);
+    font-size:12px; padding:5px 11px; border-radius:20px; cursor:pointer;
+  }
+  .toolbar .chipbtn:hover { background:rgba(255,255,255,.16); color:#fff }
+  .toolbar .chipbtn.on { background:#3584e4; color:#fff }
+
+  /* ============ GNOME 窗口外壳 ============ */
+  .stage { display:flex; justify-content:center; padding:34px 16px 8px }
+  .window {
+    position:relative; width:880px; max-width:100%; border-radius:12px; overflow:hidden;
+    background:var(--win-bg); box-shadow:0 22px 60px rgba(0,0,0,.35), 0 0 0 1px rgba(0,0,0,.08);
+    display:flex; flex-direction:column;
+  }
+  .headerbar {
+    display:grid; grid-template-columns:1fr auto 1fr; align-items:center;
+    height:47px; padding:0 6px 0 8px; background:var(--hb); border-bottom:1px solid var(--border);
+  }
+  .hb-left { display:flex; align-items:center; gap:2px; min-width:0 }
+  .hb-title { font-size:14.5px; font-weight:700; grid-column:2; text-align:center }
+  .hb-right { display:flex; align-items:center; justify-content:flex-end; gap:10px }
+  .wincontrols { display:flex; gap:11px; padding-right:7px }
+  .wc { width:22px; height:22px; border-radius:50%; background:rgba(0,0,0,.14); cursor:default }
+  html.dark .wc { background:rgba(255,255,255,.16) }
+  .wc.close:hover { background:#e01b24 }
+  .wc.min:hover, .wc.max:hover { background:rgba(0,0,0,.28) }
+  html.dark .wc.min:hover, html.dark .wc.max:hover { background:rgba(255,255,255,.3) }
+
+  /* AdwBanner（错误状态：bwrap 缺失） */
+  .banner {
+    display:none; align-items:center; gap:10px; padding:9px 14px; font-size:13.5px;
+    background:rgba(224,27,36,.1); color:var(--destructive); border-bottom:1px solid var(--border);
+  }
+  .banner.show { display:flex }
+  .banner button {
+    margin-left:auto; border:none; background:transparent; color:inherit; font-size:13px;
+    cursor:pointer; padding:3px 8px; border-radius:6px;
+  }
+  .banner button:hover { background:rgba(224,27,36,.1) }
+
+  .content { padding:18px 24px 26px; min-height:430px }
+
+  /* ============ AdwPreferencesGroup + boxed list ============ */
+  .group { margin-bottom:26px }
+  .group-label { font-size:13px; font-weight:700; color:var(--dim); padding:0 3px 7px }
+  .boxed { background:var(--view); border:1px solid var(--border); border-radius:12px; overflow:hidden }
+  .boxed .boxed-note { padding:9px 14px; font-size:12.5px; color:var(--dim); border-top:1px solid var(--border) }
+
+  .row {
+    display:flex; align-items:center; gap:13px; min-height:54px; padding:8px 14px;
+    font-size:14px; position:relative;
+  }
+  .row + .row { border-top:1px solid var(--border) }
+  .row.activatable { cursor:pointer }
+  .row.activatable:hover { background:var(--hover) }
+  .row-titles { flex:1; min-width:0 }
+  .row-title { display:flex; align-items:center; gap:8px }
+  .row-sub { font-size:12.5px; color:var(--dim); margin-top:2px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap }
+  .row-sub .mono { font-family:ui-monospace,"JetBrains Mono",monospace; font-size:12px }
+  .row .chev { color:var(--faint); font-size:17px; margin-left:2px }
+
+  .appicon {
+    width:34px; height:34px; border-radius:9px; flex:none;
+    display:grid; place-items:center; color:#fff; font-size:15px; font-weight:700;
+    box-shadow:inset 0 -10px 14px rgba(0,0,0,.1);
+  }
+  .insticon {
+    width:34px; height:34px; border-radius:9px; flex:none; position:relative;
+    display:grid; place-items:center; color:var(--dim); font-size:17px; font-weight:700;
+    background:var(--hover); border:1px dashed var(--border);
+  }
+  .insticon::after {
+    content:""; position:absolute; right:-4px; bottom:-4px; width:13px; height:13px;
+    border-radius:4px; background:var(--accent);
+  }
+
+  /* GtkSwitch（AdwActionRow suffix） */
+  .switch { position:relative; flex:none; width:47px; height:26px; cursor:pointer }
+  .switch input { position:absolute; opacity:0; width:100%; height:100%; cursor:pointer; margin:0 }
+  .switch .track {
+    position:absolute; inset:0; border-radius:13px; background:var(--switch-off); transition:background .2s;
+  }
+  .switch .knob {
+    position:absolute; top:2px; left:2px; width:22px; height:22px; border-radius:50%;
+    background:var(--switch-knob); box-shadow:0 1px 2px rgba(0,0,0,.2);
+    transition:left .2s cubic-bezier(.2,.8,.3,1); display:grid; place-items:center;
+    font-size:12px; font-weight:700; color:transparent;
+  }
+  .switch input:checked ~ .track { background:var(--accent) }
+  .switch input:checked ~ .knob { left:23px; color:var(--accent) }
+  .switch input:checked ~ .knob::before { content:"✓" }
+  .switch input:focus-visible ~ .track { outline:2px solid var(--accent); outline-offset:2px }
+
+  /* 按钮 */
+  .btn {
+    border:none; font:inherit; font-size:13.5px; padding:6px 13px; border-radius:7px;
+    background:transparent; color:var(--fg); cursor:pointer;
+  }
+  .btn:hover { background:var(--hover) }
+  .btn.small { font-size:13px; padding:4.5px 11px }
+  .btn.suggested { background:var(--accent); color:var(--accent-fg); font-weight:600 }
+  .btn.suggested:hover { background:#2f76cf; }
+  html.dark .btn.suggested:hover { background:#4a90e4 }
+  .btn.suggested:disabled { opacity:.45; cursor:default }
+  .btn.suggested:disabled:hover { background:var(--accent) }
+  .btn.destructive { color:var(--destructive) }
+  .btn.destructive:hover { background:rgba(224,27,36,.08) }
+  .btn.link { color:var(--accent) }
+  .btn.link:hover { background:var(--chip-blue-bg) }
+
+  /* 空态：AdwStatusPage */
+  .statuspage { text-align:center; padding:46px 20px 38px }
+  .clone-ic { position:relative; width:74px; height:74px; margin:0 auto 22px }
+  .clone-ic .sq1, .clone-ic .sq2 {
+    position:absolute; width:52px; height:52px; border-radius:14px;
+    background:var(--chip-blue-bg); border:2px solid var(--accent);
+  }
+  .clone-ic .sq2 { top:20px; left:20px; background:var(--view) }
+  .statuspage h3 { font-size:19px; font-weight:700; margin-bottom:9px }
+  .statuspage p { font-size:14px; color:var(--dim); max-width:420px; margin:0 auto; line-height:1.55 }
+
+  /* ============ AdwToast（ToastOverlay） ============ */
+  .toast {
+    position:absolute; left:50%; bottom:14px; transform:translate(-50%,14px); opacity:0;
+    background:var(--toast-bg); color:var(--toast-fg); padding:9px 16px; border-radius:10px;
+    font-size:13.5px; pointer-events:none; transition:.28s cubic-bezier(.2,.8,.3,1);
+    box-shadow:0 4px 16px rgba(0,0,0,.25); z-index:40; white-space:nowrap;
+  }
+  .toast.show { opacity:1; transform:translate(-50%,0) }
+
+  /* ============ AdwDialog（discover 路径勾选） ============ */
+  .overlay {
+    position:absolute; inset:0; background:var(--backdrop); z-index:30;
+    display:none; align-items:center; justify-content:center; backdrop-filter:blur(2px);
+  }
+  .overlay.open { display:flex }
+  .dialog {
+    width:520px; max-width:calc(100% - 32px); background:var(--view); border-radius:14px;
+    box-shadow:0 18px 46px rgba(0,0,0,.3); overflow:hidden;
+    display:flex; flex-direction:column; animation:dlg .22s cubic-bezier(.2,.8,.3,1);
+  }
+  @keyframes dlg { from { transform:scale(.94); opacity:0 } }
+  .dialog-head { padding:20px 20px 4px; text-align:center }
+  .dialog-head h3 { font-size:16px; font-weight:700 }
+  .dialog-head p { font-size:13px; color:var(--dim); margin-top:6px; line-height:1.5 }
+  .dialog-body { padding:10px 14px; max-height:330px; overflow:auto }
+  .dialog-foot {
+    display:flex; justify-content:flex-end; gap:8px; padding:12px 14px;
+    border-top:1px solid var(--border);
+  }
+  .chkrow {
+    display:flex; align-items:center; gap:11px; padding:9px 10px; border-radius:9px;
+    cursor:pointer; font-size:13px;
+  }
+  .chkrow:hover { background:var(--hover) }
+  .chkrow + .chkrow { margin-top:2px }
+  .chkrow .path { font-family:ui-monospace,monospace; font-size:12.5px }
+  .chkrow .why { font-size:11.5px; color:var(--dim); margin-top:2px }
+  .chkrow .tt { flex:1; min-width:0 }
+  .chkrow input { position:absolute; opacity:0; pointer-events:none }
+  .cb {
+    flex:none; width:17px; height:17px; border-radius:4px; border:2px solid rgba(0,0,0,.25);
+    display:grid; place-items:center; color:transparent; font-size:12px; font-weight:700; margin-left:3px;
+  }
+  html.dark .cb { border-color:rgba(255,255,255,.35) }
+  .chkrow input:checked ~ .cb { background:var(--accent); border-color:var(--accent); color:#fff }
+  .cb::before { content:"✓" }
+  .chkrow input:focus-visible ~ .cb { outline:2px solid var(--accent); outline-offset:2px }
+  .chip { flex:none; font-size:11px; font-weight:600; padding:2.5px 9px; border-radius:20px }
+  .chip.config { background:var(--chip-blue-bg); color:var(--accent) }
+  .chip.cache { background:var(--hover); color:var(--dim) }
+  .chip.pub { background:var(--chip-orange-bg); color:var(--chip-orange-fg) }
+  .locknote {
+    margin:8px 10px 2px; padding:8px 12px; border-radius:8px; background:var(--hover);
+    font-size:12px; color:var(--dim); line-height:1.5;
+  }
+  .locknote b { color:var(--fg) }
+
+  /* ============ 设计规格注释卡（非产品 UI） ============ */
+  .annotations { max-width:880px; margin:20px auto 0; padding:0 16px }
+  .annot {
+    display:none; background:var(--view); border:1px solid var(--border); border-radius:12px;
+    padding:18px 22px; font-size:13px; line-height:1.65;
+  }
+  .annot.show { display:block }
+  .annot h4 { font-size:13px; font-weight:700; margin-bottom:8px; color:var(--dim) }
+  .annot table { width:100%; border-collapse:collapse; margin:6px 0 10px }
+  .annot td { padding:4.5px 8px; border-top:1px solid var(--border); vertical-align:top }
+  .annot td:first-child { white-space:nowrap; font-weight:600; width:170px }
+  .annot .w { font-family:ui-monospace,monospace; font-size:12px; color:var(--accent) }
+  .annot .states span {
+    display:inline-block; margin:2px 6px 2px 0; padding:2px 10px; border-radius:20px;
+    background:var(--hover); color:var(--dim); font-size:12px;
+  }
+</style>
+</head>
+<body>
+
+<!-- ═══════════ 设计稿控制条 ═══════════ -->
+<div class="toolbar">
+  <span class="title">appclone GUI 设计稿</span>
+  <div class="tabs" role="tablist">
+    <button class="tab" role="tab" aria-selected="true"  data-scr="1">屏1 · 应用列表</button>
+    <button class="tab" role="tab" aria-selected="false" data-scr="2">屏2 · 应用详情</button>
+    <button class="tab" role="tab" aria-selected="false" data-scr="3">屏3 · discover 对话框</button>
+  </div>
+  <span class="spacer"></span>
+  <button class="chipbtn" id="btnEmpty">空态演示</button>
+  <button class="chipbtn" id="btnBanner">错误横幅</button>
+  <button class="chipbtn" id="btnTheme">深色主题</button>
+</div>
+
+<div class="stage">
+<div class="window" id="win">
+
+  <!-- AdwHeaderBar -->
+  <div class="headerbar">
+    <div class="hb-left">
+      <button class="btn" id="btnBack" style="display:none" title="返回">←</button>
+    </div>
+    <div class="hb-title" id="hbTitle">应用分身</div>
+    <div class="hb-right">
+      <div class="wincontrols"><div class="wc close"></div><div class="wc min"></div><div class="wc max"></div></div>
+    </div>
+  </div>
+
+  <!-- AdwBanner：依赖缺失（doctor 检出 bwrap 未安装） -->
+  <div class="banner" id="banner">
+    ⚠ 未检测到 bubblewrap (bwrap) — 分身功能需要它提供隔离运行环境。
+    <button id="bannerDismiss">知道了</button>
+  </div>
+
+  <div class="content">
+
+    <!-- ═══════════ SCREEN 1/3 · 应用列表 ═══════════ -->
+    <section id="scr1">
+      <!-- 空态（AdwStatusPage）：状态演示开关触发 -->
+      <div id="emptyState" style="display:none">
+        <div class="statuspage">
+          <div class="clone-ic"><div class="sq1"></div><div class="sq2"></div></div>
+          <h3>尚未开启任何分身</h3>
+          <p>从下方「未配置的应用」中选择一个应用，点击「配置…」，appclone 会跟踪它的数据写入位置并生成隔离档案。</p>
+        </div>
+      </div>
+      <!-- 默认态 -->
+      <div id="listState">
+        <div class="group" id="grpSupported">
+          <div class="group-label">已支持分身</div>
+          <div class="boxed" id="supportedBox"><!-- JS 渲染 --></div>
+        </div>
+        <div class="group" id="grpUnconf">
+          <div class="group-label">未配置的应用</div>
+          <div class="boxed" id="unconfBox"><!-- JS 渲染 --></div>
+          <div class="boxed" style="margin-top:14px">
+            <div class="boxed-note">
+              列表来自 <span class="mono" style="font-family:ui-monospace">~/.local/share/applications/*.desktop</span>；
+              已支持应用的隔离档案位于 <span class="mono" style="font-family:ui-monospace">~/.local/share/appclone/profiles.d/</span>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ═══════════ SCREEN 2/3 · 应用详情 ═══════════ -->
+    <section id="scr2" style="display:none">
+      <div class="group">
+        <div class="group-label" id="detInstLabel">实例</div>
+        <div class="boxed" id="instBox"><!-- JS 渲染 --></div>
+        <div class="boxed" style="margin-top:14px">
+          <div class="row activatable" id="rowAddInst" tabindex="0">
+            <div class="insticon" style="border-style:solid">＋</div>
+            <div class="row-titles"><div class="row-title" style="color:var(--accent);font-weight:600">新建分身</div>
+            <div class="row-sub">跟踪应用写入路径，创建新的隔离实例</div></div>
+          </div>
+        </div>
+      </div>
+      <div class="group">
+        <div class="group-label">档案信息 · wechat.sh</div>
+        <div class="boxed">
+          <div class="row">
+            <div class="row-titles">
+              <div class="row-title">隔离路径 <span class="chip config" style="margin-left:2px">2 个</span></div>
+              <div class="row-sub"><span class="mono">~/.config/wechat</span> · <span class="mono">~/.local/share/wechat</span></div>
+            </div>
+            <button class="btn small link" id="btnRediscover">重新探测</button>
+          </div>
+          <div class="row">
+            <div class="row-titles">
+              <div class="row-title">单例互斥处理</div>
+              <div class="row-sub">锁文件已替换 · DBus 会话共享（未开启私有总线）</div>
+            </div>
+          </div>
+          <div class="row">
+            <div class="row-titles">
+              <div class="row-title">实例数据根目录</div>
+              <div class="row-sub mono" style="font-family:ui-monospace">~/.local/share/appclone/instances/wechat/&lt;id&gt;/root/</div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+  </div>
+
+  <!-- AdwToast -->
+  <div class="toast" id="toast"></div>
+
+  <!-- ═══════════ SCREEN 3/3 · AdwDialog · discover 路径勾选 ═══════════ -->
+  <div class="overlay" id="overlay">
+    <div class="dialog" role="dialog" aria-modal="true" aria-labelledby="dlgTitle">
+      <div class="dialog-head">
+        <h3 id="dlgTitle">首次配置 · 钉钉</h3>
+        <p>appclone 跟踪到该应用写入了以下路径。勾选属于「应用自身数据」的目录——它们会被隔离，其余文件与主空间保持共享。</p>
+      </div>
+      <div class="dialog-body" id="dlgBody"><!-- JS 渲染 --></div>
+      <div class="dialog-foot">
+        <button class="btn" id="dlgCancel">取消</button>
+        <button class="btn suggested" id="dlgConfirm" disabled>创建分身</button>
+      </div>
+    </div>
+  </div>
+
+</div>
+</div>
+
+<!-- ═══════════ 设计规格注释（每屏一张，随 tab 切换） ═══════════ -->
+<div class="annotations">
+  <div class="annot show" id="annot1">
+    <h4>屏1 · 应用列表 — 组件映射与状态</h4>
+    <table>
+      <tr><td>窗口 / 头栏</td><td><span class="w">AdwWindow + AdwHeaderBar</span>（CSD 圆角、居中粗体标题、右侧窗控圆点）</td></tr>
+      <tr><td>页面骨架</td><td><span class="w">AdwPreferencesPage → AdwPreferencesGroup → boxed AdwActionRow</span></td></tr>
+      <tr><td>分身开关</td><td><span class="w">AdwActionRow + GtkSwitch（add_suffix）</span>——行主体激活进详情，开关独立操作不冒泡（GNOME Settings 通用模式）</td></tr>
+      <tr><td>未配置应用</td><td><span class="w">AdwActionRow + flat Button「配置…」</span> → 打开 discover 对话框（屏3）</td></tr>
+    </table>
+    <div class="states">状态：<span>默认</span><span>空态（AdwStatusPage，工具栏「空态演示」）</span><span>错误（AdwBanner：bwrap 缺失）</span><span>开关开启 → 副标题变为实例计数</span></div>
+    跳转：点行体 → 屏2 详情；点「配置…」→ 屏3 对话框（首次配置模式）。
+  </div>
+  <div class="annot" id="annot2">
+    <h4>屏2 · 应用详情 — 组件映射与状态</h4>
+    <table>
+      <tr><td>实例行</td><td><span class="w">AdwActionRow + suffix 按钮组</span>：启动（suggested）/ 删除（destructive-flat）；实例名支持内联重命名（contenteditable，失焦提交）</td></tr>
+      <tr><td>新建入口</td><td><span class="w">AdwActionRow（activatable）</span>→ 打开屏3 对话框（新建分身模式）</td></tr>
+      <tr><td>档案信息</td><td><span class="w">AdwPreferencesGroup</span> 只读行展示 AC_PATHS / 锁处理 / 实例根目录，等价 CLI 的 <span class="w">doctor</span> 输出</td></tr>
+      <tr><td>操作反馈</td><td><span class="w">AdwToastOverlay + AdwToast</span>——启动/删除均以 Toast 呈现，不打断列表；删除实际走回收站（gio trash）</td></tr>
+    </table>
+    <div class="states">状态：<span>有实例</span><span>零实例（仅剩「新建分身」行）</span><span>删除后 Toast 确认 + 可撤销（v2）</span></div>
+    跳转：头栏「←」→ 屏1；「重新探测 / 新建分身」→ 屏3。
+  </div>
+  <div class="annot" id="annot3">
+    <h4>屏3 · discover 路径勾选对话框 — 组件映射与状态</h4>
+    <table>
+      <tr><td>对话框</td><td><span class="w">AdwDialog</span>（桌面居中、窗口内遮罩、Esc/取消关闭）；标题随入口切换「首次配置 · X」/「新建分身 · X」</td></tr>
+      <tr><td>路径行</td><td><span class="w">AdwActionRow + GtkCheckButton（add_prefix）</span> + 语义 chip：配置（蓝，默认勾选）/ 缓存（默认排除）/ 公共目录（橙，强制排除并说明）</td></tr>
+      <tr><td>锁文件提示</td><td>信息条（对应 CLI 的 <span class="w">AC_LOCKFILES</span> 自动检测结论，无需用户勾选）</td></tr>
+      <tr><td>确认按钮</td><td><span class="w">suggested-action</span>，选中 ≥1 个配置路径才可用——对应方案文档 §6.1「甄别公共目录」环节的 GUI 化</td></tr>
+    </table>
+    <div class="states">状态：<span>默认（按语义预勾选）</span><span>全不选（确认禁用）</span><span>确认 → 写档案 + 建实例 + Toast，未配置应用升级为已支持</span></div>
+  </div>
+</div>
+
+<script>
+/* ============ 数据模型（对应 core 包：Profile + Instance） ============ */
+const apps = [
+  { id:'wechat',   name:'微信',        letter:'微', color:'#07c160', supported:true,
+    instances:[{id:'work', size:'214 MB', last:'2 小时前'}] },
+  { id:'telegram', name:'Telegram',   letter:'T', color:'#2ba3db', supported:true,
+    instances:[{id:'分身 1', size:'86 MB', last:'昨天'}] },
+  { id:'qq',       name:'QQ',          letter:'Q', color:'#12b7f5', supported:true,
+    instances:[] },
+  { id:'firefox',  name:'火狐浏览器', letter:'F', color:'#ff7139', supported:true,
+    instances:[] },
+  { id:'dingtalk', name:'钉钉',        letter:'钉', color:'#0089ff', supported:false, instances:[] },
+  { id:'chrome',   name:'Chrome',      letter:'C', color:'#e2432e', supported:false, instances:[] },
+];
+
+/* discover 候选路径（对应对 CLI discover 输出的 GUI 呈现） */
+const pathCandidates = {
+  dingtalk: [
+    { path:'~/.config/DingTalk',        chip:'config', checked:true,  why:'应用配置目录 — 建议隔离' },
+    { path:'~/.local/share/DingTalk',   chip:'config', checked:true,  why:'应用数据目录 — 建议隔离' },
+    { path:'~/.dingtalk',               chip:'config', checked:true,  why:'写死于 $HOME 的状态目录 — 建议隔离' },
+    { path:'~/.cache/DingTalk',         chip:'cache',  checked:false, why:'缓存 — 默认不隔离（首次启动略慢，但省空间）' },
+    { path:'~/Downloads',               chip:'pub',    checked:false, why:'公共下载目录 — 保持共享，请勿隔离', locked:true },
+  ],
+  wechat: [
+    { path:'~/.config/wechat',          chip:'config', checked:true,  why:'应用配置目录 — 建议隔离' },
+    { path:'~/.local/share/wechat',     chip:'config', checked:true,  why:'应用数据目录 — 建议隔离' },
+    { path:'~/.cache/wechat',           chip:'cache',  checked:false, why:'缓存 — 默认不隔离' },
+  ],
+};
+
+const $  = s => document.querySelector(s);
+const $$ = s => [...document.querySelectorAll(s)];
+let currentApp = null;   // 屏2 / 屏3 上下文
+let dlgMode = 'setup';   // setup=首次配置 | clone=新建分身
+
+/* ============ 渲染 ============ */
+function subOf(app) {
+  return app.instances.length
+    ? `${app.instances.length} 个分身 · 上次使用 ${app.instances[0].last}`
+    : '未开启分身';
+}
+function renderList() {
+  const sup = apps.filter(a => a.supported), unc = apps.filter(a => !a.supported);
+  $('#supportedBox').innerHTML = sup.map(a => `
+    <div class="row activatable" data-app="${a.id}" tabindex="0">
+      <div class="appicon" style="background:${a.color}">${a.letter}</div>
+      <div class="row-titles">
+        <div class="row-title">${a.name}</div>
+        <div class="row-sub" data-sub>${subOf(a)}</div>
+      </div>
+      <label class="switch" title="分身开关">
+        <input type="checkbox" data-sw="${a.id}" ${a.instances.length ? 'checked' : ''}>
+        <span class="track"></span><span class="knob"></span>
+      </label>
+      <span class="chev">›</span>
+    </div>`).join('') ||
+    `<div class="row"><div class="row-sub">暂无 — 从下方开始配置</div></div>`;
+  $('#unconfBox').innerHTML = unc.map(a => `
+    <div class="row">
+      <div class="appicon" style="background:${a.color}">${a.letter}</div>
+      <div class="row-titles">
+        <div class="row-title">${a.name}</div>
+        <div class="row-sub">尚未生成隔离档案</div>
+      </div>
+      <button class="btn small" data-setup="${a.id}">配置…</button>
+    </div>`).join('');
+}
+
+function renderDetail() {
+  const a = currentApp;
+  $('#hbTitle').textContent = a.name;
+  $('#detInstLabel').textContent = `实例 · ${a.name}`;
+  const rows = a.instances.map((inst, i) => `
+    <div class="row">
+      <div class="insticon">${a.letter}</div>
+      <div class="row-titles">
+        <div class="row-title">
+          <span class="iname" data-i="${i}" contenteditable="true" spellcheck="false"
+                style="padding:2px 6px;border-radius:6px;outline:none;min-width:40px">${inst.id}</span>
+        </div>
+        <div class="row-sub">${inst.size} · 上次使用 ${inst.last}</div>
+      </div>
+      <button class="btn small suggested" data-launch="${i}">启动</button>
+      <button class="btn small destructive" data-del="${i}">删除</button>
+    </div>`).join('');
+  $('#instBox').innerHTML = rows ||
+    `<div class="row"><div class="row-sub">还没有分身实例 — 点击下方「新建分身」开始</div></div>`;
+}
+
+function renderDialog() {
+  const a = currentApp;
+  $('#dlgTitle').textContent = dlgMode === 'setup' ? `首次配置 · ${a.name}` : `新建分身 · ${a.name}`;
+  const list = (pathCandidates[a.id] || pathCandidates.wechat).map((p, i) => `
+    <label class="chkrow">
+      <input type="checkbox" data-chk="${i}" ${p.checked ? 'checked' : ''} ${p.locked ? 'disabled' : ''}>
+      <span class="cb"></span>
+      <div class="tt">
+        <div class="path">${p.path}</div>
+        <div class="why">${p.why}</div>
+      </div>
+      <span class="chip ${p.chip}">${p.chip === 'config' ? '配置' : p.chip === 'cache' ? '缓存' : '公共目录'}</span>
+    </label>`).join('');
+  $('#dlgBody').innerHTML = list + `
+    <div class="locknote">已自动检测到单例锁 <b>~/.x/${a.id}.sock</b>（对应档案 <b>AC_LOCKFILES</b>），
+    分身将使用私有空文件替换，无需手动处理。</div>`;
+  refreshConfirm();
+}
+function refreshConfirm() {
+  $('#dlgConfirm').disabled = !$$('[data-chk]').some(c => c.checked);
+}
+
+/* ============ 交互 ============ */
+function showScreen(n) {
+  [1,2,3].forEach(i => $('#scr'+i).style.display = i===n ? '' : 'none');
+  $$('.tab').forEach(t => t.setAttribute('aria-selected', +t.dataset.scr === n));
+  $('#btnBack').style.display = n === 2 ? '' : 'none';
+  $('#hbTitle').textContent = n === 1 ? '应用分身' : $('#hbTitle').textContent;
+  [1,2,3].forEach(i => $('#annot'+i).classList.toggle('show', i === n));
+  if (n === 3) openDialog(currentApp || apps[4], 'setup'); // 直接查看屏3时给默认演示上下文
+}
+function toast(msg) {
+  const t = $('#toast'); t.textContent = msg; t.classList.add('show');
+  clearTimeout(t._h); t._h = setTimeout(() => t.classList.remove('show'), 2600);
+}
+function openDialog(app, mode) {
+  currentApp = app; dlgMode = mode; renderDialog();
+  $('#overlay').classList.add('open');
+}
+function closeDialog() { $('#overlay').classList.remove('open') }
+
+document.addEventListener('click', e => {
+  const t = e.target;
+  /* Screen 切换（含屏3 tab 直接打开对话框） */
+  const tab = t.closest('.tab');
+  if (tab) {
+    const n = +tab.dataset.scr;
+    if (n === 3) { showScreen(2); showScreen(3); } else showScreen(n);
+    return;
+  }
+  /* 列表：行体 → 详情（开关点击不冒泡到行） */
+  const row = t.closest('.row.activatable[data-app]');
+  if (row && !t.closest('.switch')) {
+    currentApp = apps.find(a => a.id === row.dataset.app);
+    renderDetail(); showScreen(2); return;
+  }
+  const setupBtn = t.closest('[data-setup]');
+  if (setupBtn) { openDialog(apps.find(a => a.id === setupBtn.dataset.setup), 'setup'); return; }
+  /* 详情操作 */
+  const l = t.closest('[data-launch]');
+  if (l) { toast(`正在通过 bwrap 启动「${currentApp.name} · ${currentApp.instances[l.dataset.launch].id}」…`); return; }
+  const d = t.closest('[data-del]');
+  if (d) {
+    const [rm] = currentApp.instances.splice(d.dataset.del, 1);
+    renderList(); renderDetail();
+    toast(`已将「${rm.id}」移入回收站（gio trash）`); return;
+  }
+  if (t.closest('#rowAddInst')) { openDialog(currentApp, 'clone'); return; }
+  if (t.closest('#btnBack')) { renderList(); showScreen(1); return; }
+  if (t.closest('#btnRediscover')) { openDialog(currentApp, 'clone'); toast('将重新运行 strace 跟踪…（演示中直接展示候选）'); return; }
+  /* 对话框 */
+  if (t.closest('#dlgCancel') || t.id === 'overlay') { closeDialog(); return; }
+  if (t.closest('#dlgConfirm')) {
+    const n = $$('[data-chk]').filter(c => c.checked).length;
+    if (dlgMode === 'setup') {
+      currentApp.supported = true;
+      currentApp.instances.push({ id:'分身 1', size:'8 MB', last:'刚刚' });
+      toast(`已生成档案并创建「${currentApp.name} · 分身 1」（隔离 ${n} 个路径）`);
+      renderList(); showScreen(1);
+    } else {
+      currentApp.instances.push({ id:'分身 ' + (currentApp.instances.length + 1), size:'8 MB', last:'刚刚' });
+      toast(`已创建新分身（隔离 ${n} 个路径）`);
+      renderList(); renderDetail(); showScreen(2);
+    }
+    closeDialog(); return;
+  }
+  /* 状态演示 */
+  if (t.closest('#btnTheme')) { $('html').classList.toggle('dark'); t.classList.toggle('on'); return; }
+  if (t.closest('#btnEmpty')) {
+    const on = !$('#emptyState').style.display.includes('flex');
+    $('#emptyState').style.display = on ? 'flex' : 'none';
+    $('#listState').style.display = on ? 'none' : '';
+    t.classList.toggle('on', on); return;
+  }
+  if (t.closest('#btnBanner')) { $('#banner').classList.toggle('show'); t.classList.toggle('on'); return; }
+  if (t.closest('#bannerDismiss')) { $('#banner').classList.remove('show'); $('#btnBanner').classList.remove('on'); }
+});
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape') closeDialog();
+  if (e.key === 'Enter' && document.activeElement?.matches('.row.activatable')) document.activeElement.click();
+});
+document.addEventListener('change', e => {
+  const sw = e.target.closest('[data-sw]');
+  if (sw) {
+    const a = apps.find(x => x.id === sw.dataset.sw);
+    if (sw.checked && !a.instances.length) a.instances.push({ id:'分身 1', size:'8 MB', last:'刚刚' });
+    if (!sw.checked) a.instances.length = 0;
+    const sub = sw.closest('.row').querySelector('[data-sub]');
+    sub.textContent = subOf(a);
+    toast(sw.checked ? `已创建「${a.name} · 分身 1」` : `已移除「${a.name}」全部分身（移入回收站）`);
+    return;
+  }
+  if (e.target.closest('[data-chk]')) refreshConfirm();
+});
+/* 内联重命名：失焦提交 */
+document.addEventListener('blur', e => {
+  const n = e.target.closest('.iname');
+  if (!n) return;
+  const inst = currentApp.instances[+n.dataset.i];
+  const v = n.textContent.trim();
+  if (v) { inst.id = v; toast(`已重命名为「${v}」`) } else n.textContent = inst.id;
+}, true);
+
+renderList();
+</script>
+</body>
+</html>
