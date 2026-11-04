@@ -1,0 +1,249 @@
+# Linux 应用分身（App Clone）完整技术方案
+
+> 目标：在桌面 Linux 上实现类似 Android "应用分身 / Cloned Apps" 的功能——
+> **只隔离目标应用自身的配置与数据**（两个实例互不可见、可同时运行），
+> **其余一切照常共享**（下载、文档、剪贴板、通知、输入法、GPU/音频）。
+> 无需 root，无需修改应用本身。
+
+## 1. 设计目标与非目标
+
+**目标**
+
+- 同一应用多个实例并行运行，各有独立账号/聊天记录/设置；
+- 实例间私有数据互不可见（含内核层面的 mount 隔离）；
+- 公共文件（`~/Downloads` 等）与会话资源全部共享——分身下载的文件直接出现在原位置；
+- 对应用黑盒：不依赖应用支持多开参数；
+- 一条命令创建/删除分身，并生成带角标的桌面图标（近似 Android 的"开关"体验）。
+
+**非目标（当前版本不做）**
+
+- 强权限隔离（分身进程拿不到主实例数据的访问权）——那是 user namespace + 独立 UID 的路线，复杂度高且引入桌面会话授权问题；
+- Flatpak 应用内部分身（另有思路，见 §8.4）；
+- Windows/Wayland 单显示会话外的多桌面环境。
+
+## 2. 与 Android Cloned Apps 的机制对照
+
+| Android（多用户机制） | 本方案（mount namespace） |
+|---|---|
+| `installExistingPackageAsUser(pkg, profileId)`，数据目录自动出现在 `/data/user/<id>/<pkg>/` | 档案 `AC_PATHS` + `--bind 实例目录 原路径`，数据目录重定向到 `instances/<app>/<id>/root/` 下 |
+| PMS 安装时**统一分配**数据目录（路径确定，所以一个开关即可） | Linux 无"户籍管理"，用 per-app **路径档案**事后补齐这份知识 |
+| AMS 按 userId 检测单实例 | 私有 DBus 会话总线 + 锁文件 inode 替换 |
+| Launcher 显示两个图标 | 自动生成 `.desktop`（Name 加「分身」后缀） |
+| 克隆 profile **共享**父用户外部存储 `/storage/emulated/0` | `--bind / /` 整个根文件系统原样透传，天然共享 |
+
+## 3. 总体架构
+
+```
+用户点击桌面入口  appclone-<app>-<id>.desktop
+   │
+   └─ appclone run <app> <id>
+        ├─ 加载档案  ~/.local/share/appclone/profiles.d/<app>.sh
+        │      （路径知识库 = 事后补做的 Android PMS 安装期目录分配）
+        ├─ 构造 bwrap 参数
+        │      --bind / /                      ← 整个系统原样透传（其余全部可见）
+        │      --bind 实例私有目录 应用数据路径   ← 仅偷换应用自己的目录
+        │      --bind 实例私有空文件 应用锁文件    ← 绕过互斥锁
+        │      （可选）私有 DBus session bus
+        │      （可选）私有 XDG_RUNTIME_DIR（wayland/pulse socket 仍共享进来）
+        └─ exec bwrap ... -- <应用可执行文件>
+```
+
+**核心原理一句话**：进入一个私有 mount namespace，在里面把整个文件系统原样 bind 进来，只把应用读写自身状态的那几个目录换成分身专用的副本。替换仅存在于该进程的命名空间内，主用户环境零影响，不需要 root。
+
+## 4. 目录与文件布局
+
+```
+~/.local/share/appclone/
+├── profiles.d/
+│   └── <app>.sh            # 应用档案：AC_EXEC、AC_PATHS、AC_LOCKFILES 等
+├── instances/
+│   └── <app>/<id>/
+│       ├── root/<原路径>/   # 偷换后的数据目录（如 root/home/u/.config/WeChat/）
+│       ├── locks/           # 私有锁文件
+│       └── runtime/         # （可选）私有 XDG_RUNTIME_DIR
+├── .trash/                  # 删除实例的兜底存放处
+~/.local/share/applications/
+└── appclone-<app>-<id>.desktop   # 生成的桌面入口
+```
+
+## 5. 应用档案（per-app 路径知识库）规范
+
+这是整套方案中唯一需要人工维护的东西，也是 Linux 与 Android 架构差异的落点（Android 由系统在安装期统一分配目录，Linux 需要事后摸清）。
+
+| 字段 | 说明 |
+|---|---|
+| `AC_EXEC` | 应用可执行文件路径（必填） |
+| `AC_PATHS` | 需要隔离的目录列表（`discover` 结果填入；`$HOME` 加载时展开） |
+| `AC_LOCKFILES` | 应用用于互斥的锁文件/socket 路径，将被替换为实例私有空文件 |
+| `AC_EXTRA_BINDS` | 额外 bind，格式 `"源\|目标"`，用于 `/var`、`/opt` 下写死的路径 |
+| `AC_ISOLATE_DBUS` | 1 = 私有 DBus 会话总线，绕过 well-known name 单例检测 |
+| `AC_ISOLATE_RUNTIME` | 1 = 私有 XDG_RUNTIME_DIR（wayland/pulse/bus socket 仍 bind 进来） |
+| `AC_EXTRA_ENV` | 额外环境变量，`"VAR=value"` |
+| `AC_CWD` | 启动工作目录 |
+
+### 5.1 档案示例：通用 Electron 应用模板
+
+```bash
+AC_EXEC="/usr/bin/some-electron-app"
+AC_PATHS=(
+  "$HOME/.config/SomeApp"
+  "$HOME/.local/share/SomeApp"   # 部分应用还写 ~/.SomeApp，以 discover 为准
+)
+AC_LOCKFILES=("$XDG_RUNTIME_DIR/someapp.sock")   # Electron 常见的单例 socket
+AC_ISOLATE_DBUS=1                                # 若应用在 DBus 上抢 well-known name
+AC_ISOLATE_RUNTIME=0
+AC_EXTRA_ENV=()
+AC_CWD="$HOME"
+```
+
+### 5.2 官方自带多开参数的应用（推荐直接用，不必上沙箱）
+
+```bash
+# Chromium 系（含各 Electron 应用）
+chromium --user-data-dir="$HOME/appclone/instance2"
+
+# Firefox
+firefox -P profile2 -no-remote
+```
+
+对这类应用，方案一（XDG/专有参数）比沙箱更干净；`appclone` 的档案机制留作兜底。
+
+## 6. 工具：`appclone` CLI
+
+完整源码见随附文件 `appclone`（`bash -n` 语法校验通过）。安装：
+
+```bash
+install -Dm755 appclone ~/.local/bin/appclone
+```
+
+依赖：`bubblewrap`（必需）；`strace`、`dbus`、`gio`（可选）。
+bwrap 依赖非特权 user namespace，个别发行版需确认
+`sysctl kernel.unprivileged_userns_clone` 为 1。
+
+命令一览：
+
+| 命令 | 作用 |
+|---|---|
+| `appclone profile-new <app>` | 生成档案模板 |
+| `appclone discover <app>` | strace 跟踪应用，列出它在 `~` 下**写入**的路径 |
+| `appclone add <app> <id>` | 创建分身实例 + 桌面入口 |
+| `appclone run <app> <id> [args]` | 在分身环境中启动 |
+| `appclone list [app]` | 列出应用与实例 |
+| `appclone doctor <app> <id>` | 环境检查，打印将执行的 bwrap 命令（排障） |
+| `appclone rm <app> <id>` | 实例移入回收站 + 删桌面入口 |
+
+### 6.1 接入一个新应用的完整流程
+
+```bash
+# 1) 生成档案并填上可执行文件
+appclone profile-new wechat
+vi ~/.local/share/appclone/profiles.d/wechat.sh      # 填 AC_EXEC
+
+# 2) 摸路径（关键一步；此过程应用未沙箱、会写主实例，属正常）
+appclone discover wechat
+#   → 在应用里把功能尽量用一遍：登录、收发文件、截图、改设置，然后退出
+#   → 输出的路径中，把"应用自身状态"目录填进 AC_PATHS
+#   → 甄别：Downloads/图片等公共目录出现是正常的共享行为，不要隔离
+
+# 3) 创建并使用分身
+appclone add wechat work
+appclone run wechat work          # 或从应用列表点「WeChat (分身:work)」
+
+# 4) 排障（分身秒退/弹回主实例时）
+appclone doctor wechat work
+```
+
+`discover` 的识别逻辑：`strace -e trace=%file` 抓全部文件操作，只保留带写标志
+（`O_WRONLY/O_RDWR/O_CREAT/O_TRUNC/mkdir/rename/unlink`）的 `$HOME` 绝对路径，
+排除 `~/.cache`。这就是把 Android PMS"安装时分配目录"的工作事后补做一遍。
+
+### 6.2 单例/互斥问题（GUI 双开的真正难点）
+
+应用"双开"失败通常不是目录问题，而是单例检测。三种手段按序尝试：
+
+1. **锁文件**：`strace` 里若见 `flock/open(O_CREAT)` 某固定路径 → 填 `AC_LOCKFILES`。
+   原理：mount 一个 inode 不同的私有空文件盖在上面，`flock` 自然不再互斥。
+2. **DBus well-known name**：应用启动时在 session bus 上抢名字，抢不到就把参数
+   转发给已有实例后退出 → 开 `AC_ISOLATE_DBUS=1`（`dbus-run-session` 起私有总线）。
+   副作用：托盘、通知等会话集成在分身内失效，按需取舍。
+3. **`$XDG_RUNTIME_DIR` 下的 socket**：Electron 系常见 → 开 `AC_ISOLATE_RUNTIME=1`。
+   wayland/pulse/bus socket 会被 bind 进新目录，图形与声音不受影响。
+
+## 7. 验证清单
+
+```bash
+# A. 隔离生效：分身写入的数据落在实例目录，而非宿主位置
+appclone run <app> <id>   # 在应用内改一条设置，然后：
+find ~/.local/share/appclone/instances/<app>/<id>/root -mmin -5
+# 宿主对应目录应无新文件
+
+# B. 共享生效：分身下载/保存的文件出现在公共目录
+ls -lt ~/Downloads | head        # 分身里保存的文件应在此出现
+
+# C. 双开成立：两实例同时运行
+pgrep -af <app>                  # 应看到两个进程
+
+# D. 命名空间内确认替换成功
+appclone run <app> <id> sh -c 'findmnt | grep <数据路径>'
+# 应显示 bind 类型的挂载
+```
+
+## 8. 高级用法
+
+### 8.1 从主实例数据"克隆起步"（OverlayFS 语义）
+
+新分身直接继承主实例现有状态（类似 Android 克隆的复制语义）：
+
+```bash
+# 无 root，用 fuse-overlayfs
+fuse-overlayfs -o lowerdir="$HOME/.config/WeChat",upperdir=.../instances/wechat/work/upper,workdir=.../work .../instances/wechat/work/merged
+# 然后把档案中该路径的 bind 源改为 merged 目录（或临时手工）
+bwrap --bind / / --bind .../merged "$HOME/.config/WeChat" wechat
+```
+
+分身的修改全落在 upper 层，主实例数据不被触碰。
+
+### 8.2 systemd 逃生舱写法（等价原理，便于临时调试）
+
+```bash
+systemd-run --user --same-dir \
+  -p BindPaths="$HOME/appclone/wx2/config:$HOME/.config/WeChat" \
+  -p BindPaths="$HOME/appclone/wx2/data:$HOME/.local/share/WeChat" \
+  wechat
+```
+
+### 8.3 仅 XDG 环境变量（应用守规矩时的零成本方案）
+
+```bash
+XDG_CONFIG_HOME=$HOME/appclone/inst2/config \
+XDG_DATA_HOME=$HOME/appclone/inst2/data \
+  some-app
+```
+
+### 8.4 Flatpak 应用的思路
+
+Flatpak 已把数据收进 `~/.var/app/<appid>`（相当于平台统一分配目录），
+理论上对同一 appid 换实例目录 bind 即可分身；需要 `flatpak run` 与 bwrap 的
+嵌套协调，留作后续扩展。
+
+## 9. 局限与风险
+
+- **路径档案需人工维护**：应用升级改存储位置时分身可能漏隔离——`discover` 重新跑一遍即可修复；
+- **AC_ISOLATE_DBUS 的代价**：私有总线内托盘/通知不可用，适合"能双开 > 桌面集成"的取舍场景；
+- **写了 `$HOME` 之外的路径**（如 `/var/lib/x`）：用 `AC_EXTRA_BINDS` 补；写 `/etc` 的应用已属系统级，不建议分身；
+- **不防检测**：与 Android 系统分身不同，本方案目标是"能用"而非"反检测"，风控型应用（银行类）理论上可经环境探查发现 mount namespace；
+- **多实例资源占用**：每个分身是完整进程（含独立渲染进程），内存按实例数增长，与 Android 同理；
+- **非特权 user namespace 被禁的环境**（部分企业策略）bwrap 无法运行，需改用 root 挂载或 systemd-run 变体。
+
+## 10. 后续扩展方向
+
+1. `discover` 结果自动聚类成目录候选（去掉随机文件名、保留高频父目录）；
+2. 档案库社区化（类似 Firejail profile 的分发模式）；
+3. 桌面图标角标（Overlay Icon / 不同 Icon= 资源）区分分身；
+4. `add --fork`：§8.1 的一键化（检测 fuse-overlayfs，自动 lower=主实例）。
+
+---
+
+**交付物**：本方案文档 + 可执行脚本 `appclone`（见同目录）。
+**验证状态**：脚本通过 `bash -n` 语法检查；功能测试（以 bash 为替身应用）确认——
+分身写入的数据落在实例目录、宿主目录不受污染、`--bind / /` 下公共目录可见。
