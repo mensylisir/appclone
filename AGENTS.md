@@ -2,7 +2,7 @@
 
 ## 项目上下文
 
-appclone 是把 Android「应用分身 / Cloned Apps」语义移植到 Linux 桌面的工具：**只隔离目标应用自身的配置与数据目录**（per-app 沙箱，两实例互不可见），**其余一切照常共享**（公共文件、DBus 会话、外设）。无需 root、无需修改应用本身。当前仓库处于 v1 bash 可用、v2 Go 重构与 GUI 未启动阶段。
+appclone 是把 Android「应用分身 / Cloned Apps」语义移植到 Linux 桌面的**产品**：**只隔离目标应用自身的配置与数据目录**（per-app 沙箱，两实例互不可见），**其余一切照常共享**（公共文件、DBus 会话、外设）。无需 root、无需修改应用本身。目标用户是普通桌面用户，产品标准是「像安卓设置里一个开关」——用户不接触命令行、档案文件、探测细节。当前仓库处于设计基线完备、Go 实现未启动阶段。
 
 每次开始工作前按顺序读取：
 
@@ -28,9 +28,8 @@ appclone 是把 Android「应用分身 / Cloned Apps」语义移植到 Linux 桌
 - 隔离引擎：bubblewrap（直接 exec 其二进制，**禁止引入容器库/改走 podman 路线**）。
 - 路径探测：主用 overlay-diff（fuse-overlayfs，lower=$HOME 只读 / upper=空写层）；strace 降级兜底；静态预填白拿 AppArmor profile 与 Flatpak 元数据。
 - 克隆起步：fuse-overlayfs（lower=主实例数据，无 root CoW）。
-- v1：bash（长期保留为最小依赖 fallback，与 v2 并行分发）。
-- v2：Go ≥1.22 单仓库，`core` 包为唯一事实核心（`BuildBwrapArgs` 纯函数），CLI（cobra）与 GUI（gotk4 + libadwaita）是 core 的两个薄视图；**无 daemon、无 IPC、无 webview**。
-- 档案格式：v1 `.sh`，v2 迁 TOML，字段语义逐项对应（见方案设计 §5.3）；实例目录布局跨版本不变。
+- 实现：**Go ≥1.22 唯一路径**（ADR-002/003：不存在 bash 产品版）。`core` 包为唯一事实核心（探测管线、`BuildBwrapArgs` 纯函数、档案 TOML、实例 CRUD），CLI（cobra，开发者视图）与 GUI（gotk4 + libadwaita，**普通用户主入口**）是 core 的两个薄视图；**无 daemon、无 IPC、无 webview**。
+- 档案格式：TOML（`profiles/<app>.toml`），由探测管线自动生成，用户只做勾选确认；实例目录布局 CLI/GUI 一致。
 
 ## 工程原则
 
@@ -46,10 +45,11 @@ appclone 是把 Android「应用分身 / Cloned Apps」语义移植到 Linux 桌
 
 一个功能只有同时满足以下要求才算完成：
 
-1. **回归通过**：改 `design/appclone-gui.html` 必须跑 `node design/guitest.js`（22/22）；改 bash 脚本必须过 `bash -n` 且在隔离假 HOME 下完成功能冒烟（写入落实例目录、宿主零污染、公共目录共享可见）。
-2. **契约不破**：CLI 命令名、实例目录布局、档案字段语义三者在改动前后保持兼容（bash/Go/CLI/GUI 视角一致）。
-3. **文档同步**：涉及机制变更时同步更新对应 docs 并保持互引一致。
-4. **状态真实**：不使用「已完成」描述没有验证证据的功能；验证输出（命令、结果）写进提交说明或 docs。
+1. **回归通过**：改 `design/appclone-gui.html` 必须跑 `node design/guitest.js`（22/22）；改 Go 代码必须过 `go vet` + `go test ./...`，涉及 bwrap/探测行为时在隔离假 HOME 下完成功能冒烟（写入落实例目录、宿主零污染、公共目录共享可见）。
+2. **契约不破**：命令语义、实例目录布局、档案字段语义在改动前后保持兼容（CLI/GUI 视角一致）。
+3. **用户零门槛红线**：任何把"要求用户读 strace 输出 / 手写档案字段 / 开终端"的设计引入产品路径，一律打回——这是本产品与脚本工具的分界线。
+4. **文档同步**：涉及机制变更时同步更新对应 docs 并保持互引一致。
+5. **状态真实**：不使用「已完成」描述没有验证证据的功能；验证输出（命令、结果）写进提交说明或 docs。
 
 ## Subagent 交叉审查（强制）
 
@@ -69,8 +69,8 @@ appclone 是把 Android「应用分身 / Cloned Apps」语义移植到 Linux 桌
 
 ## 代码与提交
 
-1. 仓库布局铁律：**根目录只放可执行脚本 `appclone`**；文档一律 `docs/`；设计稿与测试 `design/`；v2 代码按 `core/`、`cmd/appclone/`、`cmd/appclone-gui/`、`profiles/` 组织。
-2. bash 脚本保持 POSIX 可读性，`set -euo pipefail`，不引入 bash 之外解释器依赖。
+1. 仓库布局铁律：**根目录不放任何产品代码**；Go 代码按 `core/`、`cmd/appclone/`、`cmd/appclone-gui/`、`profiles/` 组织；文档一律 `docs/`；设计稿与测试 `design/`；早期 bash 原型归档 `legacy/`（不发布、不承诺维护，仅供 core 开发期行为对照）。
+2. Go 代码遵守 `gofmt`/`go vet`/`staticcheck`；`core` 保持纯函数优先、可单测。
 3. 提交信息用中文，说明「为什么」而非罗列文件；一个任务一个 commit。
 4. 不要未经用户确认创建 git commit、分支、tag 或发布。
 5. **push 默认放行**：一次已确认的 commit 完成后，推送当前分支到 `origin` 不再单独征求确认。仍需逐次确认的是：`--force`/`--force-with-lease`、推到非当前分支或 tag、发布（release）以及任何改写已推送历史的操作。
@@ -80,11 +80,10 @@ appclone 是把 Android「应用分身 / Cloned Apps」语义移植到 Linux 桌
 ## 常用命令
 
 ```bash
-bash -n appclone                          # bash 语法检查
-node design/guitest.js                    # GUI 设计稿 22 项交互回归
+gofmt -l . && go vet ./... && go test ./...    # Go 门禁
+node design/guitest.js                         # GUI 设计稿 22 项交互回归
 # 隔离冒烟（假 HOME，不污染真实主目录）：
 TESTROOT=$(mktemp -d); export AC_BASE="$TESTROOT/xdg/appclone" XDG_DATA_HOME="$TESTROOT/xdg"
-HOME="$TESTROOT/home" ./appclone profile-new t && HOME="$TESTROOT/home" ./appclone add t main
-HOME="$TESTROOT/home" ./appclone run t main -c 'echo ok > "$HOME/.config/t/x"'
-find "$AC_BASE/instances" -type f        # 数据应只落在实例目录
+HOME="$TESTROOT/home" ./appclone add t main    # Go CLI 建成后替换为 go run ./cmd/appclone
+find "$AC_BASE/instances" -type f              # 数据应只落在实例目录
 ```

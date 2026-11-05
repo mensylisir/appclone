@@ -78,7 +78,7 @@ probe_run() {  # 用法: probe_run <可执行文件> [args...]
    （Chromium 沙箱路径）、Electron app.asar 内部逻辑全部逃不掉；
    ptrace 的 2~10 倍性能惩罚不存在，用户在探测会话里正常使用应用；
 3. **免费的单例锁线索**：应用"启动时创建、退出时删除"的锁文件会在 upper 层留下
-   whiteout（0,0 字符设备）。单独收集这些路径 → 高置信的 `AC_LOCKFILES` 候选；
+   whiteout（0,0 字符设备）。单独收集这些路径 → 高置信的 `lock_files` 候选；
    strace 里这类瞬时文件反而容易因运行时长不足而漏采。
 
 ### 3.4 已知坑与对策
@@ -86,7 +86,7 @@ probe_run() {  # 用法: probe_run <可执行文件> [args...]
 | 坑 | 对策 |
 |---|---|
 | atime 更新引起伪 copy-up | 挂载时 `-o noatime`（探测场景 lower 本就该只读） |
-| 只覆盖 `$HOME`，应用写 `/var`、`/opt` 不可见 | 与静态预填（§4.1）互补：可疑系统路径单独 overlay 或提示进 `AC_EXTRA_BINDS` |
+| 只覆盖 `$HOME`，应用写 `/var`、`/opt` 不可见 | 与静态预填（§4.1）互补：可疑系统路径单独 overlay 或提示进 `extra_binds` |
 | 只捕获"本次会话被行使过的"路径 | 流程弥补：GUI/CLI 明确提示"把功能尽量用一遍"；冷启 + 热启**双跑**（登录态目录只在第二次出现） |
 | upper 出现大量 `~/.cache` 噪声 | 语义分类（§5）直接排除，不进候选 |
 | fuse-overlayfs 不可用的环境 | 降级到 strace 路径（v1 现行逻辑） |
@@ -119,12 +119,12 @@ L2 把定案结果翻译成档案语义。**strace 降级为 L1 不可用时的�
 | 路径含 `cache` / `.cache` / `Cache`（大小写不敏感） | 缓存 | ❌ 不隔离 | 丢失只影响首启速度；隔离则双份缓存 |
 | XDG 公共目录（Downloads/Documents/Pictures/Music/Videos/Public/Templates） | 公共 | ❌ 强制排除 | 项目核心语义：公共文件必须共享（见方案设计 §1） |
 | `~/.<name>` 顶层点目录 | 灰区 | ⚠️ 人工确认 | 硬编码路径的重点难点，交给屏3 勾选 |
-| `/var`、`/opt`、`/etc` 下路径 | 系统级 | ⚠️ 进 `AC_EXTRA_BINDS` 提示 | 方案设计 §9：写 /etc 的应用不建议分身 |
+| `/var`、`/opt`、`/etc` 下路径 | 系统级 | ⚠️ 进 `extra_binds` 提示 | 方案设计 §9：写 /etc 的应用不建议分身 |
 | SQLite/LevelDB/大二进制文件所在目录 | 数据 | ✅ 隔离 | 文件形态启发（.db/.sqlite/*.ldb） |
 
 ## 6. 与 CLI / GUI 的映射
 
-- L0+L1 产出 → 档案字段自动预填（`AC_PATHS` 候选、`AC_LOCKFILES` 候选）；
+- L0+L1 产出 → 档案字段自动预填（`paths` 候选、`lock_files` 候选）；
 - L2 分类 → GUI 屏3（discover 勾选对话框，见 `design/appclone-gui.html`）的
   chip 预判与勾选状态——管线跑完后用户面对的是"确认 2~3 个预勾选项"，
   而非"从 30 条 strace 输出里挑路径"；

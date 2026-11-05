@@ -1,20 +1,21 @@
 # appclone 技术选型
 
-> 本文记录 appclone 项目从原型（bash）演进到产品（Go + GUI）的完整技术选型决策，
+> 本文记录 appclone 产品（Go + GUI，直达用户）的完整技术选型决策，
 > 以及每项决策的理由与被否决的备选方案。与[方案设计](方案设计.md)配套阅读。
+> 早期 bash 原型仅用于验证隔离语义，已归档 `legacy/`，不属于产品路径（ADR-002）。
 
 ## 0. 选型总览
 
 | 层 | 选型 | 定位 |
 |---|---|---|
 | 隔离引擎 | bubblewrap (bwrap) | mount namespace 沙箱，唯一核心依赖 |
-| 路径发现 | strace (`-e trace=%file`) | 无侵入摸清应用写入路径 |
+| 路径探测 | overlay-diff（fuse-overlayfs）；strace 兜底 | 自动摸清应用写入路径（ADR-008） |
 | 克隆起步 | fuse-overlayfs | 无 root 的 copy-on-write，分身继承主实例数据 |
 | 桌面集成 | .desktop 标准 + gio trash | 图标入口 / 回收站删除 |
-| 核心层（Go） | Go ≥ 1.22，package `core` | 档案解析、实例管理、bwrap 参数构造 |
-| CLI | cobra | `cmd/appclone`，永久保留 |
-| GUI | gotk4 + libadwaita | `cmd/appclone-gui`，core 之上的薄 UI |
-| 档案格式 | TOML（v2 起从 `.sh` 迁移） | 结构化 per-app 路径知识库 |
+| 核心层 | Go ≥ 1.22，package `core` | 探测管线、档案解析、实例管理、bwrap 参数构造 |
+| CLI | cobra | `cmd/appclone`，开发者视图 |
+| GUI | gotk4 + libadwaita | `cmd/appclone-gui`，普通用户主入口 |
+| 档案格式 | TOML | 结构化 per-app 路径知识库 |
 | 构建/分发 | Go 单二进制 + 各发行版包 | 无编译期 cgo，交叉编译友好 |
 | CI | GitHub Actions（lint + test + build） | gofmt/vet/staticcheck + go test |
 
@@ -42,21 +43,20 @@
 - **fuse-overlayfs**：无 root 下唯一的 CoW 目录方案，支撑"分身从主实例数据克隆起步"；
 - **gio trash / freedesktop .desktop**：桌面生态标准，无需自造。
 
-## 2. 实现语言：bash（v1）→ Go（v2）
+## 2. 实现语言：Go（唯一实现，产品直达）
 
-### 2.1 v1 bash 的定位
+### 2.1 决策：不存在 bash v1
 
-原型期正确选择：工具本质是"参数构造器 + exec"，bash 完全胜任，零额外依赖
-（装完 bwrap 即可用），对开源项目冷启动至关重要。**v1 长期保留为
-最小依赖 fallback**，与 v2 并行分发。
+项目目标是**面向普通用户的产品**——产品标准是"像安卓设置里一个开关"。
+bash 原型（仓库早期根目录脚本）无法承载：探测自动化、discover 勾选交互、
+结构化错误、多平台分发。任何"先发 bash 版收反馈"的路线都不成立：
+让用户开终端、手填路径、读 strace 输出的工具没有用户。
 
-### 2.2 触发迁移 Go 的条件（产品化信号）
+bash 原型已完成它的历史使命：验证了 bwrap 绑定语义与目录布局，
+其 `build_bwrap_args` 逻辑由 Go `core.BuildBwrapArgs` 接管，脚本本身移出
+产品路径（归档到 `legacy/`，仅供 core 开发期做行为对照，不发布、不承诺维护）。
 
-- 路径档案从 `.sh` 升级为结构化格式（TOML），需要继承/校验/版本迁移；
-- GUI：tray/图标角标/GNOME 设置面板形态的"一键开关"；
-- 结构化错误、测试覆盖、多平台发布。
-
-### 2.3 为什么是 Go 而非 Rust / Python
+### 2.2 为什么是 Go 而非 Rust / Python
 
 | 候选 | 判定 |
 |---|---|
@@ -64,10 +64,10 @@
 | Rust | 安全收益在此薄封装场景无法兑现，开发成本高，CLI/GUI 双视图迭代速度慢于 Go |
 | Python | 部署是死穴：目标用户机器上解释器/依赖不可控，与"工具必须开箱即用"冲突 |
 
-**一条红线**：bwrap 参数构造逻辑（`core` 包中的 `BuildBwrapArgs`，对应 bash 版
-`build_bwrap_args`）是本项目的事实核心——它是 Android PMS"安装期目录分配"的
-对等物。语言只是宿主；**直接 `os/exec` 调用 bwrap 二进制，绝不引入
-containers/go 容器生态**（那会把方案拖向 podman 路线）。
+**一条红线**：bwrap 参数构造逻辑（`core` 包中的 `BuildBwrapArgs`）是本项目
+的事实核心——它是 Android PMS"安装期目录分配"的对等物。语言只是宿主；
+**直接 `os/exec` 调用 bwrap 二进制，绝不引入 containers/go 容器生态**
+（那会把方案拖向 podman 路线）。
 
 ## 3. 架构：单仓库，core 为心脏，CLI/GUI 为双视图
 
@@ -126,10 +126,10 @@ appclone/
 
 ## 5. 数据格式与版本策略
 
-- **档案格式**：v1 沿用 `.sh`（bash 加载）；v2 起 TOML
-  （`profiles/<app>.toml`），含 schema 版本字段，Go 侧写迁移器一次性转换；
+- **档案格式**：TOML（`profiles/<app>.toml`），含 schema 版本字段。
+  早期 bash 原型的 `.sh` 档案无存量用户，不做迁移器，直接以 TOML 起步；
 - **实例数据**：目录布局沿用方案文档 §4（`instances/<app>/<id>/root/<原路径>`），
-  GUI 与 CLI、bash 与 Go 版本共用同一布局——**跨版本互操作优先于格式洁癖**；
+  CLI 与 GUI 共用同一布局——**双视图互操作优先于格式洁癖**；
 - **删除语义**：一律回收站（gio trash），永久删除仅在回收站内提供。
 
 ## 6. 构建与分发
@@ -139,7 +139,6 @@ appclone/
 - **分发渠道**（按优先级）：
   1. GitHub Releases：静态二进制（amd64/arm64）；
   2. 各发行版包（AUR / COPR / PPA）——外包给社区；
-  3. bash 版随仓库分发（`curl | bash` 可用性）；
 - **CI**：GitHub Actions——PR 触发 `gofmt`/`go vet`/`staticcheck`/`go test`，
   tag 触发 Release 构建；
 - **许可证**：建议 GPL-3.0-or-later（与 GTK/libadwaita 生态一致性最好；
@@ -150,10 +149,10 @@ appclone/
 | # | 决策 | 状态 |
 |---|---|---|
 | 001 | 隔离引擎选 bubblewrap，直接 exec 其二进制，不引入容器库 | 已定 |
-| 002 | v1 bash 长期保留为最小依赖 fallback | 已定 |
-| 003 | v2 实现语言选 Go，触发条件为产品化信号（GUI/结构化档案） | 已定 |
+| 002 | ~~v1 bash 长期保留为 fallback~~ → **已废弃**：产品直达 Go，bash 原型归档 `legacy/` 仅供开发对照（2026-11-05，理由：目标用户不接受 CLI 操作，bash 版不构成可用产品） | 已改 |
+| 003 | 实现语言选 Go（原"v2 迁移"改为唯一实现路径） | 已改 |
 | 004 | 桌面应用不做前后端分离：CLI/GUI 共享 core，无 daemon | 已定 |
 | 005 | GUI 选 gotk4 + libadwaita；Fyne 为无 GTK 环境备选 | 已定 |
 | 006 | GUI 一版范围锁定"列表 + 开关"，discover 勾选放二版 | 已定 |
-| 007 | 档案格式 v2 迁移 TOML；实例目录布局跨版本兼容 | 已定 |
+| 007 | 档案格式 TOML（无 .sh 迁移负担）；实例目录布局 CLI/GUI 一致 | 已改 |
 | 008 | 路径探测：overlay-diff 为主探测、strace 降级兜底、静态预填 + 语义分类三层管线（详见 [discover.md](discover.md)） | 已定 |
