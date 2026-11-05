@@ -156,3 +156,4 @@ appclone/
 | 005 | GUI 选 gotk4 + libadwaita；Fyne 为无 GTK 环境备选 | 已定 |
 | 006 | GUI 一版范围锁定"列表 + 开关"，discover 勾选放二版 | 已定 |
 | 007 | 档案格式 v2 迁移 TOML；实例目录布局跨版本兼容 | 已定 |
+| 008 | 路径探测：overlay-diff 为主探测、strace 降级兜底、静态预填 + 语义分类三层管线（详见 [discover.md](discover.md)） | 已定 |
