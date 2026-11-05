@@ -536,13 +536,22 @@ function refreshConfirm() {
 }
 
 /* ============ 交互 ============ */
+/* 屏1/屏2 是 section；屏3 是全屏 overlay 对话框（无独立 section）。
+   showScreen 只管理 section，对话框由 openDialog/closeDialog 管理。 */
 function showScreen(n) {
-  [1,2,3].forEach(i => $('#scr'+i).style.display = i===n ? '' : 'none');
-  $$('.tab').forEach(t => t.setAttribute('aria-selected', +t.dataset.scr === n));
+  [1,2].forEach(i => $('#scr'+i).style.display = i===n ? '' : 'none');
   $('#btnBack').style.display = n === 2 ? '' : 'none';
-  $('#hbTitle').textContent = n === 1 ? '应用分身' : $('#hbTitle').textContent;
+  if (n === 1) $('#hbTitle').textContent = '应用分身';
+  updateTabs(n);
+}
+function updateTabs(n) {
+  /* tab 高亮跟随所属屏；屏3 tab 在对话框打开时点亮 */
+  $$('.tab').forEach(t => {
+    const s = +t.dataset.scr;
+    t.setAttribute('aria-selected',
+      s === n || (s === 3 && n === 2 && $('#overlay').classList.contains('open')));
+  });
   [1,2,3].forEach(i => $('#annot'+i).classList.toggle('show', i === n));
-  if (n === 3) openDialog(currentApp || apps[4], 'setup'); // 直接查看屏3时给默认演示上下文
 }
 function toast(msg) {
   const t = $('#toast'); t.textContent = msg; t.classList.add('show');
@@ -551,16 +560,28 @@ function toast(msg) {
 function openDialog(app, mode) {
   currentApp = app; dlgMode = mode; renderDialog();
   $('#overlay').classList.add('open');
+  updateTabs(3);
 }
-function closeDialog() { $('#overlay').classList.remove('open') }
+function closeDialog() {
+  $('#overlay').classList.remove('open');
+  updateTabs(currentApp ? 2 : 1);
+}
 
 document.addEventListener('click', e => {
   const t = e.target;
-  /* Screen 切换（含屏3 tab 直接打开对话框） */
+  /* Screen 切换 */
   const tab = t.closest('.tab');
   if (tab) {
     const n = +tab.dataset.scr;
-    if (n === 3) { showScreen(2); showScreen(3); } else showScreen(n);
+    if (n === 3) {
+      /* 屏3 = 对话框：需要在某个应用上下文里打开；直接看时用钉钉演示 */
+      showScreen(2);
+      openDialog(currentApp || apps.find(a => !a.supported) || apps[0], 'setup');
+      updateTabs(3);
+    } else {
+      closeDialog();
+      showScreen(n);
+    }
     return;
   }
   /* 列表：行体 → 详情（开关点击不冒泡到行） */
@@ -627,14 +648,14 @@ document.addEventListener('change', e => {
   }
   if (e.target.closest('[data-chk]')) refreshConfirm();
 });
-/* 内联重命名：失焦提交 */
-document.addEventListener('blur', e => {
-  const n = e.target.closest('.iname');
-  if (!n) return;
+/* 内联重命名：失焦提交（focusout = 冒泡版 blur，contenteditable 均可靠触发） */
+document.addEventListener('focusout', e => {
+  if (!e.target.classList?.contains('iname')) return;
+  const n = e.target;
   const inst = currentApp.instances[+n.dataset.i];
   const v = n.textContent.trim();
   if (v) { inst.id = v; toast(`已重命名为「${v}」`) } else n.textContent = inst.id;
-}, true);
+});
 
 renderList();
 </script>
