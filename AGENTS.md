@@ -6,12 +6,19 @@ appclone 是把 Android「应用分身 / Cloned Apps」语义移植到 Linux 桌
 
 每次开始工作前按顺序读取：
 
-1. `docs/方案设计.md`：唯一设计契约基线——需求定义、目录布局、档案规范、CLI 命令面、验证清单，跨版本（bash/Go、CLI/GUI）稳定。
-2. `docs/tech-stack.md`：唯一技术选型与 ADR 基线，ADR-001~008 已定案。
-3. `docs/discover.md`：路径自动探测方案谱系与三层管线（ADR-008 详情）。
-4. `design/appclone-gui.html`：**GUI 界面行为基线**。任何 GUI 相关改动（新增屏、改组件、调交互、改状态变体）之前必须读；改后必须跑 `node design/guitest.js`（22 项交互回归，需 chromium + puppeteer-core），退出码非 0 视为设计基线被破坏。
+1. `NEXT.md`：当前进度和下一步。
+2. `docs/方案设计.md`：唯一设计契约基线——需求定义、目录布局、档案规范、CLI 命令面、验证清单，跨版本（bash/Go、CLI/GUI）稳定。
+3. `docs/tech-stack.md`：唯一技术选型与 ADR 基线（编号以该文 §7 索引为准）。
+4. `docs/discover.md`：路径自动探测方案谱系与三层管线（ADR-008 详情）。
+5. `design/appclone-gui.html`：**GUI 界面行为基线**。任何 GUI 相关改动（新增屏、改组件、调交互、改状态变体）之前必须读；改后必须跑 `node design/guitest.js`（58 项交互回归，需 chromium + puppeteer-core），退出码非 0 视为设计基线被破坏。
+6. `docs/STATUS.md`：已验证功能状态。
 
-冲突裁决：交互行为与组件映射以 `design/appclone-gui.html` 为准（含窗口下方的组件映射注释卡）；目录布局、档案语义、CLI 命令面以 `docs/方案设计.md` 为准；选型冲突以 `docs/tech-stack.md` ADR 为准。
+冲突裁决（三份各管一段，不要互相越界）：
+
+- **交互行为**（点了什么、状态怎么变）以 `design/appclone-gui.html` 为准；
+- **组件映射与视觉**以 `docs/tech-stack.md` §4.5/§4.6 为准——HTML 稿是浏览器画的，不是 GTK 渲染的，照抄必然不原生（ADR-013 已裁决，稿子内那张映射卡是 v1 遗留，以 §4.6 裁决表为最终口径）；
+- **目录布局、档案语义、CLI 命令面**以 `docs/方案设计.md` 为准；
+- **选型冲突**以 `docs/tech-stack.md` §7 ADR 索引为准（编号会增补，别在别处硬写范围）。
 
 不要创建阶段总结、交付报告、重复设计文档或新的进度文件。
 
@@ -20,20 +27,23 @@ appclone 是把 Android「应用分身 / Cloned Apps」语义移植到 Linux 桌
 - 设计变更（目录布局、档案规范、命令面）：更新 `docs/方案设计.md`，并同步核对 `docs/tech-stack.md` 是否需要追加 ADR。
 - 选型或架构决策变更：先在 `docs/tech-stack.md` 追加 ADR 条目，再改实现。
 - 探测/档案机制变更：更新 `docs/discover.md`。
+- 功能状态：只根据测试证据更新 `docs/STATUS.md`。
+- 会话进度：每次结束前更新 `NEXT.md`。
+- `planned` 表示只有计划；`verified` 必须有命令、日期、结果和覆盖范围。
 - 文档互引必须保持一致：改名或新增文档时同步更新所有引用处。
 - 及时提交推送到 `git@github.com:mensylisir/appclone.git`（SSH remote，main 分支，每任务一次提交）。
 
-## 技术栈（已定案，ADR-001~008）
+## 技术栈（ADR 索引见 `docs/tech-stack.md` §7）
 
 - 隔离引擎：bubblewrap（直接 exec 其二进制，**禁止引入容器库/改走 podman 路线**）。
 - 路径探测：主用 overlay-diff（fuse-overlayfs，lower=$HOME 只读 / upper=空写层）；strace 降级兜底；静态预填白拿 AppArmor profile 与 Flatpak 元数据。
 - 克隆起步：fuse-overlayfs（lower=主实例数据，无 root CoW）。
-- 实现：**Go ≥1.22 唯一路径**（ADR-002/003：不存在 bash 产品版）。`core` 包为唯一事实核心（探测管线、`BuildBwrapArgs` 纯函数、档案 TOML、实例 CRUD），CLI（cobra，开发者视图）与 GUI（gotk4 + libadwaita，**普通用户主入口**）是 core 的两个薄视图；**无 daemon、无 IPC、无 webview**。
-- 档案格式：TOML（`profiles/<app>.toml`），由探测管线自动生成，用户只做勾选确认；实例目录布局 CLI/GUI 一致。
+- 实现：**Go ≥1.22 唯一路径**（ADR-002/003：不存在 bash 产品版）。`core` 包为唯一事实核心（探测管线、`BuildBwrapArgs` 纯函数、档案 TOML、实例 CRUD），CLI（cobra，开发者视图）与 GUI（puregotk → GTK4 + libadwaita 原生控件，**普通用户主入口**）是 core 的两个薄视图；**无 daemon、无 IPC、无 webview**。
+- 档案格式：TOML（运行时 `~/.local/share/appclone/profiles.d/<app>.toml`，仓库 `profiles/` 只是只读模板库），由探测管线自动生成，用户只做勾选确认；实例目录布局 CLI/GUI 一致。
 
 ## 工程原则
 
-1. **核心语义不可破**：只隔离 `AC_PATHS` 声明的目录，`--bind / /` 全透传——任何改动若导致公共目录（Downloads/Documents 等）被隔离，即背叛项目立意。
+1. **核心语义不可破**：只隔离档案 `paths` 声明的目录，`--bind / /` 全透传——任何改动若导致公共目录（Downloads/Documents 等）被隔离，即背叛项目立意。
 2. **免 root 红线**：任何方案引入特权要求（fanotify 归因、eBPF、真实 mount）前必须先否决或单列授权说明。
 3. **复杂度不泄漏给用户**：产品标准是「像安卓设置里一个开关」——路径探测、锁文件处理、DBus 隔离等复杂度必须由工具消化；用户界面最多出现"确认预勾选项"级别的操作。
 4. `BuildBwrapArgs` 等核心逻辑必须保持纯函数可单测；bash 与 Go 版本行为等价，命令面与目录布局是跨版本契约。
@@ -45,7 +55,7 @@ appclone 是把 Android「应用分身 / Cloned Apps」语义移植到 Linux 桌
 
 一个功能只有同时满足以下要求才算完成：
 
-1. **回归通过**：改 `design/appclone-gui.html` 必须跑 `node design/guitest.js`（22/22）；改 Go 代码必须过 `go vet` + `go test ./...`，涉及 bwrap/探测行为时在隔离假 HOME 下完成功能冒烟（写入落实例目录、宿主零污染、公共目录共享可见）。
+1. **回归通过**：改 `design/appclone-gui.html` 必须跑 `node design/guitest.js`（58/58）；改 Go 代码必须过 `go vet` + `go test ./...`，涉及 bwrap/探测行为时在隔离假 HOME 下完成功能冒烟（写入落实例目录、宿主零污染、公共目录共享可见）。
 2. **契约不破**：命令语义、实例目录布局、档案字段语义在改动前后保持兼容（CLI/GUI 视角一致）。
 3. **用户零门槛红线**：任何把"要求用户读 strace 输出 / 手写档案字段 / 开终端"的设计引入产品路径，一律打回——这是本产品与脚本工具的分界线。
 4. **文档同步**：涉及机制变更时同步更新对应 docs 并保持互引一致。
@@ -63,7 +73,8 @@ appclone 是把 Android「应用分身 / Cloned Apps」语义移植到 Linux 桌
 ## 安全要求
 
 1. 不提交、打印用户应用数据内容（聊天记录、账号态属于分身数据，验证时只检查文件存在性）。
-2. 生成的 bwrap 命令不得引入越权路径；`AC_PATHS` 外的 bind 需要档案显式声明（`AC_EXTRA_BINDS`）。
+2. 生成的 bwrap 命令不得引入越权路径；档案 `paths` 之外的 bind 需要档案显式声明（`extra_binds`）。
+   （`AC_PATHS`/`AC_LOCKFILES` 是 `legacy/` bash 原型的环境变量名，**产品代码与文档一律用 TOML 字段名**。）
 3. 探测会话运行用户应用属正常行为，但工具自身不得在探测范围外写用户目录。
 4. GUI/CLI 的删除操作只移入回收站；永久删除仅能由用户手动在回收站完成。
 
@@ -72,16 +83,20 @@ appclone 是把 Android「应用分身 / Cloned Apps」语义移植到 Linux 桌
 1. 仓库布局铁律：**根目录不放任何产品代码**；Go 代码按 `core/`、`cmd/appclone/`、`cmd/appclone-gui/`、`profiles/` 组织；文档一律 `docs/`；设计稿与测试 `design/`；早期 bash 原型归档 `legacy/`（不发布、不承诺维护，仅供 core 开发期行为对照）。
 2. Go 代码遵守 `gofmt`/`go vet`/`staticcheck`；`core` 保持纯函数优先、可单测。
 3. 提交信息用中文，说明「为什么」而非罗列文件；一个任务一个 commit。
-4. 不要未经用户确认创建 git commit、分支、tag 或发布。
-5. **push 默认放行**：一次已确认的 commit 完成后，推送当前分支到 `origin` 不再单独征求确认。仍需逐次确认的是：`--force`/`--force-with-lease`、推到非当前分支或 tag、发布（release）以及任何改写已推送历史的操作。
+4. **commit + push 默认放行**：一个任务做完就直接提交并推送到 `origin` 当前分支，**不要逐次征求确认**（用户在 2026-11-07 明确要求：每次改动不仅 commit，还要 push）。仍需逐次确认的是：`--force`/`--force-with-lease`、推到非当前分支、打 tag、发布（release），以及任何改写已推送历史的操作。
+   - 这里的"做完"指：验收命令已跑过并留下证据（回归 58/58、退出码 0；Go 侧 `go vet` + `go test`）。没跑过验证就提交，等于把未验证状态当成果。
+   - 提交前 `git status` 自查：不要把 `.workbuddy/`（本地工作区数据）带进提交，它已在 `.gitignore` 里。
 6. **提交署名**：以用户本人 git 身份提交（`git config user.name` / `user.email` 为准），禁止使用 Claude、AI 或任何其他名义署名，不得添加 AI 署名 trailer。
 7. 远端使用 SSH：`git@github.com:mensylisir/appclone.git`（本机 HTTPS 无凭据，push 会失败）。
 
 ## 常用命令
 
 ```bash
-gofmt -l . && go vet ./... && go test ./...    # Go 门禁
-node design/guitest.js                         # GUI 设计稿 22 项交互回归
+gofmt -l . && go vet ./... && go test ./...    # Go 门禁（go.mod 建成后才有意义）
+CGO_ENABLED=0 go build ./...                   # 全仓零 cgo（puregotk 不需要 C 工具链）
+# GUI 交互回归（58 项，退出码 0 才算过；脚本自动发现 chromium 与 puppeteer-core）
+node design/guitest.js
+# 找不到依赖时：npm i puppeteer-core，或用 PUPPETEER_CORE=/path、CHROMIUM=/path 指定
 # 隔离冒烟（假 HOME，不污染真实主目录）：
 TESTROOT=$(mktemp -d); export AC_BASE="$TESTROOT/xdg/appclone" XDG_DATA_HOME="$TESTROOT/xdg"
 HOME="$TESTROOT/home" ./appclone add t main    # Go CLI 建成后替换为 go run ./cmd/appclone
