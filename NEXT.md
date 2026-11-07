@@ -16,32 +16,57 @@ i18n 缺失、397 个应用无搜索、屏3 缺探测中态、公共目录组未
 `go vet ./...` 干净、`go test ./...` 全绿；假 HOME 冒烟跑通 add→list→doctor→rm。
 bwrap 参数语义用 `doctor` 打印的 argv 实测过 A/A'/B（实例内落盘、宿主零污染、公共目录共享），**但只在 root 下手工执行**，`run` 本身拒绝 root。
 GUI 方向定案：**GTK4 + libadwaita 原生控件，经 puregotk 绑定（零 cgo）**，以 S0 spike 五条验收为切换闸门（第 5 条：Ubuntu 24.04 实机）。
+**第十一轮：实现审查收口**（2026-11-07）。3 个 P0（bwrap 私有目录的 bind 源落进 `root/`、`run` 覆盖 `RuntimeDir`、
+`paths` 未做 `EvalSymlinks`）与主要 P1 修完并推送；本轮又清掉删除白名单、回滚链、GTK 版本探测三条，
+`gofmt`/`go vet` 干净、`go test ./...` 全绿（新增 8 个断言）。
 
 ## 下一步
 
-路线图第 1 项（`core` 探测原语）**被本机环境挡住**：容器内没有 `/dev/fuse` 设备节点（`mknod` 被拒），
-`fuse-overlayfs` 虽然装上了也挂不起来。探测的 overlay 主路径无法在此环境跑通，只能写代码 + 单测 diff 收集器，
-不能声称验证。strace 降级路径同样需要真实应用会话。
+路线图第 1 项（`core` 探测原语）**被本机环境挡住**：`fuse-overlayfs 1.18` 与 `fusermount3 3.18.3` 已装（用户确认），
+但容器内没有 `/dev/fuse` 设备节点（`mknod` 被沙箱拒），`fuse-overlayfs` 挂不起来。
+所以探测要拆成两半，先后顺序按"现在能不能验证"排：
 
-按 `docs/方案设计.md` §10 路线图推进，探测先行：
+1a. **可离线验证的部分**（先做）：`upper` 条目收集与归并（纯函数：目录/单文件都算、whiteout 三形态、
+   剔除 XDG 根及其祖先）+ L2 语义分类规则表（`discover.md` §5 的有序规则，含"公共目录强制排除"
+   与"共享可写压过 ~/.config 默认勾选"两条硬优先级）→ 单测可覆盖，不需要 fuse。
+1b. **需要真实会话的部分**（被挡）：overlay 会话编排、strace 降级、两轮探测循环。
+
+其余路线图项（编号沿用 `docs/方案设计.md` §10）：
 
 0. **S0 spike**（半天，先把 GUI 绑定钉死）：30 行 puregotk 程序验五条——`AdwSwitchRow` 的 `notify::active` 进 Go 回调、
    `AdwNavigationView` push/pop + Esc、`AdwAlertDialog` 异步 response id、中文 + 系统暗色，
    以及**在 Ubuntu 24.04（libadwaita 1.5.0 / GTK 4.14.2）里跑通**（门槛定 1.5 的唯一依据）。不过就换 gotk4。
-1. `core` 探测原语（overlay-diff + whiteout 收集 + 语义分类 → 生成档案）
-2. `core` 其余部分（`BuildBwrapArgs` 纯函数 + 单测、档案 TOML 解析、实例 CRUD、`id`/`display_name` 校验）
-3. CLI MVP（cobra）：`add/run/list/rm/doctor`
-4. `cmd/appclone-gui`（puregotk + libadwaita 三屏，控件映射见 `tech-stack.md` §4.5）
+1. `core` 探测原语（1a + 1b）
+2. ~~`core` 其余部分~~ **已完成**（`BuildBwrapArgs` 纯函数 + 单测、档案 TOML、实例 CRUD、`id`/`display_name` 校验）
+3. ~~CLI MVP~~ **已完成**（`add/run/list/rm/doctor/repair-desktop/version`）
+4. `cmd/appclone-gui`（puregotk + libadwaita 三屏，控件映射见 `tech-stack.md` §4.5）。
+   **前置**：拉 `puregotk` 依赖需要网络（本机 `proxy.golang.org` 502），且 S0 五条未做。
 
 ## 被挡住的
 
-- `fuse-overlayfs` 未安装、`/dev/fuse` 不存在：overlay 主探测与克隆起步无法验证。
-  方案已定义降级判据（`docs/discover.md` §3.2/§3.4），可以先走 strace 分支开工；升级为 overlay 需装包，待用户确认。
+- `/dev/fuse` 不存在（容器内 `mknod` 被拒）：overlay 主探测与克隆起步**无法验证**（`fuse-overlayfs 1.18` 与
+  `fusermount3 3.18.3` 本身已装）。方案已定义降级判据（`docs/discover.md` §3.2/§3.4），所以先做 1a 的纯函数部分；
+  1b 要等有 `/dev/fuse` 的机器（真机或 `--device /dev/fuse` 的容器）。
+- **降权验证同样被挡**：`runuser`（cannot set groups）、`setpriv`（setresuid failed）、`chown`（Invalid argument）
+  全部被沙箱拒绝，所以 bwrap 语义只能在 root 下手工执行，`run` 的非特权路径至今没有实机证据。
 - **GUI 侧的自动化闸门尚未存在**：`guitest.js` 只覆盖 HTML 稿。GTK 实现的回归要等 S0 之后建
   （`broadway`/`xdotool` 驱动三屏冒烟），在那之前 GUI 无回归保护，不能标 `verified`。
 
 ## 最近完成
 
+- 2026-11-07 **第十一轮：实现审查的剩余 P1/P2 收口**（3 P0 已在上一提交修完）：
+  - **删除白名单**（P1）：`Env.Trash` 先断言目标确属 `instances/`、`profiles.d/`、`appclone-*.desktop`，
+    越界报 5 且**不调用 `gio`**；`LauncherPath` 与白名单共用 `LauncherDir()`，避免两处 `filepath.Join` 漂移；
+    目标已不存在改为静默跳过（并发两次删除不再报假故障）。5 个新单测钉住白名单/越界/缺失三种情形。
+    **踩到的坑**：`IsUnder(parent, child)` 的参数序被我写反，测试立刻抓到——这类"看起来对"的调用只能靠断言。
+  - **回滚链**（P2）：`os.MkdirAll` 的手下会顺手建出多级父目录却只把最内层交给你，回滚时那几级空目录就永远
+    留在宿主上。新增 `mkdirAllTracked` + `removeCreated`（由外到内建、由内到外删），2 个单测覆盖"整链回收"
+    与"已存在的祖先不算本次新建"。
+  - **GTK 版本探测**（P1，机制受限）：`pkg-config` → 库文件名 libtool 版本段（GTK `4.24.1 → …2400.1`）
+    → `warn` + "无法判定版本"，三档都把来源写进结论、都不冒充通过。libadwaita 多数发行版是平 soname，
+    拿不到就明说拿不到。真正的 dlopen 探测要等 purego 依赖落地（现在 `proxy.golang.org` 502，拉不动）。
+  - **口径落到文档**：`LoadProfile` 只做解析与版本判定，语义校验归 `ValidateProfile`（否则"路径失效的档案"
+    连读出来给用户看都做不到）；`rm` 的可删范围升为 §4 的硬约束。
 - 2026-11-06 **第九轮：开工前的 12 项 P1 一次清掉**（用户要求"不要开始开发了才发现"）。判据统一为
   **"界面上承诺了 core 给不出的东西 / 状态机能进不能出 / 用户按一次就毁数据"**；`guitest.js` **44 → 58 项**，
   连续复跑 58/58、退出码 0，并用变异测试逐条确认新断言有牙：

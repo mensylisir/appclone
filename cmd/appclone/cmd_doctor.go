@@ -191,10 +191,10 @@ func runChecks(a *app) []check {
 		add("gio", "fail", "缺少 gio（glib2）：删除操作无法移入回收站，appclone 不会用 rm 代替")
 	}
 
-	if st, dt := gtkCheck("gtk4", "4.14"); true {
+	if st, dt := gtkCheck("gtk4", "libgtk-4.so.1", "4.14", "GTK4"); true {
 		add("gtk4", st, dt)
 	}
-	if st, dt := gtkCheck("libadwaita-1", "1.5"); true {
+	if st, dt := gtkCheck("libadwaita-1", "libadwaita-1.so.0", "1.5", "libadwaita"); true {
 		add("libadwaita", st, dt)
 	}
 
@@ -210,22 +210,118 @@ func runChecks(a *app) []check {
 	return out
 }
 
-// gtkCheck 用 pkg-config 查版本，CLI 二进制绝不 import GUI 包：
+// gtkCheck 查 GUI 两个运行库的版本，CLI 二进制绝不 import GUI 包：
 // 纯 CLI 机器上 import 会让 init 阶段 panic（§6 doctor 条目）。
-func gtkCheck(pkg, min string) (string, string) {
-	p, err := exec.LookPath("pkg-config")
-	if err != nil {
-		return "warn", "没有 pkg-config，无法确认 " + pkg + " 版本（GUI 才需要）"
+//
+// 探测顺序按可信度递减，并且**把来源写进结论**——版本号来自哪里决定了它能不能
+// 当证据用：
+//  1. `pkg-config --modversion`：有开发包时精确，但运行库装、开发包不装（普通用户
+//     的常态）就拿不到；
+//  2. 库文件名的 libtool 版本段：GTK 用 `-version-info` 生成
+//     `libgtk-4.so.1.<minor*100>.<micro>`（4.24.1 → 2400.1），发行版一致，但它是
+//     文件名约定，不是 ABI 里的事实；
+//  3. 都拿不到 → `warn` + 明确说"无法判定版本"，**不冒充通过**（§6.3 的同一条纪律）。
+//
+// 真正的 dlopen 探测（`gtk_get_minor_version()`）要等 GUI 增量引入 purego 依赖后
+// 才接入：现在为它单独引一个模块不划算，而"不知道"比"猜一个数"诚实。
+func gtkCheck(pkg, soname, min, label string) (string, string) {
+	if p, err := exec.LookPath("pkg-config"); err == nil {
+		if v := strings.TrimSpace(runOut(p, "--modversion", pkg)); v != "" {
+			if versionLess(v, min) {
+				return "warn", label + " " + v + " 低于要求的 " + min + "（pkg-config）"
+			}
+			return "ok", label + " " + v + "（pkg-config）"
+		}
 	}
-	v := strings.TrimSpace(runOut(p, "--modversion", pkg))
+	lib := findLib(soname)
+	if lib == "" {
+		// 库不存在 ≠ 版本太低：CLI 完全不需要它，所以是 warn 而不是 fail。
+		return "warn", label + " 未安装（只影响 GUI）"
+	}
+	v, src := libVersion(lib, soname)
 	if v == "" {
-		return "warn", pkg + " 未安装（只影响 GUI）"
+		return "warn", label + " 无法判定版本（缺 pkg-config，且 " + filepath.Base(lib) +
+			" 的库文件名不带版本号）；GUI 需要 ≥ " + min
 	}
-	// 版本必须按数字段比较：字典序下 "1.10.0" < "1.5" 会误报低版本。
 	if versionLess(v, min) {
-		return "warn", pkg + " " + v + " 低于要求的 " + min
+		return "warn", label + " " + v + " 低于要求的 " + min + "（" + src + "）"
 	}
-	return "ok", pkg + " " + v
+	return "ok", label + " " + v + "（" + src + "）"
+}
+
+// findLib 在常规库目录里找 soname。多架构目录（Debian 系的
+// /usr/lib/x86_64-linux-gnu）用扫一层子目录的办法覆盖，不去解析 ld.so.conf：
+// doctor 是排障口，认得发行版的事实来源比认得 ld.so 的全部语法更实用。
+func findLib(soname string) string {
+	for _, d := range []string{"/usr/lib", "/usr/lib64", "/lib", "/lib64", "/usr/local/lib"} {
+		p := filepath.Join(d, soname)
+		if fi, err := os.Lstat(p); err == nil && !fi.IsDir() {
+			return p
+		}
+	}
+	ents, err := os.ReadDir("/usr/lib")
+	if err != nil {
+		return ""
+	}
+	for _, ent := range ents {
+		if !ent.IsDir() {
+			continue
+		}
+		p := filepath.Join("/usr/lib", ent.Name(), soname)
+		if fi, err := os.Lstat(p); err == nil && !fi.IsDir() {
+			return p
+		}
+	}
+	return ""
+}
+
+// libVersion 从库路径推版本。只有 `libfoo.so.N.<编码>.<micro>` 这种带版本段的
+// 命名能给出结果（GTK 是；libadwaita 在多数发行版上是平的
+// `libadwaita-1.so.0`，拿不到）。
+func libVersion(path, soname string) (version, source string) {
+	real := path
+	if r, err := filepath.EvalSymlinks(path); err == nil {
+		real = r
+	}
+	base := filepath.Base(real)
+	rest, ok := strings.CutPrefix(base, soname)
+	if !ok {
+		return "", ""
+	}
+	parts := strings.Split(strings.TrimPrefix(rest, "."), ".")
+	if len(parts) < 2 {
+		return "", ""
+	}
+	enc, err := strconv.Atoi(parts[0])
+	if err != nil || enc < 100 || enc > 9999 {
+		return "", ""
+	}
+	micro := parts[1]
+	major := sonameMajor(soname)
+	if major == "" {
+		return "", ""
+	}
+	// 编码是 minor*100：1400 → 4.14，2400 → 4.24；主版本取自 soname
+	// （libgtk-4.so.1 → 4，libadwaita-1.so.0 → 1），不靠猜。
+	return major + "." + strconv.Itoa(enc/100) + "." + micro, "库文件名"
+}
+
+// sonameMajor 从 soname 取主版本：libgtk-4.so.1 → "4"，libadwaita-1.so.0 → "1"，
+// libgobject-2.0.so.0 → "2"（glib 系把主版本写成 "2.0"）。
+func sonameMajor(soname string) string {
+	head, _, _ := strings.Cut(soname, ".so")
+	i := strings.LastIndex(head, "-")
+	if i < 0 || i+1 >= len(head) {
+		return ""
+	}
+	suffix := head[i+1:]
+	if j := strings.Index(suffix, "."); j >= 0 {
+		suffix = suffix[:j]
+	}
+	if _, err := strconv.Atoi(suffix); err != nil {
+		return ""
+	}
+	return suffix
 }
 
 // versionLess 比较点分版本号：a < b 返回 true。非数字段按 0 处理。

@@ -50,8 +50,7 @@ func ResolveCLIPath() (string, error) {
 // LauncherPath 返回分身入口的路径。文件名只由 app/id 决定：
 // 重命名 display_name 不换文件名（§4）。
 func (e *Env) LauncherPath(app, id string) string {
-	dir := filepath.Join(e.Resolver.XDG["DATA_HOME"], "applications")
-	return filepath.Join(dir, "appclone-"+app+"-"+id+".desktop")
+	return filepath.Join(e.LauncherDir(), "appclone-"+app+"-"+id+".desktop")
 }
 
 // launcherName 拼「应用名（分身 显示名）」，超长时截断显示名并补省略号。

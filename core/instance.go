@@ -82,9 +82,7 @@ func (e *Env) CreateInstance(ctx context.Context, app string, p Profile, id stri
 		os.Remove(profTmp)
 		os.RemoveAll(e.InstancePath(app, id)) // 只删本次新建的实例目录
 		// 宿主侧补建的占位目录/锁文件也要回收：留着会变成"用户没见过却存在"的空目录（§4）。
-		for _, c := range createdTargets {
-			os.Remove(c)
-		}
+		removeCreated(createdTargets)
 	}
 	defer func() {
 		if !committedProfile {
@@ -171,9 +169,7 @@ func (e *Env) CreateInstance(ctx context.Context, app string, p Profile, id stri
 func (e *Env) prepareBindTargets(p Profile, in Instance) (created []string, err error) {
 	created = []string{}
 	fail := func(err error) ([]string, error) {
-		for _, c := range created {
-			os.Remove(c) // 只删本次新建的，且都是空目录/空文件
-		}
+		removeCreated(created) // 只删本次新建的，且都是空目录/空文件
 		return nil, err
 	}
 	// 实例侧源必须存在：⑤⑧ 的源不存在是 core 的 bug，不许用 -try 掩盖。
@@ -191,10 +187,11 @@ func (e *Env) prepareBindTargets(p Profile, in Instance) (created []string, err 
 		}
 		// 宿主侧目标：目录 0700。
 		if _, statErr := os.Stat(abs); os.IsNotExist(statErr) {
-			if err := os.MkdirAll(abs, 0o700); err != nil {
+			made, err := mkdirAllTracked(abs, 0o700)
+			created = append(created, made...)
+			if err != nil {
 				return fail(errEnv("err.env.mkdir", map[string]any{"path": abs}, err))
 			}
-			created = append(created, abs)
 		}
 	}
 	for _, lf := range p.LockFiles {
@@ -215,7 +212,9 @@ func (e *Env) prepareBindTargets(p Profile, in Instance) (created []string, err 
 		}
 		// 宿主侧锁文件必须预建 0600，理由见上（0444 会锁死主实例）。
 		if _, statErr := os.Stat(abs); os.IsNotExist(statErr) {
-			if err := os.MkdirAll(filepath.Dir(abs), 0o700); err != nil {
+			made, err := mkdirAllTracked(filepath.Dir(abs), 0o700)
+			created = append(created, made...)
+			if err != nil {
 				return fail(errEnv("err.env.mkdir", map[string]any{"path": abs}, err))
 			}
 			f, err := os.OpenFile(abs, os.O_CREATE|os.O_WRONLY, 0o600)
@@ -227,6 +226,47 @@ func (e *Env) prepareBindTargets(p Profile, in Instance) (created []string, err 
 		}
 	}
 	return created, nil
+}
+
+// mkdirAllTracked 是 os.MkdirAll 的可回滚版本：返回本次真正新建的目录
+// （由外到内），并**只创建缺的那几级**。
+//
+// 为什么要替 os.MkdirAll：`~/.config/foo/bar` 的 foo 也会被它顺手建出来，
+// 但 MkdirAll 只把最内层交给调用方，回滚时 foo 就永远留在宿主上了——
+// 用户看到的是一个自己从没建过的空目录，而 appclone 完全不知道它存在（§4 写入白名单）。
+func mkdirAllTracked(path string, perm os.FileMode) ([]string, error) {
+	var missing []string
+	for p := filepath.Clean(path); ; p = filepath.Dir(p) {
+		if _, err := os.Lstat(p); err == nil {
+			break
+		} else if !os.IsNotExist(err) {
+			return nil, err
+		}
+		missing = append(missing, p)
+		if parent := filepath.Dir(p); parent == p {
+			break // 已经走到根，理论上到不了（根一定存在）
+		}
+	}
+	var created []string
+	for i := len(missing) - 1; i >= 0; i-- {
+		if err := os.Mkdir(missing[i], perm); err != nil {
+			return created, err
+		}
+		created = append(created, missing[i])
+	}
+	return created, nil
+}
+
+// removeCreated 逆序回收 mkdirAllTracked 建出的目录：先删最内层，父目录
+// 才可能变空、才有可能被删掉。顺序反了会静默留下整条空目录链。
+func removeCreated(created []string) {
+	sorted := append([]string(nil), created...)
+	sort.SliceStable(sorted, func(i, j int) bool {
+		return pathDepth(sorted[i]) > pathDepth(sorted[j])
+	})
+	for _, c := range sorted {
+		os.Remove(c)
+	}
 }
 
 // ListInstances 读某个应用下全部实例。目录不存在返回空列表（不是错误：
@@ -329,7 +369,9 @@ func (e *Env) DeleteInstance(ctx context.Context, app, id string) error {
 			paths = append(paths, lp)
 		}
 	}
-	return e.Trasher(paths...)
+	// 走 Env.Trash 而不是直接 Trasher：它会先断言两个路径都落在 appclone
+	// 自己的范围内（§6.3 第 775 行），越界报 5 而不是交给 gio 碰运气。
+	return e.Trash(paths...)
 }
 
 // IsRunning 用 flock 试探运行态：拿到 = 没在跑（立刻释放），拿不到 = 在跑。

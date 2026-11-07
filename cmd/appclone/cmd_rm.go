@@ -39,7 +39,7 @@ func newRmCmd(a *app) *cobra.Command {
 					return err
 				}
 				if len(insts) == 0 {
-					if err := a.env.Trasher(a.env.ProfilePath(appKey)); err != nil {
+					if err := a.env.Trash(a.env.ProfilePath(appKey)); err != nil {
 						return err
 					}
 				}

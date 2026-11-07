@@ -17,6 +17,6 @@
 | 探测 L1 overlay-diff、strace 降级 | `approved`（`docs/discover.md`；两者在 Go 中均未实现） |
 | 探测 L0 静态预填、L2 语义分类 | `planned` |
 | `core.BuildBwrapArgs`（参数全序）+ 档案 TOML（未知字段保留/版本策略）+ 路径解析 + 定义校验 + 实例 CRUD + 桌面入口 + 运行态 flock | `implemented` — 2026-11-07 `go vet ./...` 干净、`go test ./...` **全绿**（bwrap golden 断言 argv 全序、公共目录/其下/`AC_BASE`/受保护目录拒绝、父子路径归一、NFC 撞名、未知字段回填、`Mkdir` 判重、`run.lock` 冲突、UTC 时间）。**未过实现审查**，故不标 `verified` |
-| CLI `add` / `run` / `list` / `rm` / `doctor` / `repair-desktop` / `version` | `implemented` — 2026-11-07 假 `$HOME` + `AC_BASE` 冒烟：`add demo` → `add demo work` → `list` → `doctor` → `rm` 全部按契约落盘；`run` 在 root 下按设计拒绝（退出 3） |
+| CLI `add` / `run` / `list` / `rm` / `doctor` / `repair-desktop` / `version` | `implemented` — 2026-11-07 假 `$HOME` + `AC_BASE` 冒烟：`add demo` → `add demo work` → `list` → `doctor` → `rm` 全部按契约落盘；`run` 在 root 下按设计拒绝（退出 3）。`rm` 的可删范围由 `Env.Trash` 硬白名单把关（越界 5 且不调 `gio`），`doctor` 的 GTK/libadwaita 版本按 `pkg-config` → 库文件名 → `warn 无法判定` 三档给结论 |
 | bwrap 参数语义实测（实例内写入 / 宿主零污染 / 公共目录共享） | `verified`（**范围受限**）— 2026-11-07 用 `appclone doctor demo main` 打印出的 argv 以 root 手工执行（产品路径 `run` 拒绝 root，本机也无法降权）：A 实例内 `root/.../.config/Demo/out.txt` 存在、A' 宿主 `~/.config/Demo` **为空**、B `~/Downloads/shared.txt` 出现。**仅证明 argv 语义**，未证明非特权 user namespace 下的同一行为 |
 | 探测管线（overlay-diff / strace 降级）、GUI 二进制 | `planned` |

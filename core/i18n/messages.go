@@ -22,6 +22,7 @@ var messages = map[string]map[string]string{
 		"err.env.open_lock":     "无法打开锁文件 {path}。",
 		"err.env.flock":         "无法锁定 {path}，文件系统可能不支持文件锁。",
 		"err.env.read_dir":      "无法读取 {path}。",
+		"err.env.stat":          "无法检查 {path} 的状态。",
 		"err.env.no_gio":        "系统缺少 gio（glib2 提供），无法把数据移入回收站。请安装 glib2 后重试；appclone 不会用 rm 代替它。",
 		"err.env.trash_failed":  "移入回收站失败：{output}",
 
@@ -73,6 +74,9 @@ var messages = map[string]map[string]string{
 		"err.instance.running":      "「{app}」的这个分身正在运行，请先在应用里退出它。",
 		"err.instance.id_exhausted": "「{app}」下的分身数量已达上限，无法再自动分配名字。",
 
+		// 删除
+		"err.trash.outside": "拒绝删除 {path}：它不在 appclone 自己的数据目录里。为了不误删你的文件，appclone 只会把 instances/、profiles.d/ 与 appclone-*.desktop 移入回收站。",
+
 		// 显示名
 		"err.display_name.empty":        "名字不能为空。",
 		"err.display_name.too_long":     "名字最长 {max} 个字，「{name}」太长了。",
@@ -115,6 +119,7 @@ var messages = map[string]map[string]string{
 		"err.env.open_lock":     "Cannot open lock file {path}.",
 		"err.env.flock":         "Cannot lock {path}; the filesystem may not support file locks.",
 		"err.env.read_dir":      "Cannot read {path}.",
+		"err.env.stat":          "Cannot stat {path}.",
 		"err.env.no_gio":        "gio (from glib2) is missing, so data cannot be moved to the trash. Install glib2 and retry; appclone will not fall back to rm.",
 		"err.env.trash_failed":  "Moving to trash failed: {output}",
 
@@ -161,6 +166,8 @@ var messages = map[string]map[string]string{
 		"err.instance.bad_time":     "Bad timestamp in {path} (expected RFC3339 UTC).",
 		"err.instance.running":      "This clone of \"{app}\" is running. Quit it in the app first.",
 		"err.instance.id_exhausted": "\"{app}\" has reached the maximum number of clones.",
+
+		"err.trash.outside": "Refusing to delete {path}: it is not inside appclone's own data directory. To avoid deleting your files by mistake, appclone only moves instances/, profiles.d/ and appclone-*.desktop to the trash.",
 
 		"err.display_name.empty":        "The name cannot be empty.",
 		"err.display_name.too_long":     "The name must be at most {max} characters; \"{name}\" is too long.",
