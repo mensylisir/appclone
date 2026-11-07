@@ -71,9 +71,9 @@ func (e *Env) Run(ctx context.Context, app, id string, opt RunOptions) (RunResul
 	if err != nil {
 		return RunResult{}, err
 	}
-	if err := e.ValidateRunnable(p); err != nil {
-		return RunResult{}, err
-	}
+	// 先补建、再校验存在性：宿主的 `paths` 目标如果被删掉了（应用重装、用户清理），
+	// 补一个空目录就能继续跑——那正是 `add` 建实例时做的事。反过来先校验的话，
+	// 用户会得到一个"档案已失效"的死胡同，而唯一的出路是重新探测（得到同一份档案）。
 	if _, err := e.prepareBindTargets(p, in); err != nil {
 		return RunResult{}, err
 	}

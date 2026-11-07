@@ -299,3 +299,37 @@ func TestValidateProfileRejectsBlanketWhitelist(t *testing.T) {
 		t.Fatalf("公共目录在 shared_writes 里应合法，得到 %v", err)
 	}
 }
+
+// 档案里的 paths 在宿主上被删掉之后：建实例要能补建（探测刚跑完时目录本来就
+// 不存在），而不是报"档案已失效"——否则用户卡在"重新配置 → 仍然失效"里。
+func TestCreateInstanceRecreatesMissingPath(t *testing.T) {
+	e := testEnv(t)
+	app, p := seedApp(t, e)
+	gone := filepath.Join(e.Resolver.Home, ".config", "Gone")
+	if err := os.MkdirAll(gone, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	p.Paths = []string{"~/.config/Gone"}
+	// 先确认它存在时能建出一个实例。
+	if _, err := e.CreateInstance(context.Background(), app, p, "one"); err != nil {
+		t.Fatalf("第一次建实例失败：%v", err)
+	}
+	// 删掉宿主目录，再用同一个档案建第二个实例：必须补建而不是报 stale。
+	if err := os.RemoveAll(gone); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.CreateInstance(context.Background(), app, p, "two"); err != nil {
+		t.Fatalf("目录缺失时应补建而不是报 stale：%v", err)
+	}
+	if st, err := os.Stat(gone); err != nil || !st.IsDir() {
+		t.Fatalf("宿主目录应被补建：%v", err)
+	}
+	// ProfileState 也不该因为目录缺失就把档案判成失效。
+	hasProfile, creatable, err := e.ProfileState(app)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !hasProfile || !creatable {
+		t.Fatalf("档案可创建：hasProfile=%v creatable=%v", hasProfile, creatable)
+	}
+}
