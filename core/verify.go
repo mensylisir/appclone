@@ -23,12 +23,13 @@ const (
 // Verdict 是 `doctor --verify` 的完整结论。字段全是"给人看 + 给脚本用"的：
 // 结论、覆盖率、越界清单、被忽略的类别、证据是否保留。
 type Verdict struct {
-	Conclusion string   `json:"conclusion"`
-	Coverage   []string `json:"coverage"`
-	Violations []string `json:"violations"`
-	Ignored    []string `json:"ignored"`
-	Retained   bool     `json:"retained"`         // 越界时证据必须留着，否则等于销毁用户数据
-	Reason     string   `json:"reason,omitempty"` // unverified 的原因，如 audit_not_enabled
+	Conclusion  string   `json:"conclusion"`
+	Coverage    []string `json:"coverage"`
+	Violations  []string `json:"violations"`
+	Ignored     []string `json:"ignored"`
+	Retained    bool     `json:"retained"`               // 越界时证据必须留着，否则等于销毁用户数据
+	Reason      string   `json:"reason,omitempty"`       // unverified 的原因，如 audit_not_enabled
+	GeneratedAt string   `json:"generated_at,omitempty"` // 重放已存摘要时带上它，用户才知道结论有多旧
 }
 
 // ExitCode 是结论对应的退出码：只有 leak-detected 是失败（8）。
@@ -162,20 +163,21 @@ type Summary struct {
 	Conclusion  string   `toml:"conclusion"`
 	Coverage    []string `toml:"coverage"`
 	Violations  []string `toml:"violations"`
+	Ignored     []string `toml:"ignored,omitempty"` // §5：结论必须带上"被忽略的类别"
 	Retained    bool     `toml:"evidence_retained"`
 	GeneratedAt string   `toml:"generated_at,omitempty"`
 	Reason      string   `toml:"reason,omitempty"`
-	Ignored     []string `toml:"-"`
 }
 
 func (s Summary) Verdict() Verdict {
 	return Verdict{
-		Conclusion: s.Conclusion,
-		Coverage:   s.Coverage,
-		Violations: s.Violations,
-		Ignored:    s.Ignored,
-		Retained:   s.Retained,
-		Reason:     s.Reason,
+		Conclusion:  s.Conclusion,
+		Coverage:    s.Coverage,
+		Violations:  s.Violations,
+		Ignored:     s.Ignored,
+		Retained:    s.Retained,
+		Reason:      s.Reason,
+		GeneratedAt: s.GeneratedAt,
 	}
 }
 
@@ -190,7 +192,9 @@ func readSummary(path string) (Verdict, bool, error) {
 		return Verdict{}, false, errEnv("err.internal.read_profile", map[string]any{"path": path}, err)
 	}
 	var s Summary
-	if _, err := toml.Decode(string(data), &s); err != nil || s.Conclusion == "" {
+	// 结论必须是枚举里的三选一：手写 `conclusion = "OK"` 会被 ExitCode 当成 0
+	// （"通过"），而 CLI 的 switch 落到 default 打印 unverified —— 同一份证据两种说法。
+	if _, derr := toml.Decode(string(data), &s); derr != nil || !isVerdict(s.Conclusion) {
 		return Verdict{
 			Conclusion: VerdictUnverified,
 			Coverage:   []string{},
@@ -206,7 +210,16 @@ func readSummary(path string) (Verdict, bool, error) {
 	if s.Violations == nil {
 		s.Violations = []string{}
 	}
+	// 摘要自己写矛盾时按"保守"读：说泄漏却不保留证据 = 证据已经被删了，
+	// 这一点必须如实反映给用户，不能被 summary 里的 false 抹平。
+	if s.Conclusion == VerdictLeak {
+		s.Retained = true
+	}
 	return s.Verdict(), true, nil
+}
+
+func isVerdict(s string) bool {
+	return s == VerdictVerified || s == VerdictLeak || s == VerdictUnverified
 }
 
 func fileExists(p string) bool {
@@ -318,9 +331,10 @@ func ancestorOfAny(abs string, entries []UpperEntry, home string) bool {
 	return false
 }
 
-// readUpperTree 把 audit/upper 读成条目列表。present=false 表示"没有证据"，
+// readUpperTree 把 upper 读成条目列表。present=false 表示"没有证据"，
 // 它与"读了但为空"是两件事：后者意味着审计跑过且**什么都没写**，前者意味着
-// 根本没审计——结论不同（unverified vs verified），不能合并。
+// 根本没审计。**两者都是 unverified**（空集不算通过，§6.5），但原因不同
+// （`audit_not_enabled` vs `no_writes`），下一步也不同，所以不能合并。
 func readUpperTree(dir string) (entries []UpperEntry, present bool, err error) {
 	fi, err := os.Stat(dir)
 	if err != nil {

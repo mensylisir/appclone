@@ -54,6 +54,22 @@ GUI 方向定案：**GTK4 + libadwaita 原生控件，经 puregotk 绑定（零 
 
 ## 最近完成
 
+- 2026-11-07 **第十五轮：把上一轮"记录不修"的项清掉**（复审被 429 挡住后接着做）：
+  - **软链 XDG 根**（原 P1）：`~/.config` 指到 `~/cfg` 时，upper 里是真实路径、档案里是词法路径，
+    只比一种就"认不出来"，候选凭空消失。新增 `looseRel`（词法+真实各试一次），分类与归并全部改用它；
+    断言覆盖两种形态与"归并后候选不丢"。
+  - **summary.toml 的形状**（原 P2）：`ignored` 以前是 `toml:"-"`（永远写不进摘要，违反"必须列出
+    被忽略的类别"）；`conclusion` 不校验枚举（手写 `"OK"` 会让退出码 0 而 CLI 打印 unverified）；
+    `leak-detected` + `evidence_retained = false` 会被照抄成"没保留"。三处都收紧了，并补 `generated_at`。
+  - **`ProfileFromCandidates` 跨字段去重** + `unsupported` 补 `reason`：同一路径不能既进 `paths`
+    又进 `shared_writes`（否则 bwrap 先隔离再共享，结果取决于参数顺序）。
+  - **doctor 三处"假通过/越权"**：`state-dir` 不再 `MkdirAll`（它宣称只读），改为向上找第一个存在的祖先
+    判可写；`/dev/fuse` 用 `Access(R_OK|W_OK)`（`Stat` 分不清"存在但打不开"）；userns 两个 sysctl
+    都读不到时给 `warn`（原来判 ok）。
+  - **`libVersion` 只对 GTK 解码**：`libadwaita-1.so.0.5.0` 套 GTK 的 `minor*100` 公式会读成 1.15.0
+    —— 宁可"无法判定"，也不能给一个看起来很像的错版本。
+  - 文档补两处已知取舍（`~/.local/state` 同时出现在 ignored 与可勾选根里不矛盾；verify 的
+    `run.lock` 只在锁文件已存在时才 `LOCK_NB`，因为它是只读命令）。
 - 2026-11-07 **第十四轮：实现审查判 REJECTED 后的修复**（1 P0 + 8 P1，其余记入待办）：
   - **P0 公共目录清单一直在退化**：`user-dirs.dirs` 的键是 `XDG_DOWNLOAD_DIR`，解析只剥了 `_DIR`
     留下 `XDG_DOWNLOAD`，而查表用 `DOWNLOAD` → 永远查不到，`PublicDirs()` 一直只返回英文默认名。

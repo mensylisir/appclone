@@ -175,3 +175,39 @@ func writeTree(t *testing.T, path string) {
 		t.Fatal(err)
 	}
 }
+
+// 摘要里的结论只认三个枚举值，且"说泄漏却没保留证据"按保留读：
+// 否则手写一份 summary.toml 就能让 verify 报一个自相矛盾的结论。
+func TestReadSummaryValidatesConclusion(t *testing.T) {
+	e := testEnv(t)
+	app, _ := seedVerifyApp(t, e)
+	dir := e.AuditDir(app, "main")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "summary.toml")
+	cases := []struct {
+		body     string
+		want     string
+		retained bool
+	}{
+		{"conclusion = \"OK\"\nviolations = []\n", VerdictUnverified, true},
+		{"conclusion = \"verified\"\n", VerdictVerified, false},
+		{"conclusion = \"leak-detected\"\nevidence_retained = false\n", VerdictLeak, true},
+	}
+	for _, c := range cases {
+		if err := os.WriteFile(path, []byte(c.body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		v, ok, err := readSummary(path)
+		if err != nil || !ok {
+			t.Fatalf("读 %q 失败：%v", c.body, err)
+		}
+		if v.Conclusion != c.want {
+			t.Fatalf("结论 %q 应被判成 %s，得到 %s", c.body, c.want, v.Conclusion)
+		}
+		if v.Retained != c.retained {
+			t.Fatalf("retained 期望 %v，得到 %v（%q）", c.retained, v.Retained, c.body)
+		}
+	}
+}

@@ -220,6 +220,10 @@ func runChecks(a *app) []check {
 		add("userns", "fail", "max_user_namespaces=0，非特权用户命名空间被禁用")
 	case clone != "" && clone != "1":
 		add("userns", "fail", "unprivileged_userns_clone="+clone+"，非特权用户命名空间被禁用")
+	case maxNS == "" && clone == "":
+		// 两个 sysctl 都读不到（容器/受限 /proc）时判 ok 是假通过：
+		// doctor 的全部价值就是"能确认"，确认不了要给 warn。
+		add("userns", "warn", "读不到 userns 相关 sysctl（/proc 受限），无法确认；实际能否建 user ns 需实测")
 	default:
 		add("userns", "ok", "可用（max_user_namespaces="+orDefault(maxNS, "?")+"）")
 	}
@@ -236,7 +240,9 @@ func runChecks(a *app) []check {
 	}
 
 	if p, err := exec.LookPath("fuse-overlayfs"); err == nil {
-		if _, err := os.Stat("/dev/fuse"); err == nil {
+		// 用 Access(R_OK) 而不是 Stat：设备节点存在但打不开（权限/被 mask）
+		// 是最常见的形态，Stat 会说"有"，实际挂载立刻失败。
+		if err := unix.Access("/dev/fuse", unix.R_OK|unix.W_OK); err == nil {
 			add("fuse", "ok", "fuse-overlayfs 可用（"+p+"）")
 		} else {
 			add("fuse", "warn", "fuse-overlayfs 在，但 /dev/fuse 打不开；探测将降级到 strace")
@@ -265,22 +271,36 @@ func runChecks(a *app) []check {
 
 	// 数据目录可写性：doctor 是**只读**命令，不创建目录、不写探针文件——
 	// 那超出了 §4 的写入白名单，而且一个"检查环境"的命令顺手改环境会让人不敢用。
-	if _, err := os.Stat(a.env.Base); err != nil {
-		if os.IsNotExist(err) {
-			if parent := filepath.Dir(a.env.Base); unix.Access(parent, unix.W_OK) != nil {
-				add("state-dir", "fail", "数据目录的上级不可写："+parent)
-			} else {
-				add("state-dir", "warn", "数据目录还不存在（首次运行时会创建）："+a.env.Base)
-			}
+	if _, err := os.Stat(a.env.Base); err == nil {
+		if err := unix.Access(a.env.Base, unix.W_OK); err != nil {
+			add("state-dir", "fail", "数据目录不可写："+a.env.Base)
 		} else {
-			add("state-dir", "fail", "数据目录不可访问："+a.env.Base)
+			add("state-dir", "ok", a.env.Base)
 		}
-	} else if err := unix.Access(a.env.Base, unix.W_OK); err != nil {
-		add("state-dir", "fail", "数据目录不可写："+a.env.Base)
+	} else if !os.IsNotExist(err) {
+		add("state-dir", "fail", "数据目录不可访问："+a.env.Base)
+	} else if anc, ok := existingAncestor(filepath.Dir(a.env.Base)); !ok {
+		add("state-dir", "fail", "数据目录的上级都不存在："+filepath.Dir(a.env.Base))
+	} else if err := unix.Access(anc, unix.W_OK); err != nil {
+		add("state-dir", "fail", "数据目录的上级不可写："+anc)
 	} else {
-		add("state-dir", "ok", a.env.Base)
+		// 全新会话里 xdg 目录链常常还没建；这是正常状态，不是错误。
+		add("state-dir", "warn", "数据目录还不存在（首次运行时会创建）："+a.env.Base)
 	}
 	return out
+}
+
+// existingAncestor 往上找到第一个存在的目录：新建会话里
+// `$XDG_DATA_HOME/appclone` 的整条链可能都不存在，"能不能写"要问最上层那个存在的。
+func existingAncestor(dir string) (string, bool) {
+	for p := filepath.Clean(dir); ; p = filepath.Dir(p) {
+		if _, err := os.Stat(p); err == nil {
+			return p, true
+		}
+		if parent := filepath.Dir(p); parent == p {
+			return "", false
+		}
+	}
 }
 
 // gtkCheck 查 GUI 两个运行库的版本，CLI 二进制绝不 import GUI 包：
@@ -352,6 +372,12 @@ func findLib(soname string) string {
 // 命名能给出结果（GTK 是；libadwaita 在多数发行版上是平的
 // `libadwaita-1.so.0`，拿不到）。
 func libVersion(path, soname string) (version, source string) {
+	// 只对 GTK 解码：`libgtk-4.so.1.<minor*100>.<micro>` 是 GTK 自己的 libtool
+	// 约定（4.24.1 → 2400.1）。libadwaita 用的是另一套编号，套同一个公式会把
+	// `1.5.0` 读成 `1.15.0` —— 宁可返回"不知道"，也不能给一个看起来很像的错版本。
+	if !strings.HasPrefix(soname, "libgtk-") {
+		return "", ""
+	}
 	real := path
 	if r, err := filepath.EvalSymlinks(path); err == nil {
 		real = r

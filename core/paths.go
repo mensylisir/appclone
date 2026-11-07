@@ -196,6 +196,31 @@ func IsUnder(parent, child string) bool {
 	return ok
 }
 
+// looseRel 在**词法与真实**两种形态下各试一次 relUnder，返回命中的基准与相对路径。
+//
+// 存在的理由：软链是常态（§6.4）——`~/.config` 可能指向 `~/cfg`，家目录本身也可能
+// 是挂载点软链。upper 里记录的是**真实**路径，而档案里写的是**词法**路径（`~/...`）。
+// 只比其中一种，结论就是"认不出这是配置目录"，用户看到的是"预勾选项凭空消失"。
+func looseRel(root, child string) (base, rel string, ok bool) {
+	if rel, ok := relUnder(root, child); ok {
+		return root, rel, true
+	}
+	rr, rc := Real(root), Real(child)
+	if rr == root && rc == child {
+		return "", "", false // 两边都没被解析过，上面的判定已覆盖全部可能
+	}
+	if rel, ok := relUnder(rr, rc); ok {
+		return rr, rel, true
+	}
+	return "", "", false
+}
+
+// isUnderLoose 是 looseRel 的布尔版。
+func isUnderLoose(root, child string) bool {
+	_, _, ok := looseRel(root, child)
+	return ok
+}
+
 // PublicDirs 返回公共目录清单（§5 与 discover.md §5 的同一份数据）。
 // 优先读 user-dirs.dirs，缺失或值为 $HOME 本身时用 XDG 规范的英文默认名。
 // 返回的路径**不保证存在**：判定的是"这是不是一个公共目录"，不是"它在不在"。

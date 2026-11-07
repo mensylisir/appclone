@@ -38,7 +38,7 @@ type Candidate struct {
 // isPublic 判定公共目录本身或其中任何路径（§5 规则 1，最高优先级）。
 func (r *PathResolver) isPublic(abs string) bool {
 	for _, pub := range r.PublicDirs() {
-		if IsUnder(pub, abs) {
+		if isUnderLoose(pub, abs) {
 			return true
 		}
 	}
@@ -54,7 +54,7 @@ func (r *PathResolver) isKeyring(abs string) bool {
 		filepath.Join(r.XDG["CONFIG_HOME"], "keyrings"),
 		filepath.Join(r.XDG["DATA_HOME"], "keyrings"),
 	} {
-		if IsUnder(base, abs) {
+		if isUnderLoose(base, abs) {
 			return true
 		}
 	}
@@ -80,7 +80,7 @@ func (r *PathResolver) sharedWriteDirs() []string {
 
 func (r *PathResolver) isSharedWrite(abs string) bool {
 	for _, dir := range r.sharedWriteDirs() {
-		if IsUnder(dir, abs) {
+		if isUnderLoose(dir, abs) {
 			return true
 		}
 	}
@@ -107,8 +107,8 @@ func (r *PathResolver) isSharedWrite(abs string) bool {
 // 只看**主目录之内**的部分：绝对路径的祖先段与本判定无关，而 `$TMPDIR` 恰好
 // 常常在 `~/.cache` 下（测试环境即如此），扫全路径会把整棵临时树判成缓存。
 func (r *PathResolver) hasCacheComponent(abs string) bool {
-	rel, ok := relUnder(r.Home, abs)
-	if !ok || rel == "" {
+	rel, ok := "", false
+	if _, rel, ok = looseRel(r.Home, abs); !ok || rel == "" {
 		rel = abs
 	}
 	for _, seg := range strings.Split(rel, string(filepath.Separator)) {
@@ -172,7 +172,7 @@ func (r *PathResolver) underXdgAppDirs(abs string) bool {
 		r.XDG["CONFIG_HOME"], r.XDG["DATA_HOME"], r.XDG["STATE_HOME"],
 		filepath.Join(r.Home, ".var", "app"),
 	} {
-		if rel, ok := relUnder(root, abs); ok && rel != "" {
+		if _, rel, ok := looseRel(root, abs); ok && rel != "" {
 			return true
 		}
 	}
@@ -183,7 +183,7 @@ func (r *PathResolver) underXdgAppDirs(abs string) bool {
 // 它同时覆盖目录与单文件（`~/.apprc`）：overlay 里两者形态相同，
 // 而"是不是应用自己的"这件事两者一样说不清。
 func isTopLevelDotdir(home, abs string) bool {
-	rel, ok := relUnder(home, abs)
+	_, rel, ok := looseRel(home, abs)
 	if !ok || rel == "" {
 		return false
 	}
@@ -194,7 +194,7 @@ func isTopLevelDotdir(home, abs string) bool {
 // underAny 判定 abs 是否落在任一前缀之下（含相等）。
 func underAny(abs string, prefixes ...string) bool {
 	for _, p := range prefixes {
-		if IsUnder(p, abs) {
+		if isUnderLoose(p, abs) {
 			return true
 		}
 	}

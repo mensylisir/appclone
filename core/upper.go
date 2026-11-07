@@ -135,24 +135,28 @@ func (r *PathResolver) MergeUpper(entries []UpperEntry) ([]Candidate, []string) 
 func (r *PathResolver) ownerOf(abs string) (string, bool) {
 	roots := r.xdgRoots()
 	for _, root := range roots {
-		if abs == root {
+		// looseRel 同时认词法与真实形态：`~/.config` 软链到 `~/cfg` 时，
+		// upper 里记录的是 `cfg/App/...`，只比词法根会匹配不上，整条候选消失。
+		base, rel, ok := looseRel(root, abs)
+		if !ok {
+			continue
+		}
+		if rel == "" {
 			return "", false // 纯父目录：不是候选
 		}
-		if rel, ok := relUnder(root, abs); ok {
-			first, _, _ := strings.Cut(rel, string(filepath.Separator))
-			owner := filepath.Join(root, first)
-			if owner == r.Home {
-				return "", false
-			}
-			return owner, true
-		}
-	}
-	if rel, ok := relUnder(r.Home, abs); ok && rel != "" {
 		first, _, _ := strings.Cut(rel, string(filepath.Separator))
-		owner := filepath.Join(r.Home, first)
+		owner := filepath.Join(base, first)
+		if owner == r.Home || owner == Real(r.Home) {
+			return "", false
+		}
+		return owner, true
+	}
+	if base, rel, ok := looseRel(r.Home, abs); ok && rel != "" {
+		first, _, _ := strings.Cut(rel, string(filepath.Separator))
+		owner := filepath.Join(base, first)
 		// 祖先：`~/.local` 是 DATA_HOME/STATE_HOME 的祖先，`~/.var` 是 Flatpak 根的祖先。
 		for _, root := range roots {
-			if IsUnder(owner, root) {
+			if isUnderLoose(owner, root) {
 				return "", false
 			}
 		}
@@ -178,6 +182,9 @@ func (r *PathResolver) xdgRoots() []string {
 //
 // 未勾选的条目直接丢弃：它们不是"以后再说"，而是"这次不隔离"，写进档案只会
 // 让下一次"重新配置"看见一堆用户已经从没勾过的项。
+// 未勾选的 config/data/cache 条目直接丢弃（"这次不隔离"），但 shared 与 keyring
+// **不看勾选**：前者是"隔离会坏功能"的硬事实，后者是"根本隔离不了"的声明，
+// 两者都不该因为用户没勾就消失（§5.4）。
 func (r *PathResolver) ProfileFromCandidates(app, method string, cands []Candidate) Profile {
 	p := Profile{
 		App:         app,
@@ -186,19 +193,28 @@ func (r *PathResolver) ProfileFromCandidates(app, method string, cands []Candida
 		Ignored:     DefaultIgnored(),
 		Env:         map[string]string{},
 	}
+	seen := map[string]bool{}
+	put := func(dst *[]string, path string) {
+		if seen[path] {
+			return
+		}
+		seen[path] = true
+		*dst = append(*dst, path)
+	}
 	for _, c := range cands {
+		store := r.ToStoreForm(c.Path)
 		switch c.Class {
 		case ClassShared:
-			p.SharedWrites = append(p.SharedWrites, r.ToStoreForm(c.Path))
+			put(&p.SharedWrites, store)
 		case ClassKeyring:
 			p.Unsupported = append(p.Unsupported, Unsupported{
-				Kind: "keyring", Path: r.ToStoreForm(c.Path),
+				Kind: "keyring", Path: store, Reason: "probe.why.keyring",
 			})
 		default:
 			if !c.Checked {
 				continue
 			}
-			p.Paths = append(p.Paths, r.ToStoreForm(c.Path))
+			put(&p.Paths, store)
 		}
 	}
 	sort.Strings(p.Paths)

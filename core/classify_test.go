@@ -292,3 +292,52 @@ func TestMergeUpperCountsOnlyNonDirEntries(t *testing.T) {
 		t.Fatalf("应记 2 条写入条目，得到 %+v", cands)
 	}
 }
+
+// 软链的 XDG 根是常态（`~/.config -> ~/cfg`）。upper 里记录的是**真实**路径，
+// 只比词法根会认不出来，候选凭空消失——用户看到的是"没有可勾的配置目录"。
+func TestClassifyFollowsSymlinkedXdgRoot(t *testing.T) {
+	r := classifyEnv(t)
+	realCfg := filepath.Join(r.Home, "cfg")
+	if err := os.MkdirAll(filepath.Join(realCfg, "App"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(realCfg, filepath.Join(r.Home, ".config")); err != nil {
+		t.Skipf("这个环境不支持软链：%v", err)
+	}
+	// 真实形态（upper 里就是这种）
+	realPath := filepath.Join(realCfg, "App")
+	if class, checked, _, _ := r.Classify(realPath); class != ClassConfig || !checked {
+		t.Fatalf("软链目标的配置目录应判 config 且默认勾选，得到 %s/%v", class, checked)
+	}
+	// 词法形态（用户/文档里写的 `~/.config/App`）
+	lexPath := filepath.Join(r.Home, ".config", "App")
+	if class, checked, _, _ := r.Classify(lexPath); class != ClassConfig || !checked {
+		t.Fatalf("软链路径本身也应判 config，得到 %s/%v", class, checked)
+	}
+	// 归并：upper 里给真实路径，候选不能丢
+	cands, _ := r.MergeUpper([]UpperEntry{{Path: "cfg/App/x.json", Kind: EntryFile}})
+	if len(cands) != 1 {
+		t.Fatalf("软链 XDG 根下的写入应归并出 1 条候选，得到 %+v", cands)
+	}
+	if cands[0].Class != ClassConfig || !cands[0].Checked {
+		t.Fatalf("候选应可隔离，得到 %s/%v", cands[0].Class, cands[0].Checked)
+	}
+}
+
+// 同一条路径只能落在一个字段里：同时进 paths 与 shared_writes 会让 bwrap 先隔离
+// 再共享，结果取决于参数顺序——那是"看起来设置过、实际不确定"的状态。
+func TestProfileFromCandidatesDropsCrossFieldDuplicates(t *testing.T) {
+	r := classifyEnv(t)
+	same := filepath.Join(r.Home, ".config", "App")
+	out := r.ProfileFromCandidates("x", "overlay", []Candidate{
+		{Path: same, Class: ClassConfig, Checked: true},
+		{Path: same, Class: ClassShared},
+	})
+	total := len(out.Paths) + len(out.SharedWrites)
+	if total != 1 {
+		t.Fatalf("同一路径只该出现一次：paths=%v shared=%v", out.Paths, out.SharedWrites)
+	}
+	if len(out.Unsupported) != 0 {
+		t.Fatalf("这条不该产生 unsupported：%+v", out.Unsupported)
+	}
+}
