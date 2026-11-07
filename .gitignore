@@ -6,3 +6,9 @@ node_modules/
 /appclone
 /appclone-gui
 /legacy/*.out
+
+# 本地冒烟与构建暂存（假 HOME、编出的二进制都放这里）
+/.tmp/
+
+# 冒烟时 gio trash 会在数据目录所在卷根建 Trash 目录
+.Trash-*/

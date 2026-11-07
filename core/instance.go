@@ -1,0 +1,407 @@
+package core
+
+import (
+	"context"
+	"os"
+	"path/filepath"
+	"sort"
+	"strings"
+
+	"golang.org/x/text/unicode/norm"
+
+	"golang.org/x/sys/unix"
+)
+
+// CreateInstance 建实例：写档案 + 建实例目录 + 生成桌面入口。
+//
+// 事务顺序（§11）不能改：中途崩溃会留下"有实例无档案""有入口无实例"三类半成品，
+// 而三类半成品在 GUI 上表现为"开关是开的，点进去什么都没有"。
+func (e *Env) CreateInstance(ctx context.Context, app string, p Profile, id string) (Instance, error) {
+	if err := ValidateAppKey(app); err != nil {
+		return Instance{}, err
+	}
+	if id != "" {
+		if err := ValidateID(id); err != nil {
+			return Instance{}, err
+		}
+	}
+	p.App = app
+	// 1. 全部校验在内存里做完，一个字节都不写。
+	if err := ValidateProfile(p, e.BuildOptions()); err != nil {
+		return Instance{}, err
+	}
+	if err := ValidateCreatable(p); err != nil {
+		return Instance{}, err
+	}
+	if err := e.ValidateRunnable(p); err != nil {
+		return Instance{}, err
+	}
+
+	existing, err := e.ListInstances(app)
+	if err != nil {
+		return Instance{}, err
+	}
+	names := make([]string, 0, len(existing))
+	for _, in := range existing {
+		names = append(names, in.DisplayName)
+	}
+
+	if id == "" {
+		if id, err = e.AllocID(app); err != nil {
+			return Instance{}, err
+		}
+	}
+	display := AllocDisplayName(names)
+	if err := ValidateDisplayName(display, names); err != nil {
+		return Instance{}, err
+	}
+
+	now := e.Clock().UTC()
+	in := Instance{
+		Version:     ProfileVersion,
+		App:         app,
+		ID:          id,
+		DisplayName: display,
+		CreatedAt:   now,
+		ProbeMethod: p.ProbeMethod,
+		Root:        filepath.Join(e.InstancePath(app, id), "root"),
+	}
+
+	// 2. 档案写到临时文件，先不 rename（提交点是两个 rename，各原子）。
+	profBytes, err := encodeProfile(p)
+	if err != nil {
+		return Instance{}, err
+	}
+	profTmp, err := stageFile(e.ProfilePath(app), profBytes, 0o600)
+	if err != nil {
+		return Instance{}, err
+	}
+	committedProfile := false
+	cleanup := func() {
+		os.Remove(profTmp)
+		os.RemoveAll(e.InstancePath(app, id)) // 只删本次新建的实例目录
+	}
+	defer func() {
+		if !committedProfile {
+			os.Remove(profTmp)
+		}
+	}()
+
+	// 3. Mkdir 的 EEXIST 是唯一判重依据：锁外先 stat 再 Mkdir 会 TOCTOU，
+	// 两个进程都看到"不存在"，其中一个的数据被覆盖（§4.2）。
+	if err := os.MkdirAll(filepath.Join(e.Base, "instances", app), 0o700); err != nil {
+		return Instance{}, errEnv("err.env.mkdir", map[string]any{"path": e.Base}, err)
+	}
+	if err := os.Mkdir(e.InstancePath(app, id), 0o700); err != nil {
+		if os.IsExist(err) {
+			ids := make([]string, 0, len(existing))
+			for _, o := range existing {
+				ids = append(ids, o.ID)
+			}
+			return Instance{}, errConflict("err.instance.exists", map[string]any{
+				"app": app, "id": id, "existing": ids,
+			})
+		}
+		return Instance{}, errEnv("err.env.mkdir", map[string]any{"path": e.InstancePath(app, id)}, err)
+	}
+
+	// 4. 子目录与元数据。
+	for _, sub := range []string{"root", "locks", "runtime", "dbus", "audit"} {
+		if err := os.MkdirAll(filepath.Join(e.InstancePath(app, id), sub), 0o700); err != nil {
+			cleanup()
+			return Instance{}, errEnv("err.env.mkdir", map[string]any{"path": sub}, err)
+		}
+	}
+	if _, err := e.prepareBindTargets(p, in); err != nil {
+		cleanup()
+		return Instance{}, err
+	}
+	if err := e.saveInstance(in); err != nil {
+		cleanup()
+		return Instance{}, err
+	}
+
+	// 5. 桌面入口也先写临时文件。源 .desktop 必须在（§6.3：找不到应用/无 Exec 报 2）。
+	d, err := e.LoadApp(app)
+	if err != nil {
+		cleanup()
+		return Instance{}, err
+	}
+	launcherBytes, err := e.renderLauncher(in, d)
+	if err != nil {
+		cleanup()
+		return Instance{}, err
+	}
+	launcherPath := e.LauncherPath(app, id)
+	launchTmp, err := stageFile(launcherPath, launcherBytes, 0o644)
+	if err != nil {
+		cleanup()
+		return Instance{}, err
+	}
+
+	// 6. 提交：档案 → 入口。两个 rename 各原子，中间失败最多留下"有档案无入口"，
+	// repair-desktop 能补，不会丢数据。
+	if err := os.Rename(profTmp, e.ProfilePath(app)); err != nil {
+		os.Remove(launchTmp)
+		cleanup()
+		return Instance{}, errEnv("err.env.write", map[string]any{"path": e.ProfilePath(app)}, err)
+	}
+	committedProfile = true
+	if err := os.Rename(launchTmp, launcherPath); err != nil {
+		os.Remove(launchTmp)
+		cleanup()
+		return Instance{}, errEnv("err.env.write", map[string]any{"path": launcherPath}, err)
+	}
+	return in, nil
+}
+
+// prepareBindTargets 为 bind 目标补建占位物（§4 白名单的唯一显式例外）。
+//
+// 只增不删，并返回"本次新建清单"——失败回滚时只回收自己建的那些。
+// 为什么必须自己建：bwrap 会在**宿主**为不存在的 bind 目标建占位物，
+// 文件是 **0444**，那个权限会让应用 O_WRONLY 打开失败、也会让主实例
+// 之后打不开同名锁文件（§3.2 第 2 条）。
+func (e *Env) prepareBindTargets(p Profile, in Instance) (created []string, err error) {
+	created = []string{}
+	fail := func(err error) ([]string, error) {
+		for _, c := range created {
+			os.Remove(c) // 只删本次新建的，且都是空目录/空文件
+		}
+		return nil, err
+	}
+	// 实例侧源必须存在：⑤⑧ 的源不存在是 core 的 bug，不许用 -try 掩盖。
+	for _, raw := range p.Paths {
+		abs, err := e.Resolver.Expand(raw)
+		if err != nil {
+			return fail(err)
+		}
+		src, err := instanceChild(in.Root, abs)
+		if err != nil {
+			return fail(err)
+		}
+		if err := os.MkdirAll(src, 0o700); err != nil {
+			return fail(errEnv("err.env.mkdir", map[string]any{"path": src}, err))
+		}
+		// 宿主侧目标：目录 0700。
+		if _, statErr := os.Stat(abs); os.IsNotExist(statErr) {
+			if err := os.MkdirAll(abs, 0o700); err != nil {
+				return fail(errEnv("err.env.mkdir", map[string]any{"path": abs}, err))
+			}
+			created = append(created, abs)
+		}
+	}
+	for _, lf := range p.LockFiles {
+		abs, err := e.Resolver.Expand(lf)
+		if err != nil {
+			return fail(err)
+		}
+		lockSrc := filepath.Join(in.Root, "locks", lockFileName(abs))
+		if _, statErr := os.Stat(lockSrc); os.IsNotExist(statErr) {
+			if err := os.MkdirAll(filepath.Dir(lockSrc), 0o700); err != nil {
+				return fail(errEnv("err.env.mkdir", map[string]any{"path": lockSrc}, err))
+			}
+			if f, err := os.OpenFile(lockSrc, os.O_CREATE|os.O_WRONLY, 0o600); err == nil {
+				f.Close()
+			} else {
+				return fail(errEnv("err.env.write", map[string]any{"path": lockSrc}, err))
+			}
+		}
+		// 宿主侧锁文件必须预建 0600，理由见上（0444 会锁死主实例）。
+		if _, statErr := os.Stat(abs); os.IsNotExist(statErr) {
+			if err := os.MkdirAll(filepath.Dir(abs), 0o700); err != nil {
+				return fail(errEnv("err.env.mkdir", map[string]any{"path": abs}, err))
+			}
+			f, err := os.OpenFile(abs, os.O_CREATE|os.O_WRONLY, 0o600)
+			if err != nil {
+				return fail(errEnv("err.env.write", map[string]any{"path": abs}, err))
+			}
+			f.Close()
+			created = append(created, abs)
+		}
+	}
+	return created, nil
+}
+
+// ListInstances 读某个应用下全部实例。目录不存在返回空列表（不是错误：
+// "从没开过分身"是最正常的状态）。
+func (e *Env) ListInstances(app string) ([]Instance, error) {
+	dir := filepath.Join(e.Base, "instances", app)
+	ents, err := os.ReadDir(dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, errEnv("err.env.read_dir", map[string]any{"path": dir}, err)
+	}
+	out := make([]Instance, 0, len(ents))
+	for _, ent := range ents {
+		if !ent.IsDir() {
+			continue
+		}
+		in, err := e.loadInstance(app, ent.Name())
+		if err != nil {
+			// 单个实例元数据损坏不该让整页消失：跳过并保留其余，
+			// GUI 上表现为"少一个分身"，CLI 上由 doctor 指出。
+			continue
+		}
+		out = append(out, in)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	return out, nil
+}
+
+// GetInstance 读单个实例。
+func (e *Env) GetInstance(app, id string) (Instance, error) {
+	if err := ValidateID(id); err != nil {
+		return Instance{}, err
+	}
+	return e.loadInstance(app, id)
+}
+
+// RenameInstance 只改 display_name，并原子重写同一个 .desktop。
+// 不换文件名：入口名只由 app/id 决定，改 display_name 换文件名会往回收站
+// 里堆过期入口，还在删与建之间留一个"入口消失"的窗口（§4）。
+func (e *Env) RenameInstance(app, id, newName string) error {
+	in, err := e.GetInstance(app, id)
+	if err != nil {
+		return err
+	}
+	list, err := e.ListInstances(app)
+	if err != nil {
+		return err
+	}
+	existing := make([]string, 0, len(list))
+	for _, o := range list {
+		if o.ID == id {
+			continue
+		}
+		existing = append(existing, o.DisplayName)
+	}
+	if err := ValidateDisplayName(newName, existing); err != nil {
+		return err
+	}
+	in.DisplayName = norm.NFC.String(strings.TrimSpace(newName))
+	if err := e.saveInstance(in); err != nil {
+		return err
+	}
+	if d, err := e.LoadApp(in.App); err == nil {
+		return e.WriteLauncher(in, d)
+	}
+	// 源 .desktop 不在了（应用被卸载）：实例元数据已改，入口保留旧名，
+	// 由 repair-desktop 或删除路径处理。这里不退化成"删掉入口"。
+	return nil
+}
+
+// DeleteInstance 删实例 + 入口，一律进回收站。
+//
+// 自己以 LOCK_NB 打开并持有 run.lock 直到 gio trash 返回：检查"没在跑"与
+// trash 之间存在竞态，另一个进程可以在中间 run 起来，随后目录被搬走（§4.2）。
+func (e *Env) DeleteInstance(ctx context.Context, app, id string) error {
+	if _, err := e.GetInstance(app, id); err != nil {
+		return err
+	}
+	lockPath := filepath.Join(e.InstancePath(app, id), "run.lock")
+	f, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return errEnv("err.env.open_lock", map[string]any{"path": lockPath}, err)
+	}
+	defer f.Close()
+	if err := unix.Flock(int(f.Fd()), unix.LOCK_EX|unix.LOCK_NB); err != nil {
+		return errState("err.instance.running", map[string]any{"app": app, "id": id})
+	}
+	defer unix.Flock(int(f.Fd()), unix.LOCK_UN)
+
+	paths := []string{e.InstancePath(app, id)}
+	if lp := e.LauncherPath(app, id); lp != "" {
+		if _, err := os.Stat(lp); err == nil {
+			paths = append(paths, lp)
+		}
+	}
+	return e.Trasher(paths...)
+}
+
+// IsRunning 用 flock 试探运行态：拿到 = 没在跑（立刻释放），拿不到 = 在跑。
+// 没有 PID 文件，也没有 stale 状态——内核持有锁，进程怎么死都会释放（§4.3）。
+func (e *Env) IsRunning(app, id string) (bool, error) {
+	path := filepath.Join(e.InstancePath(app, id), "run.lock")
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, errEnv("err.env.open_lock", map[string]any{"path": path}, err)
+	}
+	defer f.Close()
+	if err := unix.Flock(int(f.Fd()), unix.LOCK_EX|unix.LOCK_NB); err != nil {
+		if err == unix.EWOULDBLOCK || err == unix.EAGAIN {
+			return true, nil
+		}
+		return false, errEnv("err.env.flock", map[string]any{"path": path}, err)
+	}
+	unix.Flock(int(f.Fd()), unix.LOCK_UN)
+	return false, nil
+}
+
+// HoldRunLock 给 run 用：拿到锁就一直持有到进程退出（内核在退出时释放）。
+// 拿不到立刻返回 7，不许阻塞——桌面图标被点两次是常态（§4.3）。
+func (e *Env) HoldRunLock(app, id string) (*os.File, error) {
+	path := filepath.Join(e.InstancePath(app, id), "run.lock")
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return nil, errEnv("err.env.open_lock", map[string]any{"path": path}, err)
+	}
+	if err := unix.Flock(int(f.Fd()), unix.LOCK_EX|unix.LOCK_NB); err != nil {
+		f.Close()
+		return nil, errState("err.instance.running", map[string]any{"app": app, "id": id})
+	}
+	return f, nil
+}
+
+// TouchLastUsed 记录本次 run 的开始时间（instance.toml 的 last_used_at）。
+func (e *Env) TouchLastUsed(app, id string) error {
+	in, err := e.GetInstance(app, id)
+	if err != nil {
+		return err
+	}
+	now := e.Clock().UTC()
+	in.LastUsedAt = &now
+	return e.saveInstance(in)
+}
+
+// stageFile 写同目录临时文件但不提交，返回临时路径。提交由调用方 rename——
+// CreateInstance 的两个 rename 才是事务的提交点。
+func stageFile(path string, data []byte, perm os.FileMode) (string, error) {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return "", errEnv("err.env.mkdir", map[string]any{"path": dir}, err)
+	}
+	tmp := filepath.Join(dir, "."+filepath.Base(path)+".tmp."+strconvItoa(os.Getpid()))
+	if err := writeFileAtomic(tmp, data, perm); err != nil {
+		return "", err
+	}
+	// rename 到最终提交点是一次 rename；这里把 tmp 再挪到一个不含时间戳的名字，
+	// 保证 stageFile 的结果可以被 rename 到目标。
+	return tmp, nil
+}
+
+func strconvItoa(i int) string {
+	if i == 0 {
+		return "0"
+	}
+	neg := i < 0
+	if neg {
+		i = -i
+	}
+	var b [20]byte
+	pos := len(b)
+	for i > 0 {
+		pos--
+		b[pos] = byte('0' + i%10)
+		i /= 10
+	}
+	if neg {
+		pos--
+		b[pos] = '-'
+	}
+	return string(b[pos:])
+}

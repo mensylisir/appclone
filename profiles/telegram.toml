@@ -1,0 +1,27 @@
+# 内置模板：Telegram Desktop（Electron/自绘，单例靠 runtime socket）
+#
+# 这只是"预填来源"，不是权威事实：exec 路径随发行版打包方式变化
+# （Arch 是 /usr/bin/telegram-desktop，官方 tar 包是 /opt/telegram/Telegram）。
+# 运行时档案 profiles.d/<app>.toml 才是生效的那份（§4 三个名字的语义）。
+# 探测管线摸出的结果优先于本文件——本文件只在"从没探测过"时提供起点。
+version = 1
+
+exec = "/usr/bin/telegram-desktop"
+
+paths = [
+  "~/.local/share/TelegramDesktop",
+]
+
+# Telegram 用 XDG_RUNTIME_DIR 下的 socket 做单例判定；
+# 普通文件锁对它无效（bind 空文件会让 connect() 报 ENOTSOCK），见 §6.2。
+isolate_runtime = true
+
+cwd = "~"
+probe_method = "manual"
+
+ignored = [
+  "~/.cache",
+  "~/.thumbnails",
+  "~/.local/share/Trash",
+  "~/.local/state",
+]

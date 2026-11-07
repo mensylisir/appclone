@@ -12,10 +12,16 @@ i18n 缺失、397 个应用无搜索、屏3 缺探测中态、公共目录组未
 第八轮把回归 33 → 38 → **44 项**，脚本与交叉审查随即抓出 5 个真实行为缺陷（致命横幅单向死锁、入口标题错、
 失败态重试点不动、open 入口取消不回弹、探测定时器泄漏改写 tab 高亮），已修并连续三次 44/44、退出码 0。
 第九轮按"开工前把问题一次解决"又清了 12 项 P1，随后只读交叉审查又判 **REJECTED**（1 P0 + 12 P1），全部修完后回归 **44 → 58 项**，全绿退出码 0，7 组变异测试证明新断言有牙。
-Go 实现未启动：`core/`、`cmd/`、`go.mod` 均不存在。
+**第十轮：Go 开发已启动**（2026-11-07）。`go.mod` + `core/`（errors/paths/profile/validate/bwrap/state/instance/apps/launcher/run/trash/i18n/bundled）+ `cmd/appclone`（add/run/list/rm/doctor/repair-desktop/version）+ `profiles/`（内置模板，`//go:embed`）。
+`go vet ./...` 干净、`go test ./...` 全绿；假 HOME 冒烟跑通 add→list→doctor→rm。
+bwrap 参数语义用 `doctor` 打印的 argv 实测过 A/A'/B（实例内落盘、宿主零污染、公共目录共享），**但只在 root 下手工执行**，`run` 本身拒绝 root。
 GUI 方向定案：**GTK4 + libadwaita 原生控件，经 puregotk 绑定（零 cgo）**，以 S0 spike 五条验收为切换闸门（第 5 条：Ubuntu 24.04 实机）。
 
 ## 下一步
+
+路线图第 1 项（`core` 探测原语）**被本机环境挡住**：容器内没有 `/dev/fuse` 设备节点（`mknod` 被拒），
+`fuse-overlayfs` 虽然装上了也挂不起来。探测的 overlay 主路径无法在此环境跑通，只能写代码 + 单测 diff 收集器，
+不能声称验证。strace 降级路径同样需要真实应用会话。
 
 按 `docs/方案设计.md` §10 路线图推进，探测先行：
 

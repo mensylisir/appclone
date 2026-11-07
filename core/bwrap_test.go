@@ -1,0 +1,164 @@
+package core
+
+import (
+	"strings"
+	"testing"
+)
+
+// testEnv 造一个完全隔离的 Env：家目录、XDG、数据根都在 t.TempDir() 里。
+// 所有测试都必须走它——用真实环境跑的测试既是假通过源，也会污染主目录（§7 前置）。
+func testEnv(t *testing.T) *Env {
+	t.Helper()
+	root := t.TempDir()
+	home := root + "/home"
+	getenv := func(k string) string {
+		switch k {
+		case "XDG_CONFIG_HOME":
+			return root + "/xdg/config"
+		case "XDG_DATA_HOME":
+			return root + "/xdg/data"
+		case "XDG_STATE_HOME":
+			return root + "/xdg/state"
+		case "XDG_CACHE_HOME":
+			return root + "/xdg/cache"
+		case "XDG_RUNTIME_DIR":
+			return root + "/run"
+		}
+		return ""
+	}
+	r := newResolver(home, home, 1000, getenv)
+	e := NewEnvAt(root+"/xdg/appclone", r)
+	// 不真的动回收站：测试里把删除换成"记下来"。
+	e.Trasher = func(paths ...string) error { return nil }
+	e.CliPath = "/usr/bin/appclone"
+	return e
+}
+
+func (e *Env) opts() BuildOptions {
+	o := e.BuildOptions()
+	o.RuntimeDir = e.Resolver.XDG["RUNTIME_DIR"]
+	return o
+}
+
+// instSrc 独立实现一次映射，不复用 instanceChild：测试要能抓住被测函数的错。
+func instSrc(root, abs string) string {
+	return root + "/" + strings.TrimPrefix(abs, "/")
+}
+
+func TestBuildBwrapArgsGoldenOrder(t *testing.T) {
+	e := testEnv(t)
+	o := e.opts()
+	o.RuntimeSocks = []BindPair{
+		{Src: o.RuntimeDir + "/wayland-0", Dst: o.RuntimeDir + "/wayland-0"},
+		{Src: o.RuntimeDir + "/pulse/native", Dst: o.RuntimeDir + "/pulse/native"},
+	}
+	o.DBusAddress = "unix:path=/run/user/1000/bus-private"
+
+	p := Profile{
+		App:            "wechat",
+		Version:        ProfileVersion,
+		Exec:           "/usr/bin/wechat",
+		ExecArgs:       []string{"--flag"},
+		Paths:          []string{"~/.config/WeChat", "~/.local/share/WeChat"},
+		SharedWrites:   []string{"~/.config/gtk-3.0/bookmarks"},
+		LockFiles:      []string{"~/.config/WeChat/lock"},
+		IsolateDBus:    true,
+		IsolateRuntime: true,
+		Env:            map[string]string{"B": "2", "A": "1"},
+		Cwd:            "~",
+	}
+	in := Instance{App: "wechat", ID: "work", Root: e.InstancePath("wechat", "work") + "/root"}
+
+	got, err := BuildBwrapArgs(p, in, o)
+	if err != nil {
+		t.Fatalf("BuildBwrapArgs: %v", err)
+	}
+	want := []string{
+		"--unshare-user",
+		"--unshare-pid", "--unshare-ipc",
+		"--bind", "/", "/",
+		"--dev-bind", "/dev", "/dev",
+		"--proc", "/proc",
+		// ⑤ paths：父先子后，源在实例 root 下
+		"--bind", instSrc(in.Root, o.Home+"/.config/WeChat"), o.Home + "/.config/WeChat",
+		"--bind", instSrc(in.Root, o.Home+"/.local/share/WeChat"), o.Home + "/.local/share/WeChat",
+		// ⑥ shared_writes 在 paths 之后
+		"--bind-try", o.Home + "/.config/gtk-3.0/bookmarks", o.Home + "/.config/gtk-3.0/bookmarks",
+		// ⑧ lock_files
+		"--bind", in.Root + "/locks/" + lockFileName(o.Home+"/.config/WeChat/lock"), o.Home + "/.config/WeChat/lock",
+		// ⑨ runtime 目录 + setenv，然后只读 socket
+		"--bind", in.Root + "/runtime", o.RuntimeDir,
+		"--setenv", "XDG_RUNTIME_DIR", o.RuntimeDir,
+		"--ro-bind-try", o.RuntimeDir + "/wayland-0", o.RuntimeDir + "/wayland-0",
+		"--ro-bind-try", o.RuntimeDir + "/pulse/native", o.RuntimeDir + "/pulse/native",
+		// ⑩ dbus
+		"--bind", in.Root + "/dbus/bus", o.RuntimeDir + "/bus",
+		"--setenv", "DBUS_SESSION_BUS_ADDRESS", o.DBusAddress,
+		// ⑫ env 按 key 字典序
+		"--setenv", "A", "1",
+		"--setenv", "B", "2",
+		"--chdir", o.Home,
+		"--die-with-parent",
+	}
+	if strings.Join(got, " ") != strings.Join(want, " ") {
+		t.Fatalf("argv 不符合契约：\n got=%v\nwant=%v", got, want)
+	}
+	// 硬规则单点复核：只读 socket 必须在 runtime 目录 bind 之后，否则目录 bind 会盖掉它。
+	assertOrder(t, got, "--setenv XDG_RUNTIME_DIR", "--ro-bind-try")
+	assertOrder(t, got, "--bind / /", "--dev-bind")
+	assertOrder(t, got, "--bind "+instSrc(in.Root, o.Home+"/.config/WeChat"), "--bind-try")
+}
+
+// assertOrder 断言 a 在 b 之前出现（参数按 argv 元素配对，不能只做字符串包含）。
+func assertOrder(t *testing.T, argv []string, a, b string) {
+	t.Helper()
+	sa, sb := strings.Join(argv, " "), ""
+	_ = sb
+	ia := strings.Index(sa, a)
+	ib := strings.Index(sa, b)
+	if ia < 0 || ib < 0 || ia > ib {
+		t.Fatalf("顺序不符合契约：%q 必须早于 %q\nargv=%v", a, b, argv)
+	}
+}
+
+func TestBuildBwrapArgsRejectsPublicDir(t *testing.T) {
+	e := testEnv(t)
+	o := e.opts()
+	p := Profile{App: "x", Version: 1, Exec: "/bin/true", Paths: []string{"~/Downloads"}}
+	_, err := BuildBwrapArgs(p, Instance{Root: "/tmp/root"}, o)
+	if ExitCode(err) != CodeInput {
+		t.Fatalf("公共目录必须被拒（退出 2），得到 %v", err)
+	}
+}
+
+func TestBuildBwrapArgsDBusImpliesRuntime(t *testing.T) {
+	e := testEnv(t)
+	o := e.opts()
+	o.DBusAddress = "unix:path=/run/user/1000/x"
+	p := Profile{App: "x", Version: 1, Exec: "/bin/true", Paths: []string{"~/.config/X"}, IsolateDBus: true}
+	got, err := BuildBwrapArgs(p, Instance{Root: "/tmp/root"}, o)
+	if err != nil {
+		t.Fatal(err)
+	}
+	joined := strings.Join(got, " ")
+	// 没有 isolate_runtime 时也必须 bind runtime：否则 bus 的 bind 目标落在宿主
+	// $XDG_RUNTIME_DIR，bwrap 会在宿主建 bus 占位文件，压掉真实 session bus。
+	if !strings.Contains(joined, "--setenv XDG_RUNTIME_DIR") {
+		t.Fatalf("isolate_dbus 必须隐含 isolate_runtime，argv=%v", got)
+	}
+}
+
+func TestInstanceChildNeverEscapes(t *testing.T) {
+	root := "/base/instances/app/main/root"
+	got, err := instanceChild(root, "/home/u/.config/App")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != root+"/home/u/.config/App" {
+		t.Fatalf("映射错误：%s", got)
+	}
+	// 这条是防 filepath.Join 丢前缀的回归：Join(root, "/abs") 会返回 "/abs"。
+	if strings.HasPrefix(got, "/home") {
+		t.Fatalf("源路径逃出实例目录：%s", got)
+	}
+}
