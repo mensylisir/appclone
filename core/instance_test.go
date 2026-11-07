@@ -333,3 +333,88 @@ func TestCreateInstanceRecreatesMissingPath(t *testing.T) {
 		t.Fatalf("档案可创建：hasProfile=%v creatable=%v", hasProfile, creatable)
 	}
 }
+
+// 实例目录布局是跨版本契约（CLI 与 GUI 必须一致，§4）。这里逐项断言，
+// 因为布局一旦漂移，旧实例会"看起来还在、实际数据丢了"。
+func TestInstanceLayout(t *testing.T) {
+	e := testEnv(t)
+	app, p := seedApp(t, e)
+	in, err := e.CreateInstance(context.Background(), app, p, "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, sub := range []string{"root", "locks", "runtime", "dbus", "audit"} {
+		dir := filepath.Join(in.Dir(), sub)
+		st, err := os.Stat(dir)
+		if err != nil || !st.IsDir() {
+			t.Fatalf("实例里缺少 %s/：%v", sub, err)
+		}
+		if perm := st.Mode().Perm(); perm != 0o700 {
+			t.Fatalf("%s/ 的权限应为 0700，得到 %o", sub, perm)
+		}
+	}
+	// instance.toml 是元数据的唯一权威来源，必须只有自己可读。
+	st, err := os.Stat(filepath.Join(in.Dir(), "instance.toml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if perm := st.Mode().Perm(); perm != 0o600 {
+		t.Fatalf("instance.toml 权限应为 0600，得到 %o", perm)
+	}
+	// run.lock 在第一次取锁时才建（只读命令不许在实例目录里造文件）。
+	if _, err := os.Stat(filepath.Join(in.Dir(), "run.lock")); !os.IsNotExist(err) {
+		t.Fatal("建实例时不该预建 run.lock")
+	}
+	f, err := e.HoldRunLock(app, "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	st, err = os.Stat(filepath.Join(in.Dir(), "run.lock"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if perm := st.Mode().Perm(); perm != 0o600 {
+		t.Fatalf("run.lock 权限应为 0600，得到 %o", perm)
+	}
+}
+
+// 入口里的 CLI 路径必须跟着当前二进制走：appclone 升级/搬家后 TryExec 指向旧路径，
+// 表现是"图标点了没反应"。repair-desktop 做的就是这件事（§6 命令表）。
+func TestWriteLauncherFollowsCliPath(t *testing.T) {
+	e := testEnv(t)
+	app, p := seedApp(t, e)
+	in, err := e.CreateInstance(context.Background(), app, p, "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := e.LauncherPath(app, "main")
+	first, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(first), "TryExec="+e.CliPath) {
+		t.Fatalf("入口应指向当前 CLI：\n%s", first)
+	}
+	// 换一个 CLI 路径后重写同一入口（repair-desktop 的动作）。
+	e.CliPath = "/opt/appclone/appclone"
+	d, err := e.LoadApp(app)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := e.WriteLauncher(in, d); err != nil {
+		t.Fatal(err)
+	}
+	second, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(second), "TryExec=/opt/appclone/appclone") ||
+		!strings.Contains(string(second), "Exec=/opt/appclone/appclone run ") {
+		t.Fatalf("重写后入口应指向新 CLI：\n%s", second)
+	}
+	// 入口文件名只由 app/id 决定，不随 CLI 路径或显示名变化。
+	if e.LauncherPath(app, "main") != path {
+		t.Fatal("入口文件名不能变（改名不换文件）")
+	}
+}
