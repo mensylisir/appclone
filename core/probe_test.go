@@ -204,13 +204,15 @@ func (f *fakeMounter) Mount(lower, upper, work, merged string) (func() error, er
 }
 
 type fakeRunner struct {
-	res  SessionResult
-	err  error
-	argv []string
+	res   SessionResult
+	err   error
+	argv  []string
+	calls int
 }
 
 func (f *fakeRunner) Run(_ context.Context, argv []string, _ io.Writer) (SessionResult, error) {
 	f.argv = argv
+	f.calls++
 	return f.res, f.err
 }
 
@@ -475,5 +477,37 @@ func TestProbeBindGuardScript(t *testing.T) {
 	// /proc 一定在别的文件系统上，用它模拟"bind 生效的真实目录"。
 	if code := run("/proc"); code != 0 {
 		t.Fatalf("跨设备（bind 生效）应放行，得到 %d", code)
+	}
+}
+
+// 一轮不够：登录态/token 往往第二次启动才落盘（§4）。默认跑两轮，
+// 且两轮共用同一份 overlay 写层（第二轮能看到第一轮的写入，取并集）。
+func TestProbeRunsTwoRoundsByDefault(t *testing.T) {
+	e := probeEnv(t)
+	m := &fakeMounter{entries: []string{".config/TestApp/config.json"}}
+	r := &fakeRunner{}
+	var stderr strings.Builder
+	if _, err := e.probeSession(context.Background(), "testapp", ProbeOptions{
+		Command: []string{"/nonexistent/zz-probe-test-app"}, Mounter: m, Runner: r,
+		Stderr: &stderr,
+	}, m, r); err != nil {
+		t.Fatal(err)
+	}
+	if r.calls != 2 {
+		t.Fatalf("默认应跑两轮，实际 %d 轮", r.calls)
+	}
+	// 每轮都要告诉用户"该做什么"，否则用户不知道要开两次。
+	if strings.Count(stderr.String(), "轮") < 2 {
+		t.Fatalf("两轮都应打印提示，实际：%q", stderr.String())
+	}
+	// 显式指定轮数时以它为准（排障时只跑一轮更快）。
+	r2 := &fakeRunner{}
+	if _, err := e.probeSession(context.Background(), "testapp", ProbeOptions{
+		Command: []string{"/nonexistent/zz-probe-test-app"}, Mounter: m, Runner: r2, Rounds: 1,
+	}, m, r2); err != nil {
+		t.Fatal(err)
+	}
+	if r2.calls != 1 {
+		t.Fatalf("显式 Rounds=1 时只该跑一轮，实际 %d", r2.calls)
 	}
 }

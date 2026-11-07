@@ -96,7 +96,7 @@ func newAddCmd(a *app) *cobra.Command {
 					}
 					cmdline := append([]string{d.Exec}, d.ExecArgs...)
 					fmt.Fprintf(cmd.ErrOrStderr(),
-						"正在跟踪「%s」的写入：应用会被启动一次，请正常用一下再把它关掉。\n", appKey)
+						"正在跟踪「%s」的写入：应用会被启动两次，每次用一下再关掉。\n", appKey)
 					// L0 先扫一遍：它的锁文件线索能让探测不再"零写入"——主实例
 					// 在跑时应用会发现锁被占用、把参数转发过去然后自己退出（§3.2.2）。
 					hints := a.env.StaticHints(ctx, d)

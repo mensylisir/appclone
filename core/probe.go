@@ -19,8 +19,11 @@ type ProbeOptions struct {
 	Stderr   io.Writer // 会话的 stderr（GUI 无 stderr，可为 nil）
 	Mounter  OverlayMounter
 	Runner   SessionRunner
-	// Timeout 是整个会话的硬上限：用户开了应用就不管了的情况必须有尽头。
+	// Timeout 是**每一轮**会话的硬上限：用户开了应用就不管了的情况必须有尽头。
 	Timeout time.Duration
+	// Rounds 是要跑几轮，默认 2（§4）。登录态、token 往往第二次启动才落盘：
+	// 只跑一轮的典型结果就是"探到了配置目录、没探到凭据目录"。
+	Rounds int
 }
 
 // ProbeResult 是一次探测的产出。
@@ -62,6 +65,23 @@ func (e *Env) Probe(ctx context.Context, app string, opt ProbeOptions) (ProbeRes
 		runner = setsidRunner{}
 	}
 	return e.probeSession(ctx, app, opt, mounter, runner)
+}
+
+// probeRoundFailed 把"某一轮没跑起来"翻译成退出码。抽出来是因为它同时要
+// 卸载、清理/保留现场，塞在循环里会让主流程读不出顺序。
+func (e *Env) probeRoundFailed(app string, round, rounds int, runErr error, discard func()) (ProbeResult, error) {
+	discard()
+	if errors.Is(runErr, context.Canceled) {
+		return ProbeResult{}, ErrCanceled
+	}
+	if errors.Is(runErr, context.DeadlineExceeded) {
+		return ProbeResult{}, newErr(CodeProbe, "err.probe.timeout", map[string]any{
+			"app": app, "round": round + 1, "rounds": rounds,
+		}, runErr)
+	}
+	return ProbeResult{}, newErr(CodeEnv, "err.probe.session", map[string]any{
+		"app": app, "message": runErr.Error(),
+	}, runErr)
 }
 
 // probeSession 是去掉"非 root"闸门之后的探测本体：root 检查与它无关，
@@ -166,9 +186,33 @@ func (e *Env) probeSession(ctx context.Context, app string, opt ProbeOptions, mo
 	if timeout == 0 {
 		timeout = probeTimeoutDefault
 	}
-	sctx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
-	res, runErr := runner.Run(sctx, argv, opt.Stderr)
+	rounds := opt.Rounds
+	if rounds <= 0 {
+		rounds = 2
+	}
+	var res SessionResult
+	for round := 0; round < rounds; round++ {
+		sctx, cancel := context.WithTimeout(ctx, timeout)
+		if opt.Stderr != nil && rounds > 1 {
+			fmt.Fprintf(opt.Stderr, "appclone: 第 %d/%d 轮 —— 请打开应用用一下，然后把它关掉\n", round+1, rounds)
+		}
+		r, runErr := runner.Run(sctx, argv, opt.Stderr)
+		cancel()
+		if runErr != nil {
+			// 第一轮就取消/失败：没有可信证据，按原来的分派处理。
+			return e.probeRoundFailed(app, round, rounds, runErr, discard)
+		}
+		if r.ExitCode == probeGuardFailed {
+			// 正向断言失败：公共目录仍在 overlay 里。应用还没跑，删写层安全。
+			discard()
+			return ProbeResult{}, errProbe("err.probe.bind_verify_failed", map[string]any{
+				"path": strings.Join(publicTargets(pubBinds), "、"),
+			})
+		}
+		// 后续轮次沿用最后一轮的结果；前面轮次只要没报错就继续——
+		// "第二轮才写 token" 正是要覆盖的情形。
+		res = r
+	}
 
 	// 会话结束 → 先停 dbus、再卸载（顺序反了会 EBUSY）。
 	if stopBus != nil {
@@ -181,22 +225,6 @@ func (e *Env) probeSession(ctx context.Context, app string, opt ProbeOptions, mo
 		// 所以**不删**，留着并报环境错误。
 		return ProbeResult{}, unmountErr
 	}
-	if runErr != nil {
-		if errors.Is(runErr, context.Canceled) || errors.Is(sctx.Err(), context.Canceled) {
-			discard()
-			return ProbeResult{}, ErrCanceled
-		}
-		if errors.Is(runErr, context.DeadlineExceeded) || sctx.Err() == context.DeadlineExceeded {
-			q, _ := quarantine()
-			_ = q
-			return ProbeResult{}, newErr(CodeProbe, "err.probe.timeout", map[string]any{"app": app}, runErr)
-		}
-		discard()
-		return ProbeResult{}, newErr(CodeEnv, "err.probe.session", map[string]any{
-			"app": app, "message": runErr.Error(),
-		}, runErr)
-	}
-
 	// 收集：先读，再判，最后才谈删（§3.2.3 末条）。
 	entries, present, readErr := readUpperTree(upper)
 	if readErr != nil {
