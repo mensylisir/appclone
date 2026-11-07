@@ -414,3 +414,66 @@ func TestProbeProfileCreatesInstanceForFreshApp(t *testing.T) {
 		t.Fatal("实例 id 不能为空")
 	}
 }
+
+// 有公共目录时，会话命令被包一层守卫脚本：`sh -c <guard> -- <app...>`。
+// 守卫必须在 app 之前，且用 `--` 当 $0，否则 `exec "$@"` 会漏掉第一个参数。
+func TestProbeBwrapArgsWrapsWithBindGuard(t *testing.T) {
+	spec := ProbeSpec{
+		Home:        "/home/u",
+		Merged:      "/var/tmp/probe/merged",
+		PublicBinds: []BindPair{{Src: "/home/u/Downloads", Dst: "/home/u/Downloads"}},
+		Env:         probeGuardEnv([]BindPair{{Src: "/home/u/Downloads", Dst: "/home/u/Downloads"}}),
+		Command:     []string{"/usr/bin/app", "--flag"},
+	}
+	argv, err := ProbeBwrapArgs(spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	joined := strings.Join(argv, " ")
+	idx := strings.Index(joined, "-- /bin/sh -c ")
+	if idx < 0 {
+		t.Fatalf("有公共目录时必须包守卫脚本：%s", joined)
+	}
+	if !strings.HasSuffix(joined, " -- /usr/bin/app --flag") {
+		t.Fatalf("app 必须原样接在守卫之后：%s", joined)
+	}
+	// 目录通过环境变量传（空格安全的换行分隔），不能拼进脚本。
+	if !strings.Contains(joined, "--setenv AC_PROBE_PUBLICS /home/u/Downloads") {
+		t.Fatalf("公共目录应经环境变量传入：%s", joined)
+	}
+	// 没有公共目录时不包，保持最小惊讶。
+	noPub, err := ProbeBwrapArgs(ProbeSpec{Home: "/home/u", Merged: "/m", Command: []string{"/bin/true"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(strings.Join(noPub, " "), "/bin/sh -c") {
+		t.Fatalf("没有公共目录时不该包守卫：%v", noPub)
+	}
+}
+
+// 守卫脚本本身的逻辑要能跑：这是"正向断言"唯一可离线验证的部分。
+//   - 公共目录与 $HOME 同一设备（= 还在 overlay 上）→ 退出 91；
+//   - 公共目录在另一个文件系统（= bind 生效）→ 放行，正常 exec 应用。
+func TestProbeBindGuardScript(t *testing.T) {
+	home := t.TempDir()
+	inside := filepath.Join(home, "Downloads")
+	if err := os.MkdirAll(inside, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	run := func(pub string) int {
+		cmd := exec.Command("/bin/sh", "-c", probeBindGuard, "--", "/bin/true")
+		cmd.Env = []string{"HOME=" + home, "AC_PROBE_PUBLICS=" + pub, "PATH=/usr/bin:/bin"}
+		_ = cmd.Run()
+		if cmd.ProcessState == nil {
+			t.Fatalf("守卫生进程没有状态")
+		}
+		return cmd.ProcessState.ExitCode()
+	}
+	if code := run(inside); code != probeGuardFailed {
+		t.Fatalf("同一设备（overlay 内）应报 %d，得到 %d", probeGuardFailed, code)
+	}
+	// /proc 一定在别的文件系统上，用它模拟"bind 生效的真实目录"。
+	if code := run("/proc"); code != 0 {
+		t.Fatalf("跨设备（bind 生效）应放行，得到 %d", code)
+	}
+}

@@ -47,6 +47,10 @@ func newAddCmd(a *app) *cobra.Command {
 			if len(args) == 2 {
 				id = args[1]
 			}
+			if profileOnly && id != "" {
+				// 只保存档案却给了实例 id：静默忽略会让人以为实例建了。
+				return core.NewUsage("--profile-only 不创建实例，不要再给 <id>")
+			}
 			// 探测会把应用跑起来，用户随时可能 Ctrl-C：信号要能传到 context，
 			// 否则 defer 全部跳过、/var/tmp 下留下挂载点与写层（§3.2.3）。
 			ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -104,7 +108,10 @@ func newAddCmd(a *app) *cobra.Command {
 					// 零写入 = 给不出结论，**不生成空档案**：空 paths 的档案会让
 					// 开关亮着却什么都不隔离（§6.3）。
 					if len(p.Paths) == 0 {
-						return core.NewProbeNoWrites(appKey)
+						// 只观测到缓存/共享写入时，"什么都没跟踪到"是错的说法：
+						// 用户会去查应用是不是没启动，而真正的原因是这些写入
+						// 本来就不值得隔离（§6.3）。
+						return core.NewProbeNoWrites(appKey, len(res.Candidates))
 					}
 				}
 			} else {

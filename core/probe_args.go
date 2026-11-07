@@ -12,16 +12,17 @@ import (
 // 单独抽出来是为了让 argv 构造成为纯函数：这条命令一旦顺序写错，后果是
 // "用户存进 ~/Downloads 的文件被删"或者"探测零写入"，都必须能断言。
 type ProbeSpec struct {
-	Home        string     // 有效 HOME（AC_HOME 或真实 HOME）
-	Base        string     // AC_BASE（探测期要 bind 回去，否则工具自己的写入会进 upper）
-	Merged      string     // overlay 的 merged 视图
-	RuntimeDir  string     // 探测期私有 XDG_RUNTIME_DIR
-	RuntimeSock []BindPair // 宿主 socket：Src 在宿主，Dst 在探测私有 runtime 里
-	DBusAddress string     // 私有会话总线地址；空 = 没有总线（降级）
-	PublicBinds []BindPair // 公共目录：Src = 宿主真实目录，Dst = 有效 HOME 下的目标
-	SharedWrite []string   // 共享可写文件（输入法/书签），尽量 bind 回真实
-	LockBinds   []BindPair // 锁文件：Src = 探测期空文件，Dst = 宿主锁路径
-	Command     []string   // 应用命令（argv[0] 之后全部原样）
+	Home        string            // 有效 HOME（AC_HOME 或真实 HOME）
+	Base        string            // AC_BASE（探测期要 bind 回去，否则工具自己的写入会进 upper）
+	Merged      string            // overlay 的 merged 视图
+	RuntimeDir  string            // 探测期私有 XDG_RUNTIME_DIR
+	RuntimeSock []BindPair        // 宿主 socket：Src 在宿主，Dst 在探测私有 runtime 里
+	DBusAddress string            // 私有会话总线地址；空 = 没有总线（降级）
+	PublicBinds []BindPair        // 公共目录：Src = 宿主真实目录，Dst = 有效 HOME 下的目标
+	SharedWrite []string          // 共享可写文件（输入法/书签），尽量 bind 回真实
+	LockBinds   []BindPair        // 锁文件：Src = 探测期空文件，Dst = 宿主锁路径
+	Env         map[string]string // 额外注入的环境变量（字典序输出）
+	Command     []string          // 应用命令（argv[0] 之后全部原样）
 }
 
 // ProbeBwrapArgs 产出探测会话的完整 argv（纯函数，golden 断言）。
@@ -87,9 +88,72 @@ func ProbeBwrapArgs(s ProbeSpec) ([]string, error) {
 		argv = append(argv, "--setenv", "DBUS_SESSION_BUS_ADDRESS", s.DBusAddress)
 	}
 	argv = append(argv, "--setenv", "HOME", s.Home)
+	for _, k := range sortedKeys(s.Env) {
+		argv = append(argv, "--setenv", k, s.Env[k])
+	}
 	argv = append(argv, "--die-with-parent")
 	argv = append(argv, "--")
+
+	// 正向断言（§3.2.1 要求，反向断言证明不了"bind 真的生效"）：
+	// 在会话里先跑一段守卫脚本，比对每个公共目录与 $HOME 的**设备号**——
+	// overlay 是 fuse 设备，bind 成功的真实目录在底层文件系统上，两者必然不同；
+	// 如果相同，说明 bind 没生效、这个目录仍然落在 overlay 里。
+	//
+	// 为什么不用"写标记文件再回读"：那要往用户的 ~/Downloads 里写东西，
+	// 中途被杀就留下一个残留文件。设备号比较不改任何用户数据。
+	if len(s.PublicBinds) > 0 {
+		argv = append(argv, "/bin/sh", "-c", probeBindGuard, "--")
+	}
 	return append(argv, s.Command...), nil
+}
+
+// probeBindGuard 是会话内的正向断言脚本。退出码 91 = bind 没生效。
+const probeBindGuard = `IFS='
+'
+h=$(stat -c %d -- "$HOME" 2>/dev/null) || h=
+[ -n "$h" ] || exec "$@"
+for d in $AC_PROBE_PUBLICS; do
+  [ -n "$d" ] || continue
+  v=$(stat -c %d -- "$d" 2>/dev/null) || continue
+  [ "$v" = "$h" ] && exit 91
+done
+exec "$@"
+`
+
+// probeGuardFailed 是守卫脚本约定的失败退出码（应用自己不会返回它：
+// 真返回 91 时也只多报一次"bind 未生效"，比漏报安全）。
+const probeGuardFailed = 91
+
+// probeGuardEnv 把要校验的公共目录传给守卫脚本。用换行分隔而不是空格：
+// `My Documents`、`下载` 这类名字带空格时，空格分隔会被 word splitting 拆碎。
+func probeGuardEnv(binds []BindPair) map[string]string {
+	if len(binds) == 0 {
+		return nil
+	}
+	targets := make([]string, 0, len(binds))
+	for _, b := range binds {
+		targets = append(targets, b.Dst)
+	}
+	return map[string]string{"AC_PROBE_PUBLICS": strings.Join(targets, "\n")}
+}
+
+// publicTargets 给错误文案用（只列目标，不列真实源）。
+func publicTargets(binds []BindPair) []string {
+	out := make([]string, 0, len(binds))
+	for _, b := range binds {
+		out = append(out, b.Dst)
+	}
+	return out
+}
+
+// sortedKeys 让 --setenv 的输出稳定（map 迭代顺序随机，同一条命令两次不同）。
+func sortedKeys(m map[string]string) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
 }
 
 // probePublicBinds 解析并校验公共目录，产出"真实源 → 有效 HOME 目标"的映射。

@@ -149,6 +149,7 @@ func (e *Env) probeSession(ctx context.Context, app string, opt ProbeOptions, mo
 		PublicBinds: pubBinds,
 		SharedWrite: e.probeSharedWrites(),
 		LockBinds:   locks,
+		Env:         probeGuardEnv(pubBinds),
 		Command:     opt.Command,
 	}
 	argv, err := ProbeBwrapArgs(spec)
@@ -202,6 +203,14 @@ func (e *Env) probeSession(ctx context.Context, app string, opt ProbeOptions, mo
 	if !present {
 		discard()
 		return ProbeResult{}, errEnv("err.probe.no_upper", map[string]any{"path": upper}, nil)
+	}
+	// 会话内的正向断言失败：公共目录仍落在 overlay 里（bind 没生效）。
+	// 这条比反向断言更早、也更硬——此时应用还没跑，所以可以安全删掉写层。
+	if res.ExitCode == probeGuardFailed {
+		discard()
+		return ProbeResult{}, errProbe("err.probe.bind_verify_failed", map[string]any{
+			"path": strings.Join(publicTargets(pubBinds), "、"),
+		})
 	}
 	// 会话"跑起来了但立刻失败"（bwrap 建 namespace 失败、Exec 不存在）与
 	// "应用正常退出但没写"必须分开：前者是环境/输入问题（3），后者才是 4。
