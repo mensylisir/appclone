@@ -38,8 +38,8 @@ type RunResult struct {
 func (e *Env) Run(ctx context.Context, app, id string, opt RunOptions) (RunResult, error) {
 	// root 会话下 --bind / / 是 rw，误操作能改宿主系统；而且 root 下 bwrap
 	// 本来就能跑通，"验证通过"会把非特权路径的问题全藏起来（§3.1 末段）。
-	if os.Geteuid() == 0 {
-		return RunResult{}, errEnv("err.env.root", nil, nil)
+	if err := CheckNotRoot(); err != nil {
+		return RunResult{}, err
 	}
 	in, err := e.GetInstance(app, id)
 	if err != nil {
@@ -53,7 +53,8 @@ func (e *Env) Run(ctx context.Context, app, id string, opt RunOptions) (RunResul
 			for {
 				select {
 				case <-ctx.Done():
-					return RunResult{}, ctx.Err()
+					// 用户取消不是失败：CLI 把它映射成 0（§11 sentinel）。
+					return RunResult{}, ErrCanceled
 				case <-time.After(500 * time.Millisecond):
 				}
 				if lock, err = e.HoldRunLock(app, id); err == nil {
@@ -76,10 +77,31 @@ func (e *Env) Run(ctx context.Context, app, id string, opt RunOptions) (RunResul
 	if _, err := e.prepareBindTargets(p, in); err != nil {
 		return RunResult{}, err
 	}
+	// cwd 不存在时回退到有效 HOME：应用升级删了自己的工作目录是偶然事件，
+	// 不该让整个分身起不来；bwrap 的 --chdir 到不存在目录会直接失败（§3.1 ⑫）。
+	if p.Cwd != "" {
+		if abs, cerr := e.Resolver.Expand(p.Cwd); cerr == nil {
+			if st, serr := os.Stat(abs); serr != nil || !st.IsDir() {
+				p.Cwd = e.Resolver.Home
+				if opt.Stderr != nil {
+					_, _ = io.WriteString(opt.Stderr, "appclone: 工作目录不存在，已回退到家目录\n")
+				}
+			}
+		}
+	}
 
+	// 起 bwrap 之前把"源必须存在"的项全部确认一遍：否则 bwrap 会在容器里失败，
+	// 那个失败看起来就像"应用自己退出了"，会被映射成 1，与 appclone 的码混在一起（§6.3）。
+	if err := e.ValidateRunnable(p); err != nil {
+		return RunResult{}, err
+	}
+
+	// RuntimeDir 保持宿主值（它是 bind 的**目标**，命名空间里应用看到的路径）；
+	// 私有 runtime 的**源**是 <inst>/runtime，由 BuildBwrapArgs 自己拼。
+	// 曾经把这里改成实例目录，结果 socket 的源与目标都是实例内的空目录，
+	// wayland/pulse 全丢，而 bind 源又指向不存在的 <inst>/root/runtime。
 	o := e.BuildOptions()
-	o.RuntimeDir = e.runtimeDir(in)
-	o.RuntimeSocks = FilterExisting(RuntimeSocketCandidates(e.Resolver.XDG["RUNTIME_DIR"]))
+	o.RuntimeSocks = FilterExisting(RuntimeSocketCandidates(o.RuntimeDir))
 
 	// 私有 DBus 总线：必须先起 daemon（要 socket 存在才能 bind），
 	// 且 --nofork 不能少——fork 模式下 --print-address 的父进程会先退出（§6.6）。
@@ -156,12 +178,6 @@ func (e *Env) Run(ctx context.Context, app, id string, opt RunOptions) (RunResul
 	}
 	_ = e.TouchLastUsed(app, id)
 	return res, nil
-}
-
-// runtimeDir 返回该实例的私有 XDG_RUNTIME_DIR。
-// 即使档案没开 isolate_runtime 也返回实例内路径：调用方只在需要时才用它。
-func (e *Env) runtimeDir(in Instance) string {
-	return filepath.Join(in.Dir(), "runtime")
 }
 
 // startPrivateDBus 起一个与 bwrap 同生共死的会话总线（§6.6）。

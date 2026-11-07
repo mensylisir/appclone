@@ -56,6 +56,10 @@ func ValidateProfile(p Profile, o BuildOptions) error {
 	if !filepath.IsAbs(p.Exec) {
 		return errInput("err.profile.exec_relative", map[string]any{"exec": p.Exec})
 	}
+	// 字段码必须在解析成档案时剥掉：留着会让应用收到一个名叫 "%U" 的参数（§4.1 末条）。
+	if strings.Contains(p.Exec, "%") {
+		return errInput("err.profile.exec_field_code", map[string]any{"exec": p.Exec})
+	}
 	for k := range p.Env {
 		if isReservedEnv(k) {
 			return errInput("err.profile.reserved_env", map[string]any{"key": k, "app": p.App})
@@ -187,9 +191,11 @@ func checkDangerous(abs string, o BuildOptions, field string) error {
 	if o.Base != "" && IsUnder(o.Base, abs) {
 		return errInput("err.profile.base_path", map[string]any{"path": abs, "field": field})
 	}
-	// 整个命名空间级目录（~/.config、~/.local/share、~/.local/state）。
+	// 整个命名空间级目录（~/.config、~/.local/share、~/.local/state）**及其祖先**：
+	// `~/.local` 是 DATA_HOME/STATE_HOME 的祖先，也是默认 AC_BASE 的祖先，
+	// 隔离它会让"实例目录里的 bind 源"落在 bind 目标之内，形成自指。
 	for _, pd := range o.protectedDirs() {
-		if abs == pd {
+		if abs == pd || IsUnder(abs, pd) {
 			return errInput("err.profile.protected_path", map[string]any{"path": abs, "field": field})
 		}
 	}
@@ -261,6 +267,19 @@ func (e *Env) ValidateRunnable(p Profile) error {
 			}, err)
 		}
 	}
+	// extra_binds 的源必须存在：它用的是 --bind 不是 -try，缺失会让整条 bwrap 命令
+	// 在容器里失败，而错误看起来像"应用自己退出"（§3.1 ⑦）。
+	for _, b := range p.ExtraBinds {
+		src, err := e.Resolver.Expand(b.Src)
+		if err != nil {
+			return err
+		}
+		if _, err := os.Stat(src); err != nil {
+			return newErr(CodeInput, "err.profile.extra_bind_missing", map[string]any{
+				"app": p.App, "path": src,
+			}, err)
+		}
+	}
 	return nil
 }
 
@@ -271,10 +290,16 @@ func (e *Env) ValidateRunnable(p Profile) error {
 func (e *Env) ProfileState(app string) (hasProfile, creatable bool, err error) {
 	p, err := e.LoadProfile(app)
 	if err != nil {
-		if ExitCode(err) == CodeInput && strings.HasPrefix(errKey(err), "err.profile.not_found") {
+		if errKey(err) == "err.profile.not_found" {
 			return false, false, nil
 		}
-		return false, false, err
+		// 档案在但解析不了（损坏 / 版本超前）：这是"档案失效"，不是"没有档案"。
+		// 返回 false,false 会让 GUI 走「首次配置」并覆盖掉用户的档案；
+		// 返回 hasProfile=true 才能让它走「重新配置」（§6.1 ②）。
+		return true, false, nil
+	}
+	if err := ValidateProfile(p, e.BuildOptions()); err != nil {
+		return true, false, nil
 	}
 	if err := ValidateCreatable(p); err != nil {
 		return true, false, nil

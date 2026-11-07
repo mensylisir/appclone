@@ -11,6 +11,7 @@ import (
 	"text/tabwriter"
 
 	"github.com/spf13/cobra"
+	"golang.org/x/sys/unix"
 
 	"github.com/mensylisir/appclone/core"
 )
@@ -22,7 +23,7 @@ type check struct {
 }
 
 func newDoctorCmd(a *app) *cobra.Command {
-	var strict bool
+	var strict, verify bool
 	c := &cobra.Command{
 		Use:   "doctor [<app> [<id>]]",
 		Short: "环境检查（bwrap / userns / AppArmor / fuse / dbus / gio / GTK）",
@@ -35,6 +36,9 @@ func newDoctorCmd(a *app) *cobra.Command {
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if err := a.applyOverrides(cmd); err != nil {
 				return err
+			}
+			if verify {
+				return a.runVerify(cmd, args)
 			}
 			checks := runChecks(a)
 			data := map[string]any{"checks": checks}
@@ -91,7 +95,36 @@ func newDoctorCmd(a *app) *cobra.Command {
 		},
 	}
 	c.Flags().BoolVar(&strict, "strict", false, "必需项失败时返回退出码 3")
+	c.Flags().BoolVar(&verify, "verify", false, "对账上次运行的审计证据（本版本只会给出 unverified）")
 	return c
+}
+
+// runVerify 是 doctor --verify 的实现口径（§6.5）。
+//
+// 关键点：运行期审计层还没实现，所以这里**只能**给 unverified——"没有证据"不等于
+// "没有泄漏"。把它显示成通过，会让用户以为隔离被验证过（这是本产品最不该犯的错）。
+func (a *app) runVerify(cmd *cobra.Command, args []string) error {
+	if len(args) < 2 {
+		return core.NewUsage("doctor --verify 需要 <app> <id>")
+	}
+	appKey, id := args[0], args[1]
+	if _, err := a.env.GetInstance(appKey, id); err != nil {
+		return err
+	}
+	data := map[string]any{
+		"conclusion": "unverified",
+		"coverage":   "$HOME",
+		"violations": []string{},
+		"ignored":    core.DefaultIgnored(),
+		"retained":   false,
+		"reason":     "audit_not_enabled",
+	}
+	a.ok(data, func() {
+		fmt.Println("结论：unverified（未开启运行期审计，无法判定是否有越界写入）")
+		fmt.Println("这不是通过。要拿到结论需要先用 --audit 跑一次（本版本尚未实现）。")
+		fmt.Println("覆盖范围：$HOME 之内的写入")
+	})
+	return nil
 }
 
 // required 区分"没有它产品起不来"和"没有它只是降级"。
@@ -165,14 +198,13 @@ func runChecks(a *app) []check {
 		add("libadwaita", st, dt)
 	}
 
-	// 数据目录可写：MkdirAll 成功但真正写不进去（只读挂载）也要在这里暴露。
-	probe := filepath.Join(a.env.Base, ".doctor-write-test")
+	// 数据目录可写性：只读检查，不写探针文件——doctor 是只读命令，
+	// 往 AC_BASE 里写东西超出了 §4 的写入白名单。
 	if err := os.MkdirAll(a.env.Base, 0o700); err != nil {
 		add("state-dir", "fail", "数据目录不可创建："+a.env.Base)
-	} else if err := os.WriteFile(probe, []byte("ok"), 0o600); err != nil {
+	} else if err := unix.Access(a.env.Base, unix.W_OK); err != nil {
 		add("state-dir", "fail", "数据目录不可写："+a.env.Base)
 	} else {
-		_ = os.Remove(probe)
 		add("state-dir", "ok", a.env.Base)
 	}
 	return out

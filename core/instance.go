@@ -77,9 +77,14 @@ func (e *Env) CreateInstance(ctx context.Context, app string, p Profile, id stri
 		return Instance{}, err
 	}
 	committedProfile := false
+	var createdTargets []string
 	cleanup := func() {
 		os.Remove(profTmp)
 		os.RemoveAll(e.InstancePath(app, id)) // 只删本次新建的实例目录
+		// 宿主侧补建的占位目录/锁文件也要回收：留着会变成"用户没见过却存在"的空目录（§4）。
+		for _, c := range createdTargets {
+			os.Remove(c)
+		}
 	}
 	defer func() {
 		if !committedProfile {
@@ -112,10 +117,12 @@ func (e *Env) CreateInstance(ctx context.Context, app string, p Profile, id stri
 			return Instance{}, errEnv("err.env.mkdir", map[string]any{"path": sub}, err)
 		}
 	}
-	if _, err := e.prepareBindTargets(p, in); err != nil {
+	created, err := e.prepareBindTargets(p, in)
+	if err != nil {
 		cleanup()
 		return Instance{}, err
 	}
+	createdTargets = created
 	if err := e.saveInstance(in); err != nil {
 		cleanup()
 		return Instance{}, err
@@ -252,6 +259,11 @@ func (e *Env) ListInstances(app string) ([]Instance, error) {
 
 // GetInstance 读单个实例。
 func (e *Env) GetInstance(app, id string) (Instance, error) {
+	// app 与 id 都会拼进路径，两个都必须校验：删一个 `app="../../x"` 的实例
+	// 等于把 AC_BASE 之外的目录交给 gio trash（§4 <app> 规则）。
+	if err := ValidateAppKey(app); err != nil {
+		return Instance{}, err
+	}
 	if err := ValidateID(id); err != nil {
 		return Instance{}, err
 	}
@@ -324,7 +336,8 @@ func (e *Env) DeleteInstance(ctx context.Context, app, id string) error {
 // 没有 PID 文件，也没有 stale 状态——内核持有锁，进程怎么死都会释放（§4.3）。
 func (e *Env) IsRunning(app, id string) (bool, error) {
 	path := filepath.Join(e.InstancePath(app, id), "run.lock")
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
+	// 不带 O_CREATE：`list` 是只读命令，它不该在实例目录里创建文件（§4 写入白名单）。
+	f, err := os.OpenFile(path, os.O_RDWR, 0o600)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return false, nil

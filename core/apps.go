@@ -184,7 +184,7 @@ func parseDesktopFile(path string) (*App, error) {
 		return nil, kerr
 	}
 	a := &App{
-		DesktopID:      base,
+		DesktopID:      strings.TrimSuffix(base, ".desktop"),
 		Key:            key,
 		Name:           localizedName(keys),
 		Icon:           keys["Icon"],

@@ -3,7 +3,10 @@
 // 任何视图层依赖（cobra、GTK）。
 package core
 
-import "errors"
+import (
+	"errors"
+	"os"
+)
 
 // 退出码，与 docs/方案设计.md §6.3 一一对应。脚本与 GUI 都靠 Code 分支，
 // 不许解析人类文案（文案走 i18n 键）。
@@ -82,6 +85,28 @@ var ErrCanceled = errors.New("core: canceled")
 
 // ErrNotRunning 供 IsRunning 的调用方判空，不属于用户可见错误。
 var ErrNotRunning = errors.New("core: not running")
+
+// CheckNotRoot 是"免 root 红线"的守门人：run 与 add 都必须过它（§3.1 末段）。
+// root 会话下 --bind / / 是 rw，误操作能改宿主系统；而且 root 下 bwrap 本来就能
+// 跑通，"验证通过"会把非特权路径的问题全部藏起来。
+func CheckNotRoot() error {
+	if os.Geteuid() == 0 {
+		return errEnv("err.env.root", nil, nil)
+	}
+	return nil
+}
+
+// NewUsage 是用法错误的统一形态：退出码 1（§6.3 里 1 留给 appclone 自己）。
+func NewUsage(msg string) error {
+	return newErr(CodeInternal, "err.internal.usage", map[string]any{"message": msg}, nil)
+}
+
+// NewAuditUnavailable：--audit 已在命令面上，但运行期审计层还没实现。
+// 明确拒绝，而不是静默 no-op——静默会让用户以为开了审计，而 doctor --verify
+// 永远输出 unverified，用户只会觉得校验坏了。
+func NewAuditUnavailable() error {
+	return newErr(CodeProbe, "err.audit.unavailable", nil, nil)
+}
 
 // NewProbeUnavailable 表示"这个应用还没有可用档案，而探测管线不可用"。
 // 它必须是 CodeProbe 而不是 CodeInput：前者是"环境暂时给不出结论"，

@@ -82,7 +82,8 @@ func BuildBwrapArgs(p Profile, in Instance, o BuildOptions) ([]string, error) {
 	}
 	sort.Strings(locks)
 	for _, abs := range locks {
-		src := filepath.Join(in.Root, "locks", lockFileName(abs))
+		// 私有锁在 <inst>/locks：它不是应用数据，不该混进 root/（§4 布局）。
+		src := filepath.Join(in.Dir(), "locks", lockFileName(abs))
 		args = append(args, "--bind", src, abs)
 	}
 
@@ -92,10 +93,17 @@ func BuildBwrapArgs(p Profile, in Instance, o BuildOptions) ([]string, error) {
 	needRuntime := p.IsolateRuntime || (p.IsolateDBus && o.DBusAddress != "")
 	if needRuntime {
 		args = append(args,
-			"--bind", filepath.Join(in.Root, "runtime"), o.RuntimeDir,
+			// 源是实例目录（持久层），目标是命名空间里的宿主 runtime 路径。
+			// 写成 Join(in.Root, "runtime") 会让源变成 <inst>/root/runtime——那个目录
+			// 根本不存在，bwrap 遇到不存在的源会整条失败（§3.2 第 3 条）。
+			"--bind", filepath.Join(in.Dir(), "runtime"), o.RuntimeDir,
 			"--setenv", "XDG_RUNTIME_DIR", o.RuntimeDir, // 漏了这行，应用仍按旧值找 socket
 		)
 		for _, s := range o.RuntimeSocks {
+			// 私有总线时不能把宿主 bus 带进来：那等于把单例检测又接回宿主（§6.2）。
+			if p.IsolateDBus && filepath.Base(s.Src) == "bus" && filepath.Dir(filepath.Dir(s.Src)) == o.RuntimeDir {
+				continue
+			}
 			// 只读、只 bind socket/目录本身：把整个 $XDG_RUNTIME_DIR 带进来
 			// 等于把宿主单例 socket 一并带回来，等于没隔离（§6.2）。
 			args = append(args, "--ro-bind-try", s.Src, s.Dst)
@@ -103,7 +111,7 @@ func BuildBwrapArgs(p Profile, in Instance, o BuildOptions) ([]string, error) {
 	}
 	if p.IsolateDBus && o.DBusAddress != "" {
 		args = append(args,
-			"--bind", filepath.Join(in.Root, "dbus", "bus"), filepath.Join(o.RuntimeDir, "bus"),
+			"--bind", filepath.Join(in.Dir(), "dbus", "bus"), filepath.Join(o.RuntimeDir, "bus"),
 			"--setenv", "DBUS_SESSION_BUS_ADDRESS", o.DBusAddress,
 		)
 	}
@@ -182,10 +190,19 @@ func RuntimeSocketCandidates(runtimeDir string) []BindPair {
 		{Src: filepath.Join(runtimeDir, "pipewire-0"), Dst: filepath.Join(runtimeDir, "pipewire-0")},
 		{Src: filepath.Join(runtimeDir, "bus"), Dst: filepath.Join(runtimeDir, "bus")},
 		{Src: filepath.Join(runtimeDir, "dconf", "user"), Dst: filepath.Join(runtimeDir, "dconf", "user")},
-		{Src: filepath.Join(runtimeDir, "at-spi", "bus"), Dst: filepath.Join(runtimeDir, "at-spi", "bus")},
+
 		{Src: filepath.Join(runtimeDir, "X11-unix"), Dst: filepath.Join(runtimeDir, "X11-unix")},
 	}
-	// wayland-<n>：值取 $WAYLAND_DISPLAY，缺省 wayland-0；用通配匹配编号。
+	// at-spi 的实际文件名是 bus 或 bus_0（通配匹配，只认 bus 会让读屏失效）；
+	// wayland-<n> 同理按通配匹配编号。
+	if ents, err := os.ReadDir(filepath.Join(runtimeDir, "at-spi")); err == nil {
+		for _, ent := range ents {
+			if strings.HasPrefix(ent.Name(), "bus") {
+				p := filepath.Join(runtimeDir, "at-spi", ent.Name())
+				cands = append(cands, BindPair{Src: p, Dst: p})
+			}
+		}
+	}
 	if ents, err := os.ReadDir(runtimeDir); err == nil {
 		for _, ent := range ents {
 			name := ent.Name()

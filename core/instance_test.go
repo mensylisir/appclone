@@ -143,6 +143,27 @@ func TestIsRunningAndDeleteGuard(t *testing.T) {
 	_ = in
 }
 
+func TestDeleteInstanceRejectsPathTraversal(t *testing.T) {
+	e := testEnv(t)
+	// app 会拼进删除路径：`../../x` 这种值必须在入口就被拒，不能进到 gio trash。
+	if err := e.DeleteInstance(context.Background(), "../../etc", "main"); ExitCode(err) != CodeInput {
+		t.Fatalf("非法 app key 必须拒绝（2），得到 %v", err)
+	}
+	if _, err := e.GetInstance("../x", "main"); ExitCode(err) != CodeInput {
+		t.Fatalf("GetInstance 也要校验 app key，得到 %v", err)
+	}
+}
+
+func TestValidateRunnableRequiresExtraBindSource(t *testing.T) {
+	e := testEnv(t)
+	app, p := seedApp(t, e)
+	_ = app
+	p.ExtraBinds = []BindPair{{Src: "/nonexistent/path", Dst: "/opt/x"}}
+	if err := e.ValidateRunnable(p); errKey(err) != "err.profile.extra_bind_missing" {
+		t.Fatalf("额外绑定源不存在必须拒绝，得到 %v", err)
+	}
+}
+
 func TestProfileRoundtripKeepsUnknownFields(t *testing.T) {
 	e := testEnv(t)
 	dir := filepath.Join(e.Base, "profiles.d")

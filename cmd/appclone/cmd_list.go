@@ -34,7 +34,8 @@ type instanceJSON struct {
 }
 
 func newListCmd(a *app) *cobra.Command {
-	return &cobra.Command{
+	var all bool
+	c := &cobra.Command{
 		Use:   "list [app]",
 		Short: "列出应用与分身",
 		Args:  cobra.MaximumNArgs(1),
@@ -54,9 +55,9 @@ func newListCmd(a *app) *cobra.Command {
 				if filter != "" && ap.Key != filter {
 					continue
 				}
-				// 列表默认只显示"配过或建过"的应用：把 397 个从没碰过的应用
-				// 全列出来不是列表，是倾倒。doctor/JSON 里仍能看到全量。
-				if filter == "" && !ap.HasProfile && ap.InstanceN == 0 {
+				// 默认只显示"配过或建过"的应用：把 397 个从没碰过的应用全列出来
+				// 不是列表，是倾倒。要全量用 --all（应用集仍是三目录 ∪ 档案 ∪ 实例）。
+				if filter == "" && !all && !ap.HasProfile && ap.InstanceN == 0 {
 					continue
 				}
 				insts, err := a.env.ListInstances(ap.Key)
@@ -110,4 +111,6 @@ func newListCmd(a *app) *cobra.Command {
 			return nil
 		},
 	}
+	c.Flags().BoolVar(&all, "all", false, "列出全部应用（默认只列配过或建过分身的）")
+	return c
 }

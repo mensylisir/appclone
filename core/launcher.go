@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"strings"
 	"unicode/utf8"
+
+	"github.com/mensylisir/appclone/core/i18n"
 )
 
 // CLIPath 可被构建期 -ldflags -X 覆盖。解析顺序固定为：
@@ -53,27 +55,27 @@ func (e *Env) LauncherPath(app, id string) string {
 }
 
 // launcherName 拼「应用名（分身 显示名）」，超长时截断显示名并补省略号。
-func launcherName(appName, display string, lang string) string {
-	prefix, suffix := appName, ""
-	switch lang {
-	case "zh_CN":
-		prefix, suffix = appName+"（分身 ", "）"
-	default:
-		prefix, suffix = appName+" (Clone · ", ")"
+//
+// 后缀模板来自 i18n（desktop.clone_name_suffix），不写死在代码里：
+// 本地化只翻模板、不翻用户数据——display_name 原样嵌入。
+func launcherName(appName, display, lang string) string {
+	tmpl := i18n.T(lang, "desktop.clone_name_suffix", map[string]any{"name": display})
+	head, tail, _ := strings.Cut(tmpl, display)
+	full := appName + head + display + tail
+	if utf8.RuneCountInString(full) <= nameSuffixMax {
+		return full
 	}
-	body := display
-	if n := utf8.RuneCountInString(prefix+suffix) + utf8.RuneCountInString(body); n > nameSuffixMax {
-		keep := nameSuffixMax - utf8.RuneCountInString(prefix+suffix) - 1
-		if keep < 1 {
-			keep = 1
-		}
-		r := []rune(body)
-		if len(r) > keep {
-			r = r[:keep]
-		}
-		body = string(r) + "…"
+	// 超限时截断显示名部分并补省略号：GNOME 概览里后缀被切掉，
+	// 两个分身会看起来一模一样（§4.1）。
+	keep := nameSuffixMax - utf8.RuneCountInString(appName+head+tail) - 1
+	if keep < 1 {
+		keep = 1
 	}
-	return prefix + body + suffix
+	r := []rune(display)
+	if len(r) > keep {
+		r = r[:keep]
+	}
+	return appName + head + string(r) + "…" + tail
 }
 
 // WriteLauncher 原子重写同一个 .desktop（§4.1 全部规则）。
@@ -113,8 +115,10 @@ func (e *Env) renderLauncher(in Instance, d App) ([]byte, error) {
 	b.WriteString("[Desktop Entry]\n")
 	b.WriteString("Version=1.0\n") // Desktop Entry 规范版本，与被分身应用的版本无关
 	b.WriteString("Type=Application\n")
-	fmt.Fprintf(&b, "Name=%s\n", escapeDesktopValue(launcherName(appName, in.DisplayName, "")))
+	// 三行都写：Name 是兜底（无 [lang] 时桌面环境用它），另两行是本地化。
+	fmt.Fprintf(&b, "Name=%s\n", escapeDesktopValue(launcherName(appName, in.DisplayName, "en")))
 	fmt.Fprintf(&b, "Name[zh_CN]=%s\n", escapeDesktopValue(launcherName(appName, in.DisplayName, "zh_CN")))
+	fmt.Fprintf(&b, "Name[en]=%s\n", escapeDesktopValue(launcherName(appName, in.DisplayName, "en")))
 	exec := cli + " run " + quoteExecArg(in.App) + " " + quoteExecArg(in.ID)
 	if d.FieldCodes != "" {
 		// 保留源 Exec 的字段码（%U/%F），文件管理器"用分身打开"依赖它；

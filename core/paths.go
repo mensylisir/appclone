@@ -31,7 +31,12 @@ func NewPathResolver() (*PathResolver, error) {
 		return nil, errEnv("err.env.no_home", nil, err)
 	}
 	home := real
-	if h := os.Getenv("AC_HOME"); h != "" && filepath.IsAbs(h) {
+	if h := os.Getenv("AC_HOME"); h != "" {
+		if !filepath.IsAbs(h) {
+			// 静默忽略会让冒烟脚本"以为用了假 HOME"，实际跑的是真实主目录——
+			// 那是最危险的一类假通过（§6.4）。
+			return nil, errInput("err.env.ac_home_relative", map[string]any{"path": h})
+		}
 		home = filepath.Clean(h)
 	}
 	uid := os.Getuid()
@@ -98,13 +103,13 @@ func (r *PathResolver) Expand(s string) (string, error) {
 		return "", errInput("err.path.not_absolute", map[string]any{"path": orig})
 	}
 	clean := filepath.Clean(s)
-	if clean != s && hasDotDot(orig) {
-		return "", errInput("err.path.dotdot", map[string]any{"path": orig})
-	}
 	if hasDotDot(orig) {
 		return "", errInput("err.path.dotdot", map[string]any{"path": orig})
 	}
-	return clean, nil
+	// 必须在这里解析软链：`~/.config/App` 可能是指向 `~/Downloads` 的软链，
+	// 只用 Clean 的字符串做公共目录判定会放行，而内核 bind 时会解析到公共目录，
+	// 于是 Downloads 被隔离成实例私有——直接踩第一原则（§5 paths、§6.4）。
+	return Real(clean), nil
 }
 
 func hasDotDot(p string) bool {
@@ -222,7 +227,7 @@ func (r *PathResolver) PublicDirs() []string {
 			if !filepath.IsAbs(v) {
 				v = filepath.Join(r.Home, v)
 			}
-			v = filepath.Clean(v)
+			v = Real(filepath.Clean(v))
 			if v == filepath.Clean(r.Home) {
 				// 用户把某个公共目录指到了家目录本身：那不是公共目录，是家目录。
 				continue
@@ -249,6 +254,28 @@ func (r *PathResolver) PublicDirs() []string {
 		out = append(out, p)
 	}
 	return out
+}
+
+// Real 把路径解析成真实路径：对最长的已存在前缀做 EvalSymlinks，再接回不存在的尾段。
+// 直接用 filepath.EvalSymlinks 要求整条路径都存在，而"应用还没建过这个目录"是常态。
+func Real(p string) string {
+	p = filepath.Clean(p)
+	if resolved, err := filepath.EvalSymlinks(p); err == nil {
+		return resolved
+	}
+	// 逐级向上找到存在的祖先，解析它，再把剩下的尾段接回去。
+	head, tail := p, ""
+	for {
+		parent := filepath.Dir(head)
+		if parent == head { // 到根了
+			return p
+		}
+		tail = filepath.Join(filepath.Base(head), tail)
+		head = parent
+		if resolved, err := filepath.EvalSymlinks(head); err == nil {
+			return filepath.Join(resolved, tail)
+		}
+	}
 }
 
 // ProtectedDirs 是 paths 里一律不许出现的"整个命名空间"级路径（不含公共目录，

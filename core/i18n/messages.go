@@ -84,7 +84,11 @@ var messages = map[string]map[string]string{
 
 		// 探测（discover.md 的三层管线）
 		"err.probe.unavailable":   "「{app}」还没有可用的隔离档案，而本版本尚未接入探测管线。请等待探测功能，或使用带内置模板的应用。",
+		"err.audit.unavailable":   "运行期审计层（--audit）还没有实现，本版本无法开启。不加这个参数可以直接运行；关闭审计不影响隔离本身。",
 		"ui.add.reconfigure_note": "「{app}」的档案已失效，正在用内置模板重建；若应用的数据目录已变化，请用「重新探测」校正。",
+
+		// 桌面入口
+		"desktop.clone_name_suffix": "（分身 {name}）",
 
 		// 内部
 		"err.internal.read_profile":    "读取档案 {path} 失败。",
@@ -92,6 +96,8 @@ var messages = map[string]map[string]string{
 		"err.internal.encode_profile":  "序列化档案失败（内部错误）。",
 		"err.internal.encode_instance": "序列化分身元数据失败（内部错误）。",
 		"err.internal.no_resolver":     "内部错误：缺少路径解析器。",
+		"err.internal.unknown":         "内部错误：{message}",
+		"err.internal.usage":           "用法错误：{message}",
 		"err.internal.bind_escape":     "内部错误：绑定路径逃出了实例目录（{root} / {path}）。",
 	},
 
@@ -131,6 +137,8 @@ var messages = map[string]map[string]string{
 		"err.profile.empty":               "\"{app}\" has no isolatable app data, so no clone can be created.",
 		"err.profile.no_exec":             "The profile has no exec entry. Re-run the probe.",
 		"err.profile.exec_relative":       "Profile exec \"{exec}\" is not absolute; appclone refuses to load it.",
+		"err.profile.exec_field_code":     "Profile exec \"{exec}\" still contains a field code such as %U; field codes belong to desktop entries only.",
+		"err.profile.extra_bind_missing":  "Extra bind source \"{path}\" does not exist; this bind would make the clone fail to start.",
 		"err.profile.exec_missing":        "\"{exec}\" does not exist; \"{app}\" may have been upgraded or removed. Re-run the probe.",
 		"err.profile.stale":               "The profile for \"{app}\" is stale: {path} no longer exists. Reconfigure it (it will probe again, then create the clone).",
 		"err.profile.root_path":           "An isolation path cannot be the filesystem root (field {field}).",
@@ -162,13 +170,18 @@ var messages = map[string]map[string]string{
 		"err.launcher.no_cli": "Cannot locate the appclone command, so the desktop entry cannot be created. Reinstall appclone.",
 
 		"err.probe.unavailable":   "\"{app}\" has no usable isolation profile yet, and this build does not ship the probe pipeline. Wait for the probe feature, or use an app that ships a bundled template.",
+		"err.audit.unavailable":   "The runtime audit layer (--audit) is not implemented yet in this build. Run without the flag; isolation itself is unaffected.",
 		"ui.add.reconfigure_note": "The profile for \"{app}\" was stale; rebuilding it from the bundled template. If the app's data directories moved, run Rediscover to correct it.",
+
+		"desktop.clone_name_suffix": " (Clone · {name})",
 
 		"err.internal.read_profile":    "Reading profile {path} failed.",
 		"err.internal.read_instance":   "Reading clone metadata {path} failed.",
 		"err.internal.encode_profile":  "Encoding profile failed (internal error).",
 		"err.internal.encode_instance": "Encoding clone metadata failed (internal error).",
 		"err.internal.no_resolver":     "Internal error: missing path resolver.",
+		"err.internal.unknown":         "Internal error: {message}",
+		"err.internal.usage":           "Usage error: {message}",
 		"err.internal.bind_escape":     "Internal error: bind path escaped the instance directory ({root} / {path}).",
 	},
 }

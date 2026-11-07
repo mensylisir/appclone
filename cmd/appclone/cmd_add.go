@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"fmt"
-	"strings"
 
 	"github.com/spf13/cobra"
 
@@ -31,8 +30,14 @@ func newAddCmd(a *app) *cobra.Command {
 			if err := a.applyOverrides(cmd); err != nil {
 				return err
 			}
-			appKey := strings.ToLower(args[0])
-			if err := core.ValidateAppKey(appKey); err != nil {
+			// 用户输入先归一再校验：`add "CC Switch"` 与 `add cc-switch` 是同一个应用，
+			// 而 "CC Switch" 的 .desktop 文件名里确实带空格（§4 <app> 规则）。
+			appKey, err := core.SanitizeAppKey(args[0])
+			if err != nil {
+				return err
+			}
+			// add 与 run 都要过免 root 红线（§3.1 末段）。
+			if err := core.CheckNotRoot(); err != nil {
 				return err
 			}
 			id := ""
@@ -50,6 +55,13 @@ func newAddCmd(a *app) *cobra.Command {
 			hasProfile, creatable, err := a.env.ProfileState(appKey)
 			if err != nil {
 				return err
+			}
+			if !hasProfile {
+				// 没有档案时先确认应用真的存在：不存在是输入错误（2），
+				// 不该报成"探测给不出结论"（4）——脚本对这两类的处理完全不同（§6.3）。
+				if _, lerr := a.env.LoadApp(appKey); lerr != nil {
+					return lerr
+				}
 			}
 
 			var p core.Profile
@@ -69,9 +81,6 @@ func newAddCmd(a *app) *cobra.Command {
 					return core.NewProbeUnavailable(appKey)
 				}
 				p = bundled
-				if err := a.env.SaveProfile(p); err != nil {
-					return err
-				}
 			} else {
 				if p, err = a.env.LoadProfile(appKey); err != nil {
 					return err
@@ -79,6 +88,17 @@ func newAddCmd(a *app) *cobra.Command {
 			}
 
 			if profileOnly {
+				// 只落档案这条路径不经过 CreateInstance 的事务，校验必须自己补一遍：
+				// 存档前一个字节都不能写（§11 CreateInstance 事务第 1 步的原则）。
+				if err := core.ValidateProfile(p, a.env.BuildOptions()); err != nil {
+					return err
+				}
+				if err := core.ValidateCreatable(p); err != nil {
+					return err
+				}
+				if err := a.env.SaveProfile(p); err != nil {
+					return err
+				}
 				a.ok(map[string]any{
 					"app": appKey, "profile_saved": true, "probe_method": p.ProbeMethod,
 				}, func() {

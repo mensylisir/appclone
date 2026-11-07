@@ -48,6 +48,29 @@ func TestValidateProfileRejectsDangerousPaths(t *testing.T) {
 	}
 }
 
+func TestValidateProfileResolvesSymlinkIntoPublicDir(t *testing.T) {
+	root := t.TempDir()
+	home := root + "/home"
+	r := newResolver(home, home, 1000, func(string) string { return "" })
+	e := NewEnvAt(home+"/.local/share/appclone", r)
+	o := e.opts()
+	// ~/.config/App 是指向 ~/Downloads 的软链：只用 Clean 的字符串判定会放行，
+	// 而内核 bind 时会解析到公共目录，等于把 Downloads 隔离成实例私有。
+	if err := os.MkdirAll(home+"/.config", 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(home+"/Downloads", 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(home+"/Downloads", home+"/.config/App"); err != nil {
+		t.Skip("文件系统不支持符号链接：", err)
+	}
+	p := Profile{App: "x", Version: 1, Exec: "/bin/true", Paths: []string{"~/.config/App"}}
+	if err := ValidateProfile(p, o); errKey(err) != "err.profile.public_path" {
+		t.Fatalf("软链指向公共目录必须被拒，得到 %v", err)
+	}
+}
+
 func TestValidateProfileRejectsReservedEnvAndOverlap(t *testing.T) {
 	e := testEnv(t)
 	o := e.opts()

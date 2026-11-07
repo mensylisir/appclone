@@ -68,6 +68,7 @@ func TestBuildBwrapArgsGoldenOrder(t *testing.T) {
 		Cwd:            "~",
 	}
 	in := Instance{App: "wechat", ID: "work", Root: e.InstancePath("wechat", "work") + "/root"}
+	instDir := e.InstancePath("wechat", "work")
 
 	got, err := BuildBwrapArgs(p, in, o)
 	if err != nil {
@@ -85,14 +86,14 @@ func TestBuildBwrapArgsGoldenOrder(t *testing.T) {
 		// ⑥ shared_writes 在 paths 之后
 		"--bind-try", o.Home + "/.config/gtk-3.0/bookmarks", o.Home + "/.config/gtk-3.0/bookmarks",
 		// ⑧ lock_files
-		"--bind", in.Root + "/locks/" + lockFileName(o.Home+"/.config/WeChat/lock"), o.Home + "/.config/WeChat/lock",
+		"--bind", instDir + "/locks/" + lockFileName(o.Home+"/.config/WeChat/lock"), o.Home + "/.config/WeChat/lock",
 		// ⑨ runtime 目录 + setenv，然后只读 socket
-		"--bind", in.Root + "/runtime", o.RuntimeDir,
+		"--bind", instDir + "/runtime", o.RuntimeDir,
 		"--setenv", "XDG_RUNTIME_DIR", o.RuntimeDir,
 		"--ro-bind-try", o.RuntimeDir + "/wayland-0", o.RuntimeDir + "/wayland-0",
 		"--ro-bind-try", o.RuntimeDir + "/pulse/native", o.RuntimeDir + "/pulse/native",
 		// ⑩ dbus
-		"--bind", in.Root + "/dbus/bus", o.RuntimeDir + "/bus",
+		"--bind", instDir + "/dbus/bus", o.RuntimeDir + "/bus",
 		"--setenv", "DBUS_SESSION_BUS_ADDRESS", o.DBusAddress,
 		// ⑫ env 按 key 字典序
 		"--setenv", "A", "1",
@@ -118,6 +119,34 @@ func assertOrder(t *testing.T, argv []string, a, b string) {
 	ib := strings.Index(sa, b)
 	if ia < 0 || ib < 0 || ia > ib {
 		t.Fatalf("顺序不符合契约：%q 必须早于 %q\nargv=%v", a, b, argv)
+	}
+}
+
+func TestBuildBwrapArgsPrivateDirsLiveOutsideRoot(t *testing.T) {
+	e := testEnv(t)
+	o := e.opts()
+	o.DBusAddress = "unix:path=/run/user/1000/x"
+	p := Profile{App: "x", Version: 1, Exec: "/bin/true", Paths: []string{"~/.config/X"},
+		IsolateRuntime: true, IsolateDBus: true, LockFiles: []string{"~/.config/X/lock"}}
+	instDir := e.InstancePath("x", "main")
+	got, err := BuildBwrapArgs(p, Instance{App: "x", ID: "main", Root: instDir + "/root"}, o)
+	if err != nil {
+		t.Fatal(err)
+	}
+	joined := strings.Join(got, " ")
+	for _, want := range []string{
+		"--bind " + instDir + "/runtime " + o.RuntimeDir,
+		"--bind " + instDir + "/dbus/bus " + o.RuntimeDir + "/bus",
+		"--bind " + instDir + "/locks/",
+	} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("缺少 %q\nargv=%v", want, got)
+		}
+	}
+	// runtime/dbus/locks 都不是应用数据，绝不能出现在 root/ 下：那会被当成
+	// 应用数据一起进回收站，也会与 paths 映射出的同名子路径打架。
+	if strings.Contains(joined, "/root/runtime") || strings.Contains(joined, "/root/dbus") || strings.Contains(joined, "/root/locks") {
+		t.Fatalf("私有目录不该在 root/ 下\nargv=%v", got)
 	}
 }
 
