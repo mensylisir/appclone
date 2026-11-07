@@ -4,7 +4,6 @@ import (
 	"context"
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 )
 
@@ -66,41 +65,97 @@ func TestVerifyRefusesWhileRunning(t *testing.T) {
 	}
 }
 
-// 审计层落地后，verify 的判定逻辑就是这一段：喂一棵 upper 树，给出结论。
+// 审计层落地后，verify 的判定逻辑就是这一段：喂一棵 upper 树，给出结论，
+// 并按结论处置证据（§6.5 留存策略）。
 func TestVerifyJudgesUpperTree(t *testing.T) {
 	e := testEnv(t)
 	app, id := seedVerifyApp(t, e)
 	upper := filepath.Join(e.AuditDir(app, id), "upper")
 	// 预期内的写入：缓存噪声（ignored 类别本来就该进 upper）。
-	for _, rel := range []string{
-		".cache/TestApp/blob",
-	} {
-		writeTree(t, filepath.Join(upper, filepath.FromSlash(rel)))
-	}
+	writeTree(t, filepath.Join(upper, filepath.FromSlash(".cache/TestApp/blob")))
 	// 有 upper 就必须有 run.toml：缺了说明上次审计没正常结束，只能给 unverified。
 	writeTree(t, filepath.Join(e.AuditDir(app, id), "run.toml"))
+
 	v, err := e.Verify(app, id)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if v.Conclusion != VerdictVerified || v.ExitCode() != CodeOK {
-		t.Fatalf("只有预期写入时应判 verified，得到 %s / %v", v.Conclusion, v.Violations)
+		t.Fatalf("只有 ignored 里的写入时应判 verified，得到 %s / %v", v.Conclusion, v.Violations)
 	}
+	// verified 之后证据被消费：upper 与 run.toml 删掉、summary 落盘。
+	if _, err := os.Stat(upper); !os.IsNotExist(err) {
+		t.Fatal("verified 之后 upper 应被删除（证据已消费）")
+	}
+	if _, err := os.Stat(filepath.Join(e.AuditDir(app, id), "run.toml")); !os.IsNotExist(err) {
+		t.Fatal("verified 之后 run.toml 应被删除")
+	}
+	if _, err := os.Stat(filepath.Join(e.AuditDir(app, id), "summary.toml")); err != nil {
+		t.Fatalf("verified 之后应留下摘要：%v", err)
+	}
+	// 再验一次：走"重放"，结论一致且不会被重新对账改写。
+	again, err := e.Verify(app, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if again.Conclusion != VerdictVerified || again.GeneratedAt == "" {
+		t.Fatalf("重放应给出同一结论并带上时间，得到 %+v", again)
+	}
+}
 
-	// 再写一条越界：别的应用的配置目录。
-	writeTree(t, filepath.Join(upper, ".config", "OtherApp", "state.json"))
-	v, err = e.Verify(app, id)
+// 越界：结论 8、**证据搬进 quarantine-* 而不是删掉**（越界文件就在里面）。
+func TestVerifyQuarantinesOnLeak(t *testing.T) {
+	e := testEnv(t)
+	app, id := seedVerifyApp(t, e)
+	audit := e.AuditDir(app, id)
+	upper := filepath.Join(audit, "upper")
+	writeTree(t, filepath.Join(upper, filepath.FromSlash(".config/OtherApp/state.json")))
+	writeTree(t, filepath.Join(audit, "run.toml"))
+
+	v, err := e.Verify(app, id)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if v.Conclusion != VerdictLeak || v.ExitCode() != CodeLeak {
-		t.Fatalf("越界应判 leak-detected（8），得到 %s", v.Conclusion)
+		t.Fatalf("越界应判 leak-detected（8），得到 %s / %v", v.Conclusion, v.Violations)
 	}
-	if len(v.Violations) != 1 || !strings.HasSuffix(v.Violations[0], filepath.FromSlash(".config/OtherApp/state.json")) {
-		t.Fatalf("越界清单应只报那条真实写入（不含被顺带造出的父目录）：%v", v.Violations)
+	if !v.Retained || v.Quarantine == "" {
+		t.Fatalf("越界必须保留证据并给出位置，得到 %+v", v)
 	}
-	if !v.Retained {
-		t.Fatal("越界时证据必须保留（删掉等于销毁用户数据）")
+	// 证据确实被搬到了 quarantine，而不是删掉。
+	moved := filepath.Join(v.Quarantine, filepath.FromSlash(".config/OtherApp/state.json"))
+	if _, err := os.Stat(moved); err != nil {
+		t.Fatalf("越界文件应留在 quarantine 里：%v", err)
+	}
+	if _, err := os.Stat(upper); !os.IsNotExist(err) {
+		t.Fatal("原来的 upper 应已被搬走")
+	}
+	if _, err := os.Stat(filepath.Join(audit, "summary.toml")); err != nil {
+		t.Fatalf("结论应落盘：%v", err)
+	}
+}
+
+// 摘出失效：现场原样保留（连 upper 都不动），结论 unverified + 退出 4。
+func TestVerifyKeepsEvidenceOnExtractFailure(t *testing.T) {
+	e := testEnv(t)
+	app, id := seedVerifyApp(t, e)
+	audit := e.AuditDir(app, id)
+	upper := filepath.Join(audit, "upper")
+	writeTree(t, filepath.Join(upper, filepath.FromSlash("Downloads/important.docx")))
+	writeTree(t, filepath.Join(audit, "run.toml"))
+
+	v, err := e.Verify(app, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v.Conclusion != VerdictUnverified || v.Reason != "extract_failed" {
+		t.Fatalf("公共目录出现在 upper 应判 extract_failed，得到 %+v", v)
+	}
+	if v.ExitCode() != CodeProbe {
+		t.Fatalf("摘出失效的退出码应为 4，得到 %d", v.ExitCode())
+	}
+	if _, err := os.Stat(filepath.Join(upper, filepath.FromSlash("Downloads/important.docx"))); err != nil {
+		t.Fatalf("extract_failed 时现场必须原样保留：%v", err)
 	}
 }
 

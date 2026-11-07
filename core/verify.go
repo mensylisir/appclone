@@ -1,12 +1,14 @@
 package core
 
 import (
+	"bytes"
 	"fmt"
 	"io/fs"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/BurntSushi/toml"
 	"golang.org/x/sys/unix"
@@ -30,6 +32,7 @@ type Verdict struct {
 	Retained    bool     `json:"retained"`               // 越界时证据必须留着，否则等于销毁用户数据
 	Reason      string   `json:"reason,omitempty"`       // unverified 的原因，如 audit_not_enabled
 	GeneratedAt string   `json:"generated_at,omitempty"` // 重放已存摘要时带上它，用户才知道结论有多旧
+	Quarantine  string   `json:"quarantine,omitempty"`   // 越界证据被搬到哪里（空 = 没有搬）
 }
 
 // ExitCode 是结论对应的退出码：只有 leak-detected 是失败（8）。
@@ -159,7 +162,65 @@ func (e *Env) Verify(app, id string) (Verdict, error) {
 		// 也可能是审计层没挂上——两种都不足以证明隔离有效（§6.5 表格第 5 行）。
 		return unverified("no_writes", false), nil
 	}
-	return e.Judge(p, entries), nil
+	return e.finalize(app, id, p, e.Judge(p, entries))
+}
+
+// finalize 把结论落账，并按结论处置证据（§6.5 留存策略）。**判**与**处置**分开：
+// 判定错会误导用户，处置错会毁掉用户的文件。
+//
+//   - verified      → 写 summary.toml，删 upper 与 run.toml（证据已消费）
+//   - leak-detected → 写 summary.toml（retained），upper 改名 quarantine-*（**不删**：
+//     越界文件就在里面，删掉等于销毁用户数据）
+//   - extract_failed→ 写 summary.toml（retained），现场原样保留
+//   - 其余 unverified（无证据/证据不完整/空 upper）→ 不写摘要、不动现场
+func (e *Env) finalize(app, id string, p Profile, v Verdict) (Verdict, error) {
+	if v.Conclusion == VerdictUnverified && v.Reason != "extract_failed" {
+		return v, nil
+	}
+	audit := e.AuditDir(app, id)
+	if err := os.MkdirAll(audit, 0o700); err != nil {
+		return Verdict{}, errEnv("err.env.mkdir", map[string]any{"path": audit}, err)
+	}
+
+	// 处置顺序：先把证据搬走/删掉，再写摘要——反过来一旦摘要写成功、
+	// 处置失败，下一次 verify 会把"已消费"当成结论，现场就再也找不回了。
+	switch {
+	case v.Conclusion == VerdictLeak:
+		q := filepath.Join(audit, "quarantine-"+time.Now().UTC().Format("20060102T150405"))
+		if err := os.Rename(e.upperDir(app, id), q); err != nil {
+			return Verdict{}, errEnv("err.probe.quarantine_failed", map[string]any{"path": q}, err)
+		}
+		v.Retained = true
+		v.Quarantine = q
+	case v.Conclusion == VerdictVerified:
+		if err := os.RemoveAll(e.upperDir(app, id)); err != nil {
+			return Verdict{}, errEnv("err.env.write", map[string]any{"path": e.upperDir(app, id)}, err)
+		}
+		_ = os.Remove(filepath.Join(audit, "run.toml"))
+	default: // extract_failed：bind 失效，现场必须原样保留
+		v.Retained = true
+	}
+
+	sum := Summary{
+		Conclusion:  v.Conclusion,
+		Coverage:    v.Coverage,
+		Violations:  v.Violations,
+		Ignored:     v.Ignored,
+		Retained:    v.Retained,
+		GeneratedAt: time.Now().UTC().Format(time.RFC3339),
+		Reason:      v.Reason,
+	}
+	var buf bytes.Buffer
+	if err := toml.NewEncoder(&buf).Encode(sum); err != nil {
+		return Verdict{}, errInternal("err.internal.encode_profile", nil, err)
+	}
+	// 原子写：半份摘要比没有摘要更坏（下次会按"损坏"处理，把结论降级成不可读）。
+	if err := writeFileAtomic(filepath.Join(audit, "summary.toml"), buf.Bytes(), 0o600); err != nil {
+		return Verdict{}, err
+	}
+	// 不把"刚刚"写回 Verdict.GeneratedAt：CLI 用它标注"重放的已存摘要"，
+	// 刚判出来的结论带着它会被误标成重放。时间戳以摘要文件为准。
+	return v, nil
 }
 
 // Summary 是 `audit/summary.toml` 的形状：几 KB 的结论摘要，upper 被消费后

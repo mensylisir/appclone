@@ -137,6 +137,7 @@ func (a *app) runVerify(cmd *cobra.Command, args []string) error {
 		"retained":       v.Retained,
 		"reason":         v.Reason,
 		"generated_at":   v.GeneratedAt,
+		"quarantine":     v.Quarantine,
 	}, func() {
 		switch {
 		case v.Conclusion == core.VerdictVerified:
@@ -148,7 +149,10 @@ func (a *app) runVerify(cmd *cobra.Command, args []string) error {
 				fmt.Println("  " + p)
 			}
 			// 摘要自己说"证据没保留"时必须照实说：那意味着越界文件可能已经被删了。
-			if v.Retained {
+			if v.Quarantine != "" {
+				fmt.Println("证据已搬到：" + v.Quarantine)
+				fmt.Println("越界文件就在里面，**先别删**——把缺的文件取回来，再重新探测。")
+			} else if v.Retained {
 				fmt.Println("证据保留在实例子目录 audit/ 里，没有删除。建议重新探测后再运行。")
 			} else {
 				fmt.Println("注意：这份摘要记录为「证据未保留」——如果这不是你有意为之，越界文件可能已经无法从 audit/ 取回。")

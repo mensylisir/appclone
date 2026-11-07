@@ -56,6 +56,16 @@ GUI 方向定案：**GTK4 + libadwaita 原生控件，经 puregotk 绑定（零 
 
 ## 最近完成
 
+- 2026-11-07 **第二十一轮：`doctor --verify` 开始按结论处置证据**（§6.5 剩下的另一半）：
+  - 之前 verify 只判不落账：判完什么都不写，证据永远留在盘上，也没有 `summary.toml` 可重放。
+    现在 `finalize`：`verified` → 写摘要 + 删 upper/run.toml（证据已消费）；`leak-detected` →
+    upper 改名 `audit/quarantine-<时间>/`（**不删**，越界文件就在里面）+ 摘要记 `evidence_retained`；
+    `extract_failed` → 现场原样保留；其余 unverified 不写摘要不动现场。
+  - **顺序是"先搬/删、再写摘要"**：反过来的话，摘要一旦写成功而处置失败，下一次 verify 会按
+    "已消费"重放一个错误结论，现场再也找不回。
+  - CLI 在 leak 时直接打印 quarantine 路径并提示"先别删，把缺的文件取回来"。
+  - 断言：verified 后 upper/run.toml 消失且重放结论一致；leak 后越界文件确实躺在 quarantine 里；
+    extract_failed 时 upper 一动没动。三种处置都不需要 fuse，纯文件树验证。
 - 2026-11-07 **第二十轮：L0 静态预填落地**（把"零执行"的三条线索接上）：
   - `core/static.go`：已知模式 / AppArmor `owner … w` / Flatpak `filesystems=` 三个渠道，
     产出低置信候选与**锁文件**。锁文件是重点：它让探测不再"零写入"——主实例在跑时应用会发现锁被
