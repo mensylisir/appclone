@@ -29,7 +29,8 @@ GUI 方向定案：**GTK4 + libadwaita 原生控件，经 puregotk 绑定（零 
 1a. **可离线验证的部分**（**已完成** 2026-11-07）：`MergeUpper`（upper 归并：取应用目录/单文件本身、
    剔除 XDG 根、whiteout 单列、按路径稳定排序）+ `Classify`（§5 有序规则表）+ `ProfileFromCandidates`
    （paths / shared_writes / unsupported 三落点互斥）→ `core/classify_test.go` 8 组断言。
-1b. **需要真实会话的部分**（被挡）：overlay 会话编排、strace 降级、两轮探测循环。
+1b. **需要真实会话的部分**：overlay 会话编排**已实现**（`core/probe.go`，待真机验证）；
+    strace 降级与"两轮探测循环"仍未做。
 
 其余路线图项（编号沿用 `docs/方案设计.md` §10）：
 
@@ -44,9 +45,10 @@ GUI 方向定案：**GTK4 + libadwaita 原生控件，经 puregotk 绑定（零 
 
 ## 被挡住的
 
-- `/dev/fuse` 不存在（容器内 `mknod` 被拒）：overlay 主探测与克隆起步**无法验证**（`fuse-overlayfs 1.18` 与
-  `fusermount3 3.18.3` 本身已装）。方案已定义降级判据（`docs/discover.md` §3.2/§3.4），所以先做 1a 的纯函数部分；
-  1b 要等有 `/dev/fuse` 的机器（真机或 `--device /dev/fuse` 的容器）。
+- **开发沙箱里没有 `/dev/fuse`**（`mknod` 被拒、节点不存在）：L1 的 syscall 部分（真挂载 + 真会话）**在这里
+  无法验证**。用户机器上是有的（`ls /dev/fuse` 正常），所以这不是产品限制，只是我这边的环境限制。
+  验证办法：在真机跑 `design/probe-smoke.sh /path/to/appclone`——它用假 HOME 走完整条链路
+  （doctor → add 触发探测 → 检查档案里的 `ProbeDemo` 路径 → 检查 `/var/tmp` 无残留 → 检查假 HOME 零污染 → rm）。
 - **降权验证同样被挡**：`runuser`（cannot set groups）、`setpriv`（setresuid failed）、`chown`（Invalid argument）
   全部被沙箱拒绝，所以 bwrap 语义只能在 root 下手工执行，`run` 的非特权路径至今没有实机证据。
 - **GUI 侧的自动化闸门尚未存在**：`guitest.js` 只覆盖 HTML 稿。GTK 实现的回归要等 S0 之后建
@@ -54,6 +56,15 @@ GUI 方向定案：**GTK4 + libadwaita 原生控件，经 puregotk 绑定（零 
 
 ## 最近完成
 
+- 2026-11-07 **第十七轮：L1 overlay 探测落地（待真机验证）**：
+  - `core/probe.go`：四道闸门、`ProbeBwrapArgs` 全序、会话生命周期、污染反向断言、quarantine 保留现场。
+    几个关键决定：`fuse-overlayfs` 用 `-f` 前台跑（拿得到句柄才能确定它真的退出了）+ `auto_unmount`
+    （core 被 SIGKILL 时内核帮忙卸载，否则下次 EBUSY）+ `Pdeathsig`；`instances/` 在探测期用 tmpfs 盖住
+    （不该看见也不该写已有分身）；宿主 socket 要**重定向进私有 runtime**（只 bind 原位等于没 bind）。
+  - `add` 现在对没有内置模板的应用**真的会探测**：启动一次应用、用一下、关掉，然后归因。零写入 → 退出 4
+    且不生成空档案；污染 → 退出 3 + `quarantine-*` 现场。
+  - **可测与不可测分界写清**：argv、污染判定、编排（注入假 mounter/runner）全部单测；真挂载/真会话
+    在沙箱里没有 `/dev/fuse`，**未验证**，交给 `design/probe-smoke.sh` 在真机跑。
 - 2026-11-07 **第十六轮：第二轮复审（REJECTED）的三处 P1 修完**：
   - `blanket_path` 原来只挡 `/` 与家目录本身，`ignored = ["/home"]` 照样放行整个主目录。
     改为"家目录本身及其任何祖先一律拒绝"，比较换成词法+真实两形态（HOME 是软链时连 `~` 都挡不住）。

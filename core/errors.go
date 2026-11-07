@@ -114,3 +114,10 @@ func NewAuditUnavailable() error {
 func NewProbeUnavailable(app string) error {
 	return newErr(CodeProbe, "err.probe.unavailable", map[string]any{"app": app}, nil)
 }
+
+// NewProbeNoWrites：探测跑完了，但没观测到任何值得隔离的写入。
+// 必须拒绝生成空档案（§6.3）：空 paths 的档案能让开关亮着但什么都不隔离，
+// 那是最难被用户发现的一种坏状态。退出码 4 = "环境给不出结论"，不是输入错误。
+func NewProbeNoWrites(app string) error {
+	return newErr(CodeProbe, "err.probe.no_writes", map[string]any{"app": app}, nil)
+}

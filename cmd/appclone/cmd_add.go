@@ -75,12 +75,32 @@ func newAddCmd(a *app) *cobra.Command {
 				if berr != nil {
 					return berr
 				}
-				if !ok {
-					// 探测管线尚未接入（discover.md 的三层管线在下一增量实现）。
-					// 这里必须明确报"没有可用档案"，而不是悄悄造一个空档案。
-					return core.NewProbeUnavailable(appKey)
+				if ok {
+					p = bundled
+				} else {
+					// 没有内置模板就走探测（discover.md 的三层管线，本版本只有 L1）。
+					// 探测会**真的把应用启动一次**：用户用完关掉，会话结束才开始归因。
+					d, lerr := a.env.LoadApp(appKey)
+					if lerr != nil {
+						return lerr
+					}
+					cmdline := append([]string{d.Exec}, d.ExecArgs...)
+					fmt.Fprintf(cmd.ErrOrStderr(),
+						"正在跟踪「%s」的写入：应用会被启动一次，请正常用一下再把它关掉。\n", appKey)
+					res, perr := a.env.Probe(ctx, appKey, core.ProbeOptions{
+						Command: cmdline,
+						Stderr:  cmd.ErrOrStderr(),
+					})
+					if perr != nil {
+						return perr
+					}
+					p = res.Profile
+					// 零写入 = 给不出结论，**不生成空档案**：空 paths 的档案会让
+					// 开关亮着却什么都不隔离（§6.3）。
+					if len(p.Paths) == 0 {
+						return core.NewProbeNoWrites(appKey)
+					}
 				}
-				p = bundled
 			} else {
 				if p, err = a.env.LoadProfile(appKey); err != nil {
 					return err
