@@ -129,3 +129,37 @@ func TestScanAppsRejectsBadKey(t *testing.T) {
 		t.Fatalf("非法 key 应被拒并记一条 ScanError：apps=%v errs=%v", apps, errs)
 	}
 }
+
+// 应用卸载之后，孤儿实例必须还能出现在列表里并被删除（§6 命令表）。
+// 这条路径没有 .desktop 可扫，完全依赖"档案 ∪ 实例目录"的并集；
+// 少一半就会出现"用户在列表里找不到、也删不掉"的实例。
+func TestListAppsIncludesOrphans(t *testing.T) {
+	e := testEnv(t)
+	app, id := seedVerifyApp(t, e) // 建了档案 + 一个实例
+	// 把 .desktop 删掉，模拟"应用被卸载"。
+	desktop := filepath.Join(e.Resolver.XDG["DATA_HOME"], "applications", app+".desktop")
+	if err := os.Remove(desktop); err != nil && !os.IsNotExist(err) {
+		t.Fatal(err)
+	}
+	apps, _ := e.ListApps(context.Background())
+	var found *App
+	for i := range apps {
+		if apps[i].Key == app {
+			found = &apps[i]
+		}
+	}
+	if found == nil {
+		t.Fatalf("应用卸载后，孤儿实例仍应出现在列表里：%+v", apps)
+	}
+	if !found.HasProfile || found.InstanceN != 1 {
+		t.Fatalf("孤儿应带 hasProfile 与实例数：%+v", *found)
+	}
+	if found.Exec == "" {
+		// Exec 从档案里回填：应用已被卸载，桌面项没了，只能靠档案。
+		t.Fatalf("档案里有 exec 时列表应回填：%+v", *found)
+	}
+	// 删除路径不依赖 .desktop，必须仍然可用。
+	if err := e.DeleteInstance(context.Background(), app, id); err != nil {
+		t.Fatalf("孤儿实例必须能删：%v", err)
+	}
+}
