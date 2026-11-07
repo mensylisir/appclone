@@ -27,14 +27,17 @@ cleanup() { rm -rf "$ROOT"; }
 trap cleanup EXIT
 
 export HOME="$ROOT/home"
-export XDG_CONFIG_HOME="$ROOT/xdg/config"
-export XDG_DATA_HOME="$ROOT/xdg/data"
-export XDG_STATE_HOME="$ROOT/xdg/state"
-export XDG_CACHE_HOME="$ROOT/xdg/cache"
+# XDG 根必须落在假 HOME 之内：探测的 overlay 只罩 $HOME，写在它外面的
+# "XDG 目录"根本不会进 upper，归因结果必然是零写入（真实桌面上这些目录
+# 默认就在 $HOME 下；把 fixture 放到外面只会验出一个假失败）。
+export XDG_CONFIG_HOME="$HOME/.config"
+export XDG_DATA_HOME="$HOME/.local/share"
+export XDG_STATE_HOME="$HOME/.local/state"
+export XDG_CACHE_HOME="$HOME/.cache"
 export XDG_RUNTIME_DIR="$ROOT/run"
-export AC_BASE="$ROOT/xdg/appclone"
+export AC_BASE="$ROOT/appclone-base"
 mkdir -p "$HOME/Downloads" "$XDG_CONFIG_HOME" "$XDG_DATA_HOME/applications" \
-         "$XDG_STATE_HOME" "$XDG_CACHE_HOME" "$XDG_RUNTIME_DIR"
+         "$XDG_STATE_HOME" "$XDG_CACHE_HOME" "$XDG_RUNTIME_DIR" "$AC_BASE"
 chmod 700 "$XDG_RUNTIME_DIR"
 
 # 公共目录清单：探测不允许回退默认名，必须有一份可读的 user-dirs.dirs。
@@ -45,8 +48,12 @@ EOS
 # 一个"应用"：写自己的配置，同时在 Downloads 里存一个哨兵文件。
 cat >"$ROOT/fakeapp" <<'EOS'
 #!/bin/sh
-mkdir -p "$HOME/.config/ProbeDemo"
-printf 'v1\n' >>"$HOME/.config/ProbeDemo/config.ini"
+mkdir -p "$XDG_CONFIG_HOME/ProbeDemo"
+printf 'v1\n' >>"$XDG_CONFIG_HOME/ProbeDemo/config.ini"
+# 审计要看到"范围内的写入"才会给 verified（空集按 §6.5 只算 unverified）：
+# 缓存是 ignored 类别，正好是合法噪声。
+mkdir -p "$XDG_CACHE_HOME/ProbeDemo"
+printf 'noise\n' >>"$XDG_CACHE_HOME/ProbeDemo/cache.bin"
 printf 'user file\n' >"$HOME/Downloads/probe-sentinel.txt"
 exit 0
 EOS
@@ -104,11 +111,24 @@ inst=$(find "$AC_BASE/instances/probedemo" -maxdepth 1 -mindepth 1 -type d | hea
 
 echo
 echo "== 7) run --audit：审计层 → 证据 → 结论"
-"$CLI" run probedemo main --audit || exit 9
+# flag 必须写在位置参数之前：run 关了 flag 交错解析，`--audit` 放在
+# probedemo/main 之后会被当成透传给应用的参数（§6 语法边界）。
+"$CLI" run --audit probedemo main || exit 9
 auditdir="$inst/audit"
 [ -f "$auditdir/run.toml" ] || { echo "审计结束后应留下 run.toml（正常跑完的凭证）" >&2; exit 10; }
 workdir="/var/tmp/appclone/audit.$(id -u)/probedemo.main"
 [ -d "$workdir/upper" ] || { echo "审计写层不在预期位置：$workdir/upper" >&2; exit 10; }
+
+echo
+echo "== 7b) 隔离语义：应用写入只在实例里，宿主不留数据"
+# run 把档案 paths 绑到实例 root；应用写的就是自己的配置目录。
+grep -rq '^v1$' "$inst/root" || { echo "实例里没有找到应用写入（$inst/root）" >&2; exit 13; }
+# 宿主上的同名目录只是 bind 目标的空占位，不得含应用数据。
+if [ -n "$(find "$HOME/.config/ProbeDemo" -mindepth 1 2>/dev/null)" ]; then
+  echo "宿主 ~/.config/ProbeDemo 里出现了应用数据：" >&2
+  find "$HOME/.config/ProbeDemo" -mindepth 1 >&2
+  exit 13
+fi
 
 echo
 echo "== 8) doctor --verify：判读审计证据"

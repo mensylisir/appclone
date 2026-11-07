@@ -29,14 +29,17 @@ GUI 方向定案：**GTK4 + libadwaita 原生控件，经 puregotk 绑定（零 
 1a. **可离线验证的部分**（**已完成** 2026-11-07）：`MergeUpper`（upper 归并：取应用目录/单文件本身、
    剔除 XDG 根、whiteout 单列、按路径稳定排序）+ `Classify`（§5 有序规则表）+ `ProfileFromCandidates`
    （paths / shared_writes / unsupported 三落点互斥）→ `core/classify_test.go` 8 组断言。
-1b. **需要真实会话的部分**：overlay 会话编排**已实现**（`core/probe.go`，待真机验证）；
-    strace 降级与"两轮探测循环"仍未做。
+1b. **需要真实会话的部分**（**已完成真机验证** 2026-11-07）：overlay 会话编排、两轮探测、
+    公共目录摘出、审计层 → `design/probe-smoke.sh /tmp/appclone` 退出码 0（详见"最近完成"）。
+    剩余：strace 降级尚未用真实日志校准（见"被挡住的"）。
 
 其余路线图项（编号沿用 `docs/方案设计.md` §10）：
 
 0. **S0 spike**（半天，先把 GUI 绑定钉死）：30 行 puregotk 程序验五条——`AdwSwitchRow` 的 `notify::active` 进 Go 回调、
    `AdwNavigationView` push/pop + Esc、`AdwAlertDialog` 异步 response id、中文 + 系统暗色，
    以及**在 Ubuntu 24.04（libadwaita 1.5.0 / GTK 4.14.2）里跑通**（门槛定 1.5 的唯一依据）。不过就换 gotk4。
+   依赖已确认可获取：模块路径 `codeberg.org/puregotk/puregotk`，
+   `GOPROXY=https://goproxy.cn,direct` 可取到 `v0.0.0-20261003054014-d92056b0aa41`。
 1. `core` 探测原语（1a + 1b）
 2. ~~`core` 其余部分~~ **已完成**（`BuildBwrapArgs` 纯函数 + 单测、档案 TOML、实例 CRUD、`id`/`display_name` 校验）
 3. ~~CLI MVP~~ **已完成**（`add/run/list/rm/doctor/repair-desktop/version`）
@@ -45,17 +48,29 @@ GUI 方向定案：**GTK4 + libadwaita 原生控件，经 puregotk 绑定（零 
 
 ## 被挡住的
 
-- **开发沙箱里没有 `/dev/fuse`**（`mknod` 被拒、节点不存在）：L1 的 syscall 部分（真挂载 + 真会话）**在这里
-  无法验证**。用户机器上是有的（`ls /dev/fuse` 正常），所以这不是产品限制，只是我这边的环境限制。
-  验证办法：在真机跑 `design/probe-smoke.sh /path/to/appclone`——它用假 HOME 走完整条链路
-  （doctor → add 触发探测 → 检查档案里的 `ProbeDemo` 路径 → 检查 `/var/tmp` 无残留 → 检查假 HOME 零污染 → rm）。
-- **降权验证同样被挡**：`runuser`（cannot set groups）、`setpriv`（setresuid failed）、`chown`（Invalid argument）
-  全部被沙箱拒绝，所以 bwrap 语义只能在 root 下手工执行，`run` 的非特权路径至今没有实机证据。
+- ~~`/dev/fuse` 不可用~~ **已解除**（2026-11-07 本机出现 `/dev/fuse`，fuse-overlayfs 1.18 / fusermount3 3.18）：
+  `design/probe-smoke.sh` 已跑通整条真机链路。测试脚本自身曾有两处 fixture 缺陷（XDG 根放在假 HOME 之外、
+  `run --audit` 的 flag 写在位置参数之后），已修。
+- **strace 降级未用真实日志校准**：直接 `strace -f /bin/true` 可用，但产品内由 Go 以 `setsid` 起的
+  `strace` 在本次外层 strace 环境下报 `PTRACE_TRACEME: Operation not permitted`——需要单独确认真实
+  触发条件（是否与嵌套 tracer / 沙箱有关），再把 `ParseStrace` 与真实日志对齐。
 - **GUI 侧的自动化闸门尚未存在**：`guitest.js` 只覆盖 HTML 稿。GTK 实现的回归要等 S0 之后建
   （`broadway`/`xdotool` 驱动三屏冒烟），在那之前 GUI 无回归保护，不能标 `verified`。
 
 ## 最近完成
 
+- 2026-11-07 **第二十五轮：真机探测链路验证通过（L1 + 审计写入侧转 `verified`）**：
+  - 本机出现 `/dev/fuse`，`design/probe-smoke.sh /tmp/appclone` **非 root** 一次跑通 9 步、退出码 0：
+    doctor → 两轮 overlay 探测 → 档案（`probe_method="overlay"`、`paths=["~/.config/ProbeDemo"]`）→
+    实例 → `run --audit` → `doctor --verify` = `verified` → `rm` 回收站。
+  - 新增两条隔离断言（`7b`）：应用写入必须出现在实例 `root/` 内；宿主同名目录只能是空占位。
+  - **修掉冒烟脚本两个把失败伪装成产品问题的 fixture 缺陷**：① XDG 根被放在假 HOME 之外，
+    而 overlay 只罩 `$HOME`（归因必然零写入）；② `run probedemo main --audit` 的 flag 写在位置参数后，
+    被 `SetInterspersed(false)` 当成透传参数（`run.toml` 根本没生成）。
+  - 顺带发现：`fuse-overlayfs -o auto_unmount` 在 1.18 + libfuse 3.18 上被忽略（SIGKILL 后挂载点残留），
+    已把代码注释与 `discover.md` 的承诺改成"尽力而为 + 启动时扫残留兜底"。
+  - 测试替身现在写入 ignored 类别（`~/.cache/ProbeDemo`），让 verify 有机会给出 `verified`
+    而不是永远 `no_writes`（§6.5：空集不算通过）。
 - 2026-11-07 **第二十四轮：strace 降级落地**（没有 fuse 的机器不再直接放弃）：
   - `Probe` 的降级判据：`mounter.Available()` 失败 + `strace` 存在 → 走 strace；两者都没有才报 3。
   - `StraceCommand` 把 **bwrap 包在 strace 外层**：日志由宿主写，不用考虑"沙箱里往哪写日志"；

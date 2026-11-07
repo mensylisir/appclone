@@ -70,9 +70,13 @@ func (fuseOverlayMounter) Mount(lower, upper, work, merged string) (func() error
 	if err != nil {
 		return nil, errEnv("err.probe.no_fuse_overlayfs", nil, err)
 	}
-	// `-o auto_unmount`：core 被 SIGKILL 时内核帮忙卸载，否则挂载点变成
-	// `Transport endpoint is not connected`，下次挂载直接 EBUSY（§3.2.3）。
-	// `-o noatime`：只读访问也会因 atime 触发 copy-up，制造大量伪写入（§3.4）。
+	// `-o auto_unmount`：期望 core 被 SIGKILL 时挂载点自动卸载，否则会变成
+	// `Transport endpoint is not connected`、下次挂载 EBUSY（§3.2.3）。
+	// **实测本机 fuse-overlayfs 1.18 + libfuse 3.18 会忽略它**（stderr 打印
+	// "unknown argument ignored: auto_unmount"，SIGKILL 后 mountinfo 里仍有条目），
+	// 所以不能把它当保证：保留参数作尽力而为，真正的兜底是下次探测前的
+	// sweepStaleProbes（先 `-uz` 再判污染）。`-o noatime`：只读访问也会因 atime
+	// 触发 copy-up，制造大量伪写入（§3.4）。
 	// `-f` 前台运行：只有前台我们才拿得到进程句柄，退出时才能确定它真的没了。
 	cmd := exec.Command(bin,
 		"-f",

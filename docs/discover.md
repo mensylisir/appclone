@@ -164,7 +164,9 @@ overlay 把整个 `$HOME` 罩住，**用户在探测会话里的每一次保存�
   宿主导出的激活进程（需要按 `/proc/<pid>/ns/mnt` 扫描，命中就提示"有进程逃出沙箱"）**。
   "整组 kill 解决 daemonize"是过度承诺，不能这么写；
 - **`fuse-overlayfs` 进程要由 core 自己起自己收**（`SysProcAttr{Pdeathsig: SIGKILL}` + `auto_unmount` 挂载选项），
-  否则 core 被 SIGKILL 后挂载点变成 `Transport endpoint is not connected`，下次挂载直接 EBUSY；
+  否则 core 被 SIGKILL 后挂载点变成 `Transport endpoint is not connected`，下次挂载直接 EBUSY。
+  **`auto_unmount` 不能当保证**：2026-11-07 实测 fuse-overlayfs 1.18 + libfuse 3.18 会打印
+  `unknown argument ignored: auto_unmount`，SIGKILL 后 mountinfo 仍有条目；唯一的兜底是下面那条启动前扫残留；
 - **启动前必须扫残留**：`/var/tmp/appclone-probe-<uid>-*` 下属于本 uid 的目录 → 读 `/proc/self/mountinfo` 判断是否仍挂载
   → 是则 `fusermount3 -uz` → **删前先做污染检查**（可能含用户文件）→ 校验通过才删；
   残留清理失败就报环境错误（3），不许"清理不了就继续跑"；

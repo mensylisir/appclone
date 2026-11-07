@@ -66,14 +66,14 @@ func (e *Env) beginAudit(in Instance) (*AuditSession, *AuditLayers, error) {
 		return nil, nil, err
 	}
 	return &AuditSession{
-		e: e, in: in, work: work,
-		upper: filepath.Join(work, "upper"),
-		start: time.Now().UTC(),
-		stop:  unmount,
-	}, &AuditLayers{
-		Merged:      filepath.Join(work, "merged"),
-		PublicBinds: pubs,
-	}, nil
+			e: e, in: in, work: work,
+			upper: filepath.Join(work, "upper"),
+			start: time.Now().UTC(),
+			stop:  unmount,
+		}, &AuditLayers{
+			Merged:      filepath.Join(work, "merged"),
+			PublicBinds: pubs,
+		}, nil
 }
 
 // finish 在应用退出后调用：停挂载、写 run.toml、**保留 upper**。
