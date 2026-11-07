@@ -151,6 +151,19 @@ puregotk 自称 experimental，所以**不允许"边写产品边试"**。第一�
 
 其余对策：`go.mod` 锁定 puregotk 版本（**不追 main**，升级当独立任务并重跑 S0）；UI 只碰行控件与对话框。
 
+**S0 结果（2026-11-07，`design/s0spike/` 可复跑，`CGO_ENABLED=0` 构建）**：五条全部通过，绑定层按原方案继续。
+证据与边界：
+- ① push/pop 与 `popped` 信号正常；**Esc 会触发 NavigationView pop**（Xvfb + xdotool 实测），
+  与 §4.3"Esc 不承担页面返回"冲突——原生实现必须在窗口级拦截 Esc，不能依赖控件默认行为。
+- ② `AdwSwitchRow` 的 `notify` 进 Go 回调并回读到 `active=true`（生死线通过）。
+  附带约束：SwitchRow 只能放进 `GtkListBox`（`AdwPreferencesGroup` 提供），
+  直接塞 `GtkBox` 会告警且行不可用。
+- ③ `AdwAlertDialog` 的 `ConnectResponse` 拿到 handler id，response 信号以字符串参数分发到 Go（`"trash"`）；
+  真实点击仍属 GUI 冒烟待办（S0 只验绑定能力）。
+- ④ 中文标题渲染正常，`AdwStyleManager.GetDark()` 可读（本机会话为浅色）。
+- ⑤ 在 `ubuntu:24.04`（GTK 4.14.5 / libadwaita 1.5.0）容器内 Xvfb 跑通同一程序、退出码 0，
+  无 `init` 符号缺失 panic；**未覆盖三屏本身**——三屏尚未实现，这一条验的是"绑定在 1.5 上可用"。
+
 ### 4.4 版本门槛与一条必须承认的边界
 
 - **libadwaita ≥ 1.5**、**GTK ≥ 4.14**。门槛由两个约束的**交集**决定，不是只看控件清单：
@@ -434,7 +447,7 @@ HTML 稿是**交互行为基线，不是视觉基线**。它不是 GTK 渲染的
 | 016 | **操作系统 = 只 Linux；CPU 架构 = amd64 + arm64 一等公民**（bwrap 只存在于 Linux，macOS/Windows 属另一套机制，不是待办；arm64 的可行性由 purego Tier 1 覆盖 linux/arm64 保证，但必须用 `ubuntu-24.04-arm` runner 实跑冒烟才算验证）。分发产物四件：`.deb`（Ubuntu 24.04+/Debian 13+）、`.rpm`（Fedora 41+ / CentOS Stream 10 / RHEL 10；openSUSE 需另建 spec，v1 不承诺）、`.pkg.tar.zst` + AUR `appclone-bin`（Arch）、裸 `.tar.gz` 兜底；三种包格式由 **nfpm 一份配置**产出（`.tar.gz` 由同源清单另打 tar），依赖**写死版本下限**。**Ubuntu 24.04+ 的 AppArmor userns 限制必须由 postinstall 安装 `/etc/apparmor.d/bwrap` 解决**（否则 bwrap 建 userns 被拒，见 §6）。Flatpak 见 ADR-015；Snap / AppImage / COPR / PPA 不做 | 已定 |
 | 017 | **GUI 版本门槛下调为 libadwaita ≥ 1.5 / GTK ≥ 4.14**（原 1.6/4.16 是按控件清单正推，会排除 Ubuntu 24.04 LTS = 1.5.0 / 4.14.2）。代价：弃用 1.6 才有的 `AdwSpinner`，进度改 `GtkSpinner`。生效前提 = S0 第 5 条（Ubuntu 24.04 环境实跑通过）；该条不过则本结论作废，回到 1.6/4.16 | 已定 |
 | 018 | **探测期的隔离契约**（三条，缺一条就出事）：① XDG 公共目录、`AC_BASE`、`shared_writes` 必须在 overlay 之上 bind 回**真实**目录——否则用户在探测会话里存的文件落在 upper，探测结束删 upper 等于删用户文件；② 探测期**不看档案、强制隔离单例**（私有 runtime + 私有 DBus + L0 空锁文件），否则主实例在跑时应用转发参数后退出，探测零写入；③ 探测前扫进程挡住"应用还开着"，不给"仍然继续" | 已定 |
-| 019 | **`doctor --verify` 只在有运行期审计层时下结论**：`run --audit` 复用探测的 overlay 原语（lower=`$HOME`、upper=`instances/<app>/<id>/audit/upper`），对账 `paths`/`shared_writes` 得 `verified`/`leak-detected`；没有审计层输出 `unverified`（不是"通过"）。免 root 下 fanotify 需 `CAP_SYS_ADMIN`、eBPF 被 `unprivileged_bpf_disabled` 关、inotify 无 PID——**不做假装能归因的检查**。审计默认关闭（全 `$HOME` 过 overlay 有 copy-up 开销） | 已定 |
+| 019 | **`doctor --verify` 只在有运行期审计层时下结论**：`run --audit` 复用探测的 overlay 原语（lower=`$HOME`、upper=`/var/tmp/appclone/audit.<uid>/<app>.<id>/upper`），对账 `paths`/`shared_writes` 得 `verified`/`leak-detected`；没有审计层输出 `unverified`（不是"通过"）。免 root 下 fanotify 需 `CAP_SYS_ADMIN`、eBPF 被 `unprivileged_bpf_disabled` 关、inotify 无 PID——**不做假装能归因的检查**。审计默认关闭（全 `$HOME` 过 overlay 有 copy-up 开销） | 已定 |
 | 020 | **进程生命周期归 `appclone run`，不归 bwrap**：`--die-with-parent` 只保证直接子进程，应用自己 `fork`+`setsid` 的进程逃得掉（bwrap 0.13.1 实测）。`run` 不 exec，`setsid` 起 bwrap 并常驻为父进程，退出/收到信号时对整组 `SIGTERM`→3s→`SIGKILL`；探测期共用同一实现。`--die-with-parent` 保留为兜底 | 已定 |
 | 021 | **参数集去掉 `--unshare-uts`**：无隔离收益（hostname 副本本就与宿主一致），却让 namespace 内 hostname 与共享的 `/etc/hostname` 存在不一致可能，Java `getLocalHost`/hostname 自检类应用会走异常分支。`--unshare-pid`/`--unshare-ipc` 保留（有归因与 `--proc` 语义） | 已定 |
 | 022 | **状态一致性按多进程处理**（桌面入口、GUI、CLI 会同时动作）：写操作持 `AC_BASE/.lock`（`flock(LOCK_EX)`，等 5 秒超时，退出码 6）；所有 TOML 写入 `tmp + fsync + rename`；实例创建用 `os.Mkdir` 的 `EEXIST` 作唯一判重（**不在锁外 stat+Mkdir**，那是 TOCTOU） | 已定 |

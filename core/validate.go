@@ -132,12 +132,22 @@ func ValidateProfile(p Profile, o BuildOptions) error {
 	if o.Home != "" {
 		home = filepath.Clean(o.Home)
 	}
+	unsupportedPaths := make([]string, 0, len(p.Unsupported))
+	for _, u := range p.Unsupported {
+		if u.Path != "" {
+			unsupportedPaths = append(unsupportedPaths, u.Path)
+		}
+	}
 	for _, field := range []struct {
 		name string
 		list []string
 	}{
 		{"ignored", p.Ignored},
 		{"shared_writes", p.SharedWrites},
+		// unsupported 同样是 verify 的放行名单（§6.5 把它并进 allowed），
+		// 所以它必须和上面两项接受同一套 blanket 校验；只挡前两项的话，
+		// `unsupported = [{path="~"}]` 会让任何越界都判 verified。
+		{"unsupported", unsupportedPaths},
 	} {
 		for _, raw := range field.list {
 			abs, err := o.expand(raw)

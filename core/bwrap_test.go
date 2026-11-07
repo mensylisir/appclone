@@ -1,6 +1,8 @@
 package core
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -28,6 +30,12 @@ func testEnv(t *testing.T) *Env {
 	}
 	r := newResolver(home, home, 1000, getenv)
 	e := NewEnvAt(root+"/xdg/appclone", r)
+	// 写层根必须隔离：共用 /var/tmp 会让用例互相看到对方的 upper，
+	// 一个测试的残留能把另一个测试判成 audit_incomplete。
+	e.TmpRoot = filepath.Join(root, "tmp")
+	if err := os.MkdirAll(e.TmpRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
 	// 不真的动回收站：测试里把删除换成"记下来"。
 	e.Trasher = func(paths ...string) error { return nil }
 	e.CliPath = "/usr/bin/appclone"

@@ -49,17 +49,29 @@ func (v Verdict) ExitCode() int {
 	return CodeOK
 }
 
-// AuditDir 返回实例的审计目录：**只放轻量证据元数据**
-// （run.toml / summary.toml / quarantine-*），不含 upper。
+// AuditDir 返回实例的审计目录：放 `run.toml` / `summary.toml` 这类凭证，
+// 以及作废时搬进来的 `quarantine-*`（**里面可能装着用户文件，永不自动删**）。
+// overlay 的 upper/work/merged 不在这里——它们在 /var/tmp（§4.4/§6.5）。
 func (e *Env) AuditDir(app, id string) string {
 	return filepath.Join(e.InstancePath(app, id), "audit")
+}
+
+// latestQuarantine 返回实例 audit/ 下最近的一份 quarantine-*。
+// 名字里带 UTC 时间戳，字典序即时间序。没有则返回空串。
+func (e *Env) latestQuarantine(app, id string) string {
+	dirs, _ := filepath.Glob(filepath.Join(e.AuditDir(app, id), "quarantine-*"))
+	if len(dirs) == 0 {
+		return ""
+	}
+	sort.Strings(dirs)
+	return dirs[len(dirs)-1]
 }
 
 // AuditWorkDir 是审计 overlay 的写层位置（§4.4/§6.5）：`upper/`、`work/`、`merged/`
 // 必须在有效 HOME **之外**——overlay 的 upper 落在它自己的 lower 里会 ELOOP，
 // 而且 AC_BASE 默认就在 `$HOME` 内。所以这里落在 `/var/tmp`，与实例目录分开。
 func (e *Env) AuditWorkDir(app, id string) string {
-	return filepath.Join("/var/tmp", "appclone", fmt.Sprintf("audit.%d", e.UID), app+"."+id)
+	return filepath.Join(e.tmpRoot(), "appclone", fmt.Sprintf("audit.%d", e.UID), app+"."+id)
 }
 
 // upperDir 定位要读的 upper：优先标准位置（审计写层），回退到实例内的
@@ -112,13 +124,23 @@ func (e *Env) Verify(app, id string) (Verdict, error) {
 	if p.Ignored == nil {
 		p.Ignored = DefaultIgnored()
 	}
+	// 判定之前必须过一遍档案校验：`ignored`/`shared_writes`/`unsupported` 是
+	// verify 的放行名单，手改（或旧版本残留）一个 `~` 进去，Judge 就会对任何
+	// 越界都说 verified。只在 add/run 的入口校验、不在 verify 校验，等于把
+	// 这条最危险假通过的防线放在用户根本不会再走一遍的地方。
+	if err := ValidateProfile(p, e.BuildOptions()); err != nil {
+		return Verdict{}, err
+	}
 
 	audit := e.AuditDir(app, id)
 	entries, present, err := readUpperTree(e.upperDir(app, id))
 	if err != nil {
 		return Verdict{}, err
 	}
-	runInfo := fileExists(filepath.Join(audit, "run.toml"))
+	rec, runInfo, err := readRunRecord(filepath.Join(audit, "run.toml"))
+	if err != nil {
+		return Verdict{}, err
+	}
 	summary, hasSummary, err := readSummary(filepath.Join(audit, "summary.toml"))
 	if err != nil {
 		return Verdict{}, err
@@ -136,9 +158,18 @@ func (e *Env) Verify(app, id string) (Verdict, error) {
 	}
 
 	switch {
+	case !present && runInfo && !rec.complete():
+		// 新一轮审计已经开过，但没正常结束（连写层都没建起来就失败，或早期
+		// 被杀）。此时目录里可能还有上一轮的 summary.toml——那是**更早一次**
+		// 审计的结论，不能重放成"这次通过"。没有证据就是没有证据。
+		return unverified("audit_incomplete", false), nil
+	case present && runInfo && !rec.complete():
+		// 写层在、凭证没写完：会话中途崩了。证据保留，但不下结论。
+		return unverified("audit_incomplete", true), nil
 	case !present && hasSummary:
 		// upper 已被消费过：**重放**已存结论，不重新对账（§6.5 表格第 4 行）。
-		// 重放时也不改 Retained：摘要里写着证据留没留。
+		// 重放时也不改 Retained：摘要里写着证据留没留。走到这里说明没有更新的、
+		// 未完成的审计尝试（上面两条已经拦掉了）。
 		//
 		// ignored 优先用摘要里的：那是**审计当时**的忽略清单，用现在的档案覆盖它
 		// 等于篡改证据（用户可能已经改过档案）。
@@ -149,7 +180,12 @@ func (e *Env) Verify(app, id string) (Verdict, error) {
 	case !present && runInfo:
 		// 有 run.toml 却没有 upper：upper 被误删或审计层中途崩了。
 		// 这是"证据不完整"，不是"从没审计"——两者的下一步完全不同。
-		return unverified("audit_incomplete", true), nil
+		v := unverified("audit_incomplete", true)
+		// 被前一轮 verify 或"重开审计"搬进 quarantine-* 的证据，把最新那份的
+		// 真实路径带出去。只在 upper 确实不在时才指 quarantine——否则现场就在
+		// 工作区里，指向旧 quarantine 会把用户引到一份无关的证据上。
+		v.Quarantine = e.latestQuarantine(app, id)
+		return v, nil
 	case !present:
 		// 从没审计过。这是当前版本的常态：没有审计写入器（run --audit 未实现）。
 		return unverified("audit_not_enabled", false), nil
@@ -157,21 +193,40 @@ func (e *Env) Verify(app, id string) (Verdict, error) {
 		// 有 upper 却没有 run.toml：上次 run 崩了或被 kill，证据不完整。
 		// 这种情况**绝不能**说 verified，也不许删 upper（§6.5 表格第 3 行）。
 		return unverified("audit_incomplete", true), nil
+	case rec.Version == 0:
+		// run.toml 存在但解析不了（写坏/被截断）：凭证不完整，不能拿来对账。
+		// 降级成 audit_incomplete 而不是环境错误——用户还能重跑一次审计。
+		return unverified("audit_incomplete", true), nil
+	case rec.Version > ProfileVersion:
+		// 未来版本的写入器留下的凭证：字段语义可能已经变了，按 v1 解释未知
+		// 格式等同于猜测。保留证据、不下结论，等用户升级后再 verify。
+		return unverified("audit_incomplete", true), nil
+	case rec.App != app || rec.ID != id:
+		// 凭证不是这个实例的（目录被手工搬过/复制过）：拿来对账会得出别人的结论。
+		return unverified("audit_incomplete", true), nil
 	case len(entries) == 0:
 		// 审计跑了、应用什么都没写。空集不算通过：可能是应用根本没启动成功，
 		// 也可能是审计层没挂上——两种都不足以证明隔离有效（§6.5 表格第 5 行）。
 		return unverified("no_writes", false), nil
 	}
-	return e.finalize(app, id, p, e.Judge(p, entries))
+	return e.finalize(app, id, p, e.judge(p, entries, &rec))
+}
+
+// Judge 是 judge 的无凭证版本：没有 run.toml 时按档案推断"本该被 bind"的集合。
+// 生产路径走 Verify（带 run.toml 的实际 bind 清单），这里主要给单测与排障用。
+func (e *Env) Judge(p Profile, entries []UpperEntry) Verdict {
+	return e.judge(p, entries, nil)
 }
 
 // finalize 把结论落账，并按结论处置证据（§6.5 留存策略）。**判**与**处置**分开：
 // 判定错会误导用户，处置错会毁掉用户的文件。
 //
 //   - verified      → 写 summary.toml，删 upper 与 run.toml（证据已消费）
-//   - leak-detected → 写 summary.toml（retained），upper 改名 quarantine-*（**不删**：
-//     越界文件就在里面，删掉等于销毁用户数据）
-//   - extract_failed→ 写 summary.toml（retained），现场原样保留
+//   - leak-detected → 写 summary.toml（retained），upper **搬进** quarantine-*
+//     （不删：越界文件就在里面，删掉等于销毁用户数据）
+//   - extract_failed→ 与 leak 相同：搬进 quarantine。现场以**唯一命名**保留，
+//     新审计不会覆盖它，所以不必再把"有 retained 证据"当成不许开新审计的理由
+//     ——那会让用户取回文件后永远无法再审计（旧实现正是如此）。
 //   - 其余 unverified（无证据/证据不完整/空 upper）→ 不写摘要、不动现场
 func (e *Env) finalize(app, id string, p Profile, v Verdict) (Verdict, error) {
 	if v.Conclusion == VerdictUnverified && v.Reason != "extract_failed" {
@@ -184,21 +239,25 @@ func (e *Env) finalize(app, id string, p Profile, v Verdict) (Verdict, error) {
 
 	// 处置顺序：先把证据搬走/删掉，再写摘要——反过来一旦摘要写成功、
 	// 处置失败，下一次 verify 会把"已消费"当成结论，现场就再也找不回了。
+	//
+	// 搬运用 moveDir 而不是 os.Rename：写层在 /var/tmp，实例目录在 $HOME，
+	// 两者常常不在同一个文件系统上（/home 独立分区是普通桌面配置），
+	// rename 会 EXDEV 直接失败，leak 结论永远落不了地。
 	switch {
-	case v.Conclusion == VerdictLeak:
-		q := filepath.Join(audit, "quarantine-"+time.Now().UTC().Format("20060102T150405"))
-		if err := os.Rename(e.upperDir(app, id), q); err != nil {
+	case v.Conclusion == VerdictLeak || v.Reason == "extract_failed":
+		q := filepath.Join(audit, "quarantine-"+time.Now().UTC().Format("20060102T150405")+"-"+randSuffix())
+		if err := moveDir(e.upperDir(app, id), q); err != nil {
 			return Verdict{}, errEnv("err.probe.quarantine_failed", map[string]any{"path": q}, err)
 		}
+		e.removeAuditWork(app, id)
 		v.Retained = true
 		v.Quarantine = q
 	case v.Conclusion == VerdictVerified:
 		if err := os.RemoveAll(e.upperDir(app, id)); err != nil {
 			return Verdict{}, errEnv("err.env.write", map[string]any{"path": e.upperDir(app, id)}, err)
 		}
+		e.removeAuditWork(app, id)
 		_ = os.Remove(filepath.Join(audit, "run.toml"))
-	default: // extract_failed：bind 失效，现场必须原样保留
-		v.Retained = true
 	}
 
 	sum := Summary{
@@ -209,6 +268,7 @@ func (e *Env) finalize(app, id string, p Profile, v Verdict) (Verdict, error) {
 		Retained:    v.Retained,
 		GeneratedAt: time.Now().UTC().Format(time.RFC3339),
 		Reason:      v.Reason,
+		Quarantine:  v.Quarantine,
 	}
 	var buf bytes.Buffer
 	if err := toml.NewEncoder(&buf).Encode(sum); err != nil {
@@ -216,6 +276,13 @@ func (e *Env) finalize(app, id string, p Profile, v Verdict) (Verdict, error) {
 	}
 	// 原子写：半份摘要比没有摘要更坏（下次会按"损坏"处理，把结论降级成不可读）。
 	if err := writeFileAtomic(filepath.Join(audit, "summary.toml"), buf.Bytes(), 0o600); err != nil {
+		// 证据已经搬进 quarantine-*，摘要却没写成功：错误信息必须带上那个
+		// 路径，否则用户/下一次 verify 再也找不到这份现场（它没有指针）。
+		if v.Quarantine != "" {
+			return Verdict{}, errEnv("err.audit.summary_write", map[string]any{
+				"path": filepath.Join(audit, "summary.toml"), "quarantine": v.Quarantine,
+			}, err)
+		}
 		return Verdict{}, err
 	}
 	// 不把"刚刚"写回 Verdict.GeneratedAt：CLI 用它标注"重放的已存摘要"，
@@ -233,6 +300,9 @@ type Summary struct {
 	Retained    bool     `toml:"evidence_retained"`
 	GeneratedAt string   `toml:"generated_at,omitempty"`
 	Reason      string   `toml:"reason,omitempty"`
+	// Quarantine 是证据被搬到的位置（绝对路径）。重放时用户必须能据此找回文件，
+	// 否则摘要只告诉他"泄漏了"，却不说东西在哪。
+	Quarantine string `toml:"quarantine,omitempty"`
 }
 
 func (s Summary) Verdict() Verdict {
@@ -244,6 +314,7 @@ func (s Summary) Verdict() Verdict {
 		Retained:    s.Retained,
 		Reason:      s.Reason,
 		GeneratedAt: s.GeneratedAt,
+		Quarantine:  s.Quarantine,
 	}
 }
 
@@ -294,19 +365,16 @@ func isKnownReason(s string) bool {
 	return false
 }
 
-func fileExists(p string) bool {
-	_, err := os.Stat(p)
-	return err == nil
-}
-
-// Judge 把一棵 upper 树判成结论。**纯函数**，不读盘、不删任何东西——
+// judge 把一棵 upper 树判成结论。**纯函数**，不读盘、不删任何东西——
 // 判定与"删不删证据"必须分开：判定错会误导用户，删错会毁掉用户的文件。
 //
 // 归因口径：upper 里出现的路径只要落在"预期会写"的范围里就不算越界——
 // 忽略类别（`~/.cache` 等噪声）、`shared_writes`（本来就共享）、公共目录
 // （摘出后不该出现，出现了说明摘出失效，那本身是泄漏，所以**不**在白名单里，
 // 见下）、`AC_BASE`（工具自己的写入）。
-func (e *Env) Judge(p Profile, entries []UpperEntry) Verdict {
+//
+// rec 为本次审计 run.toml 里的实际 bind 清单；nil 时退回按档案推断（仅单测/排障）。
+func (e *Env) judge(p Profile, entries []UpperEntry, rec *runRecord) Verdict {
 	// 两档范围，优先级即顺序（§6.5）：
 	//  ① 本该被 bind 走的路径：公共目录、AC_BASE、`shared_writes`、**`paths`**。
 	//    审计层把它们 bind 回真实位置/实例目录，它们出现在 upper 里就说明 bind
@@ -324,18 +392,58 @@ func (e *Env) Judge(p Profile, entries []UpperEntry) Verdict {
 			}
 		}
 	}
-	expandInto(&mustBind, p.SharedWrites)
-	expandInto(&mustBind, p.Paths)
-	for _, pub := range e.Resolver.PublicDirs() {
-		mustBind = append(mustBind, pub)
+	// paths 一定被 bind（缺源时 run 会先失败），所以它总是判断依据。
+	if rec != nil && rec.BindsRecorded {
+		// 新格式 run.toml：用**审计当时**的 paths，而不是当前档案。审计之后
+		// 用户重新探测让 paths 变大时，旧证据里"当时未 bind"的路径会被当前
+		// 档案误判成 extract_failed。
+		mustBind = append(mustBind, rec.Paths...)
+		if len(rec.Paths) == 0 {
+			// 写入器异常（所有 paths 都在 Expand 阶段失败）才会出现"新格式但
+			// 清单为空"。此时按单测/损坏凭证处理：宁可多报 extract_failed
+			// （方向是"作废后重审"），也不能因为清单缺失把真实摘出失效判成
+			// leak-detected（方向是"重新探测"，完全错）。正常写入器不会走到。
+			expandInto(&mustBind, p.Paths)
+		}
+		// 只用**实际** bind 过的清单。按档案里写了什么推断，会把"没配置 /
+		// 当时不存在因此被 --bind-try 跳过"的目录判成摘出失效——那是一次
+		// 凭空产生的 extract_failed，会让审计永远作废。
+		mustBind = append(mustBind, rec.PublicBinds...)
+		mustBind = append(mustBind, rec.SharedBinds...)
+		if rec.Base != "" {
+			mustBind = append(mustBind, rec.Base)
+		}
+	} else {
+		// 老格式（没有 binds_recorded）或单测：退回按档案推断。这条回退是
+		// 兼容性的代价——老证据无法区分"没 bind"和"bind 失效"，至少方向
+		// 不能错（extract_failed 与 leak-detected 的下一步完全相反）。
+		expandInto(&mustBind, p.Paths)
+		expandInto(&mustBind, p.SharedWrites)
+		for _, pub := range e.Resolver.PublicDirs() {
+			mustBind = append(mustBind, pub)
+		}
+		if e.Base != "" {
+			mustBind = append(mustBind, e.Base)
+		}
 	}
-	if e.Base != "" {
-		mustBind = append(mustBind, e.Base)
+	// 白名单里的"家目录本身及其祖先"永远不能生效：那是全部放行，不是一条类别。
+	// ValidateProfile 已经会拒绝这种档案，这里再做一次纵深防御——旧版本写下的
+	// 档案、或将来某条路径绕过校验时，Judge 也不能把边界交出去。
+	expandAllowed := func(list []string) {
+		for _, raw := range list {
+			if abs, err := e.Resolver.Expand(raw); err == nil && !e.blanketPath(abs) {
+				allowed = append(allowed, abs)
+			}
+		}
 	}
-	expandInto(&allowed, p.Ignored)
+	expandAllowed(p.Ignored)
+	// 声明过、但审计开始时不存在因此没被 `--bind-try` 绑上的 shared_writes：
+	// 应用在审计期间把它建出来会落在 upper 里。那仍属于"用户声明共享"的路径，
+	// 不是越界——判成 leak 给出的下一步（重新探测）是错的。
+	expandAllowed(p.SharedWrites)
 	for _, u := range p.Unsupported {
 		if u.Path != "" {
-			expandInto(&allowed, []string{u.Path})
+			expandAllowed([]string{u.Path})
 		}
 	}
 
@@ -393,6 +501,23 @@ func (e *Env) Judge(p Profile, entries []UpperEntry) Verdict {
 	return v
 }
 
+// blanketPath 判定一个白名单条目是否等于 HOME 或它的祖先（= 放行整个主目录）。
+// 比较用词法 + 真实两种形态：HOME 是软链时只比一种会漏判。
+func (e *Env) blanketPath(abs string) bool {
+	if abs == "/" {
+		return true
+	}
+	for _, home := range []string{filepath.Clean(e.Resolver.Home), filepath.Clean(e.Resolver.RealHome)} {
+		if home == "" || home == "." {
+			continue
+		}
+		if abs == home || isUnderLoose(abs, home) {
+			return true
+		}
+	}
+	return false
+}
+
 // ancestorOfAny 判定 abs 是否是 entries 里某条**更深**条目的祖先。
 func ancestorOfAny(abs string, entries []UpperEntry, home string) bool {
 	for _, en := range entries {
@@ -428,6 +553,12 @@ func readUpperTree(dir string) (entries []UpperEntry, present bool, err error) {
 		}
 		rel, rerr := filepath.Rel(dir, path)
 		if rerr != nil {
+			return nil
+		}
+		// overlayfs 的 opaque 标记（`.wh..wh..opq`）不是删除，也不是用户文件：
+		// 它只表示"这个目录被整体替换过"。按 `.wh.` 前缀去前缀会变成不存在
+		// 的 `.wh..opq`，再作为"缺失文件"展示给用户，把人引向一个假路径。
+		if d.Name() == ".wh..wh..opq" {
 			return nil
 		}
 		kind := EntryFile

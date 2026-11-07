@@ -4,7 +4,10 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+
+	"github.com/BurntSushi/toml"
 )
 
 // seedVerifyApp 建一个带档案与实例的应用，并把 ignored / shared_writes 填上，
@@ -74,7 +77,7 @@ func TestVerifyJudgesUpperTree(t *testing.T) {
 	// 预期内的写入：缓存噪声（ignored 类别本来就该进 upper）。
 	writeTree(t, filepath.Join(upper, filepath.FromSlash(".cache/TestApp/blob")))
 	// 有 upper 就必须有 run.toml：缺了说明上次审计没正常结束，只能给 unverified。
-	writeTree(t, filepath.Join(e.AuditDir(app, id), "run.toml"))
+	seedRunRecord(t, filepath.Join(e.AuditDir(app, id), "run.toml"), runRecord{App: app, ID: id})
 
 	v, err := e.Verify(app, id)
 	if err != nil {
@@ -110,7 +113,7 @@ func TestVerifyQuarantinesOnLeak(t *testing.T) {
 	audit := e.AuditDir(app, id)
 	upper := filepath.Join(audit, "upper")
 	writeTree(t, filepath.Join(upper, filepath.FromSlash(".config/OtherApp/state.json")))
-	writeTree(t, filepath.Join(audit, "run.toml"))
+	seedRunRecord(t, filepath.Join(audit, "run.toml"), runRecord{App: app, ID: id})
 
 	v, err := e.Verify(app, id)
 	if err != nil {
@@ -135,14 +138,19 @@ func TestVerifyQuarantinesOnLeak(t *testing.T) {
 	}
 }
 
-// 摘出失效：现场原样保留（连 upper 都不动），结论 unverified + 退出 4。
+// 摘出失效：现场搬进 quarantine（不删，里面可能是用户文件），结论 unverified + 退出 4。
 func TestVerifyKeepsEvidenceOnExtractFailure(t *testing.T) {
 	e := testEnv(t)
 	app, id := seedVerifyApp(t, e)
 	audit := e.AuditDir(app, id)
 	upper := filepath.Join(audit, "upper")
 	writeTree(t, filepath.Join(upper, filepath.FromSlash("Downloads/important.docx")))
-	writeTree(t, filepath.Join(audit, "run.toml"))
+	seedRunRecord(t, filepath.Join(audit, "run.toml"), runRecord{
+		App: app, ID: id,
+		// 本次审计实际 bind 了 Downloads（这是摘出清单里的条目）。
+		PublicBinds:   []string{filepath.Join(e.Resolver.Home, "Downloads")},
+		BindsRecorded: true,
+	})
 
 	v, err := e.Verify(app, id)
 	if err != nil {
@@ -154,8 +162,26 @@ func TestVerifyKeepsEvidenceOnExtractFailure(t *testing.T) {
 	if v.ExitCode() != CodeProbe {
 		t.Fatalf("摘出失效的退出码应为 4，得到 %d", v.ExitCode())
 	}
-	if _, err := os.Stat(filepath.Join(upper, filepath.FromSlash("Downloads/important.docx"))); err != nil {
-		t.Fatalf("extract_failed 时现场必须原样保留：%v", err)
+	if !v.Retained || v.Quarantine == "" {
+		t.Fatalf("extract_failed 必须保留证据并给出位置，得到 %+v", v)
+	}
+	// 现场搬进唯一命名的 quarantine：既不丢文件，也不阻塞下一次审计。
+	if _, err := os.Stat(filepath.Join(v.Quarantine, filepath.FromSlash("Downloads/important.docx"))); err != nil {
+		t.Fatalf("extract_failed 的文件应留在 quarantine 里：%v", err)
+	}
+	if _, err := os.Stat(upper); !os.IsNotExist(err) {
+		t.Fatal("搬进 quarantine 后原 upper 不应留在审计工作区")
+	}
+	if _, err := os.Stat(filepath.Join(audit, "summary.toml")); err != nil {
+		t.Fatalf("结论应落盘：%v", err)
+	}
+	// 重放：证据已搬走，摘要必须能让用户找回文件位置。
+	again, err := e.Verify(app, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if again.Quarantine != v.Quarantine || !again.Retained {
+		t.Fatalf("重放应保留 quarantine 位置，得到 %+v", again)
 	}
 }
 
@@ -217,6 +243,121 @@ func TestJudgeDeduplicatesViolations(t *testing.T) {
 	})
 	if len(v.Violations) != 2 {
 		t.Fatalf("应去重成 2 条，得到 %v", v.Violations)
+	}
+}
+
+// seedRunRecord 写一份**可解析且已完成**的 run.toml。verify 现在会读它拿实际
+// bind 清单，继续用 "x" 当 fixture 会让所有带 run.toml 的用例报解析错误。
+//
+// 默认补 FinishedAt：凭证"完成与否"只看它；不补的话所有既有用例都会被判成
+// "审计没跑完"，测的就不是原本要测的东西了。需要构造"进行中/未完成"的用例
+// 显式设置 StartedAt 并留空 FinishedAt。
+func seedRunRecord(t *testing.T, path string, rec runRecord) {
+	t.Helper()
+	if rec.Version == 0 {
+		rec.Version = ProfileVersion
+	}
+	if rec.FinishedAt == "" && rec.StartedAt == "" {
+		rec.FinishedAt = "2026-01-01T00:00:00Z"
+	}
+	data, err := toml.Marshal(rec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// verify 必须自己校验档案：ignored=["~"] 的档案能让 Judge 对任何越界都说
+// verified。只在 add/run 入口校验，等于把防线放在用户不会再走一遍的地方。
+func TestVerifyRejectsBlanketAllowList(t *testing.T) {
+	e := testEnv(t)
+	app, id := seedVerifyApp(t, e)
+	p, err := e.LoadProfile(app)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.Ignored = []string{"~"}
+	if err := e.SaveProfile(p); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.Verify(app, id); ExitCode(err) != CodeInput {
+		t.Fatalf("ignored=[~] 的档案必须被 verify 拒绝（2），得到 %v", err)
+	}
+}
+
+// unsupported 与 ignored/shared_writes 共用放行名单，必须接受同一套 blanket 校验。
+func TestValidateProfileRejectsBlanketUnsupported(t *testing.T) {
+	e := testEnv(t)
+	p := Profile{Exec: "/bin/true", Paths: []string{"~/.config/TestApp"}}
+	for _, home := range []string{"~", "/"} {
+		p.Unsupported = []Unsupported{{Kind: "keyring", Path: home}}
+		err := ValidateProfile(p, e.BuildOptions())
+		if err == nil || errKey(err) != "err.profile.blanket_path" {
+			t.Fatalf("unsupported=[%q] 应被拒，得到 %v", home, err)
+		}
+	}
+}
+
+// 纵深防御：即使档案没经过 ValidateProfile（旧版本写下、或调用方绕过），
+// Judge 也不能把 HOME 当成白名单。否则这就是一条"任何越界都 verified"的捷径。
+func TestJudgeIgnoresBlanketAllowList(t *testing.T) {
+	e := testEnv(t)
+	p := Profile{Paths: []string{"~/.config/TestApp"}, Ignored: []string{"~"}}
+	v := e.Judge(p, []UpperEntry{
+		{Path: ".config/OtherApp/state.json", Kind: EntryFile},
+	})
+	if v.Conclusion != VerdictLeak {
+		t.Fatalf("ignored=[~] 不得放行越界，应判 leak，得到 %s/%s", v.Conclusion, v.Reason)
+	}
+}
+
+// "本该被 bind 走"的集合必须来自本次审计**实际** bind 的清单，而不是按配置
+// 推断：没配置的公共目录（这里只有 Documents 被 bind）出现在 upper 是泄漏，
+// 不是摘出失效——后者会让整次审计作废，且下一步完全不同。
+func TestJudgeUsesActualAuditBinds(t *testing.T) {
+	e := testEnv(t)
+	p := Profile{Paths: []string{"~/.config/TestApp"}}
+	home := e.Resolver.Home
+	rec := runRecord{PublicBinds: []string{filepath.Join(home, "Documents")}, BindsRecorded: true}
+
+	if v := e.judge(p, []UpperEntry{{Path: "Downloads/file.docx", Kind: EntryFile}}, &rec); v.Conclusion != VerdictLeak {
+		t.Fatalf("未参与本次 bind 的 Downloads 应是泄漏，得到 %s/%s", v.Conclusion, v.Reason)
+	}
+	if v := e.judge(p, []UpperEntry{{Path: "Documents/file.docx", Kind: EntryFile}}, &rec); v.Reason != "extract_failed" {
+		t.Fatalf("实际 bind 过的 Documents 出现在 upper 应判 extract_failed，得到 %s/%s", v.Conclusion, v.Reason)
+	}
+}
+
+// overlay 的 opaque 标记不是用户文件，也不能被去前缀成不存在的 `.wh..opq`。
+func TestReadUpperTreeSkipsOpaqueMarker(t *testing.T) {
+	dir := t.TempDir()
+	writeTree(t, filepath.Join(dir, ".config", ".wh..wh..opq"))
+	writeTree(t, filepath.Join(dir, ".config", ".wh.deleted-file"))
+	entries, present, err := readUpperTree(dir)
+	if err != nil || !present {
+		t.Fatalf("readUpperTree: %v / present=%v", err, present)
+	}
+	var paths []string
+	for _, en := range entries {
+		paths = append(paths, en.Path)
+	}
+	joined := filepath.ToSlash(filepath.Join(paths...))
+	if strings.Contains(joined, "opq") {
+		t.Fatalf("opaque 标记不该出现在条目里：%v", paths)
+	}
+	found := false
+	for _, en := range entries {
+		if en.Kind == EntryWhiteout && en.Path == ".config/deleted-file" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("普通 .wh. 删除应记录为 whiteout：%v", entries)
 	}
 }
 
@@ -298,7 +439,7 @@ func TestVerifyEvidenceCompleteness(t *testing.T) {
 	if err := os.MkdirAll(filepath.Join(audit, "upper"), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	writeTree(t, filepath.Join(audit, "run.toml"))
+	seedRunRecord(t, filepath.Join(audit, "run.toml"), runRecord{App: app, ID: id})
 	v, err = e.Verify(app, id)
 	if err != nil {
 		t.Fatal(err)
@@ -353,5 +494,85 @@ func TestVerifyEvidenceCompleteness(t *testing.T) {
 	}
 	if v.Conclusion != VerdictUnverified || v.Reason != "audit_unreadable" || !v.Retained {
 		t.Fatalf("损坏的摘要应判 unverified/audit_unreadable 且保留，得到 %+v", v)
+	}
+}
+
+// 老格式 run.toml（写入器第一版，没有 binds_recorded）不能把 extract_failed
+// 判成 leak：两者的下一步完全相反（取回文件 vs 重新探测）。
+func TestJudgeLegacyRunRecordFallsBackToProfile(t *testing.T) {
+	e := testEnv(t)
+	p := Profile{Paths: []string{"~/.config/TestApp"}}
+	rec := runRecord{} // 老文件：字段全空
+	v := e.judge(p, []UpperEntry{{Path: "Downloads/file.docx", Kind: EntryFile}}, &rec)
+	if v.Reason != "extract_failed" {
+		t.Fatalf("老格式应按档案回退（Downloads 是公共目录）、判 extract_failed，得到 %s/%s", v.Conclusion, v.Reason)
+	}
+}
+
+// 声明过、但审计开始时不存在因此没被 bind 的 shared_writes：应用在审计期间
+// 把它建出来不该算越界（§6.5：命中 shared_writes 算通过）。
+func TestJudgeAllowsDeclaredButUnboundSharedWrite(t *testing.T) {
+	e := testEnv(t)
+	p := Profile{
+		Paths:        []string{"~/.config/TestApp"},
+		SharedWrites: []string{"~/.config/fcitx5"},
+	}
+	rec := runRecord{BindsRecorded: true}
+	v := e.judge(p, []UpperEntry{{Path: ".config/fcitx5/profile", Kind: EntryFile}}, &rec)
+	if v.Conclusion != VerdictVerified {
+		t.Fatalf("声明的 shared_writes 不该判越界，得到 %s/%s %v", v.Conclusion, v.Reason, v.Violations)
+	}
+}
+
+// run.toml 写坏时降级为"证据不完整"，不能报环境错误（那样用户没有出路）。
+func TestVerifyCorruptRunRecordIsIncomplete(t *testing.T) {
+	e := testEnv(t)
+	app, id := seedVerifyApp(t, e)
+	audit := e.AuditDir(app, id)
+	writeTree(t, filepath.Join(audit, "upper", filepath.FromSlash(".config/TestApp/x")))
+	if err := os.WriteFile(filepath.Join(audit, "run.toml"), []byte("这不是 toml {{{"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	v, err := e.Verify(app, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v.Conclusion != VerdictUnverified || v.Reason != "audit_incomplete" || !v.Retained {
+		t.Fatalf("写坏的凭证应判 audit_incomplete 且保留，得到 %+v", v)
+	}
+}
+
+// upper 已被搬走（或误删）时，结论必须告诉用户 quarantine 在哪——否则
+// "证据已保留"只是半句话。反过来，upper 还在工作区时不能指向旧 quarantine。
+func TestVerifyAuditIncompletePointsToQuarantine(t *testing.T) {
+	e := testEnv(t)
+	app, id := seedVerifyApp(t, e)
+	audit := e.AuditDir(app, id)
+	seedRunRecord(t, filepath.Join(audit, "run.toml"), runRecord{App: app, ID: id})
+	q := filepath.Join(audit, "quarantine-20260101T000000-abcd")
+	writeTree(t, filepath.Join(q, filepath.FromSlash("Downloads/old.docx")))
+
+	v, err := e.Verify(app, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v.Reason != "audit_incomplete" || !v.Retained {
+		t.Fatalf("应判 audit_incomplete + retained，得到 %+v", v)
+	}
+	if v.Quarantine != q {
+		t.Fatalf("必须给出 quarantine 的真实路径 %s，得到 %q", q, v.Quarantine)
+	}
+
+	// 反例：upper 还在工作区（无 run.toml 的崩溃现场）时，别指向旧 quarantine。
+	writeTree(t, filepath.Join(audit, "upper", filepath.FromSlash(".config/TestApp/x")))
+	if err := os.Remove(filepath.Join(audit, "run.toml")); err != nil {
+		t.Fatal(err)
+	}
+	v, err = e.Verify(app, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v.Reason != "audit_incomplete" || v.Quarantine != "" {
+		t.Fatalf("现场在工作区时不应指向旧 quarantine，得到 %+v", v)
 	}
 }

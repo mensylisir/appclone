@@ -189,18 +189,54 @@ func (e *Env) prepareBindTargets(p Profile, in Instance) (created []string, err 
 		// "不能只 find -type d"）。把它们在实例里建成目录，bwrap 就是
 		// "目录 bind 到文件目标"，整条命令失败，而用户看到的是"应用起不来"。
 		//
-		// 已知边界：宿主路径**不存在**时形态无从判断，仍按目录处理。档案记的是路径
-		// 而不是类型（§5 的 paths 是字符串数组），所以"探测时是文件、创建时已被删"
-		// 这种竞态会退化成旧行为。根治要给档案加 `path_types`，属于 schema 变更，
-		// 与探测写入器一起做；在那之前 `CreateInstance` 的 `ValidateRunnable` 会先
-		// 用 `profile_stale`（退出 2）拦下不存在的源，不会把错误形态带进 bwrap。
+		// 已知边界：宿主路径**不存在**时形态无从判断，沿用实例侧已有形态。档案记的是
+		// 路径而不是类型（§5 的 paths 是字符串数组），所以"探测时是文件、之后被删"
+		// 这种竞态会退化成旧行为。根治要给档案加 `path_types`，属于 schema 变更。
 		st, statErr := os.Stat(abs)
-		isFile := statErr == nil && !st.IsDir()
+		hostExists := statErr == nil
+		isFile := hostExists && !st.IsDir()
+		// 实例侧占位必须是我们建的那个目录/普通文件。软链会把"工具自己写文件"
+		// 变成"在宿主任意位置写文件"（越出 §4 的写入白名单）；FIFO/设备节点
+		// 会让下面的 OpenFile 直接挂死（违反"禁止死等"）。
+		//
+		// 最后一段由 O_NOFOLLOW 兜住，**父级**兜不住：`~/.config` 被换成指向
+		// 实例 root 之外的软链时，MkdirAll/OpenFile 会跟着它跑出去。所以先要求
+		// "最近存在的祖先"解析后仍在 root 内。
+		if !srcWithinRoot(in.Root, src) {
+			return fail(errInput("err.profile.bind_target_type", map[string]any{
+				"app": p.App, "path": abs,
+			}))
+		}
+		srcSt, srcErr := os.Lstat(src)
+		if srcErr == nil {
+			if srcSt.Mode()&os.ModeSymlink != 0 || (!srcSt.IsDir() && !srcSt.Mode().IsRegular()) {
+				return fail(errInput("err.profile.bind_target_type", map[string]any{
+					"app": p.App, "path": abs,
+				}))
+			}
+			// 宿主不存在时没有"正确形态"可依据：沿用实例侧已有的形态，
+			// 而不是把文件悄悄当成目录重建。
+			if !hostExists {
+				isFile = srcSt.Mode().IsRegular()
+			}
+			// 宿主形态变了（文件↔目录）：bwrap 会"目录 bind 到文件目标"整条失败，
+			// 用户看到的却是"应用起不来"。给一个指向"重新配置"的明确错误。
+			if hostExists && isFile == srcSt.IsDir() {
+				return fail(errInput("err.profile.bind_target_type", map[string]any{
+					"app": p.App, "path": abs,
+				}))
+			}
+		} else if !os.IsNotExist(srcErr) {
+			// 读不了不是"不存在"：占位物状态未知，不能继续往里写。
+			return fail(errInput("err.profile.bind_target_type", map[string]any{
+				"app": p.App, "path": abs,
+			}))
+		}
 		if isFile {
 			if err := os.MkdirAll(filepath.Dir(src), 0o700); err != nil {
 				return fail(errEnv("err.env.mkdir", map[string]any{"path": src}, err))
 			}
-			f, err := os.OpenFile(src, os.O_CREATE|os.O_WRONLY, 0o600)
+			f, err := os.OpenFile(src, os.O_CREATE|os.O_WRONLY|unix.O_NOFOLLOW, 0o600)
 			if err != nil {
 				return fail(errEnv("err.env.write", map[string]any{"path": src}, err))
 			}
@@ -250,6 +286,29 @@ func (e *Env) prepareBindTargets(p Profile, in Instance) (created []string, err 
 		}
 	}
 	return created, nil
+}
+
+// srcWithinRoot 检查 src 的**最近存在祖先**解析软链后是否仍落在 root 内。
+// 不存在的那几级一定是我们即将创建的；存在的祖先若指向 root 外（父级软链），
+// 后面的 MkdirAll/OpenFile 就会跟着跑出去。
+func srcWithinRoot(root, src string) bool {
+	rootReal := Real(root)
+	for p := src; ; {
+		if _, err := os.Lstat(p); err == nil {
+			rp, rerr := filepath.EvalSymlinks(p)
+			if rerr != nil {
+				return false
+			}
+			return rp == rootReal || IsUnder(rootReal, rp)
+		} else if !os.IsNotExist(err) {
+			return false
+		}
+		parent := filepath.Dir(p)
+		if parent == p {
+			return false
+		}
+		p = parent
+	}
 }
 
 // mkdirAllTracked 是 os.MkdirAll 的可回滚版本：返回本次真正新建的目录

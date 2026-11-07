@@ -106,18 +106,20 @@ func (e *Env) Run(ctx context.Context, app, id string, opt RunOptions) (RunResul
 	// 审计层（§6.5）：overlay 罩住 HOME + 把公共目录/AC_BASE 绑回真实。
 	// 这三件事必须发生在实例 bind 之前，所以它走 BuildOptions 而不是另拼 argv。
 	var audit *AuditSession
+	started := false
 	if opt.Audit {
-		sess, layers, aerr := e.beginAudit(in)
+		sess, layers, aerr := e.beginAudit(in, p)
 		if aerr != nil {
 			return RunResult{}, aerr
 		}
 		audit = sess
 		o.Audit = layers
-		// 兜底：没走到 finish 就退出（启动失败、panic）时不清写层会更糟——
-		// 但那时应用没跑，写层里不可能有用户文件，所以 abort 是安全的。
+		// 兜底：没走到 finish 就退出。**应用是否启动过决定能不能删写层**：
+		// Start 之后写层里就可能已有用户文件，只能卸载并保留（下一次 verify
+		// 会判 audit_incomplete）；Start 之前删是安全的。
 		defer func() {
 			if audit != nil {
-				audit.abort()
+				audit.abandon(started)
 			}
 		}()
 	}
@@ -161,6 +163,7 @@ func (e *Env) Run(ctx context.Context, app, id string, opt RunOptions) (RunResul
 	if err := cmd.Start(); err != nil {
 		return RunResult{}, errEnv("err.run.start_failed", map[string]any{"exec": p.Exec}, err)
 	}
+	started = true
 	pgid := cmd.Process.Pid
 
 	// 信号 → 进程组。run 自身被杀时也要把应用带走，否则用户关掉终端

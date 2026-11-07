@@ -418,3 +418,104 @@ func TestWriteLauncherFollowsCliPath(t *testing.T) {
 		t.Fatal("入口文件名不能变（改名不换文件）")
 	}
 }
+
+// 实例侧占位若是软链，补建会跟着它写到宿主任意位置（越出 §4 的写入白名单）；
+// 指向 FIFO 时 OpenFile 还会挂死。必须拒绝。
+func TestPrepareBindTargetsRejectsSymlinkPlaceholder(t *testing.T) {
+	e := testEnv(t)
+	app, p := seedApp(t, e)
+	in, err := e.CreateInstance(context.Background(), app, p, "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	abs, err := e.Resolver.Expand(p.Paths[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	src, err := instanceChild(in.Root, abs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.RemoveAll(src); err != nil {
+		t.Fatal(err)
+	}
+	outside := filepath.Join(t.TempDir(), "outside-target")
+	if err := os.Symlink(outside, src); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.prepareBindTargets(p, in); ExitCode(err) != CodeInput {
+		t.Fatalf("软链占位应被拒（2），得到 %v", err)
+	}
+	if _, err := os.Lstat(outside); !os.IsNotExist(err) {
+		t.Fatal("拒绝之后不得在宿主任意位置创建文件")
+	}
+}
+
+// 宿主路径在"建实例 → 运行"之间从目录变成文件（或反之）时，bwrap 会
+// "目录 bind 到文件目标"整条失败；必须给一个指向重新配置的明确错误。
+func TestPrepareBindTargetsRejectsTypeChange(t *testing.T) {
+	e := testEnv(t)
+	app, p := seedApp(t, e)
+	in, err := e.CreateInstance(context.Background(), app, p, "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	abs, err := e.Resolver.Expand(p.Paths[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	src, err := instanceChild(in.Root, abs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 宿主仍是目录（seedApp 建的），实例侧被换成普通文件。
+	if err := os.RemoveAll(src); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(src, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, perr := e.prepareBindTargets(p, in)
+	if ExitCode(perr) != CodeInput {
+		t.Fatalf("形态变化应被拒（2），得到 %v", perr)
+	}
+	// 必须是"去重新配置"的键：裸的环境错误会让用户以为工具坏了，
+	// 而真正要做的是把档案里的路径重新探测/勾选一次。
+	if errKey(perr) != "err.profile.bind_target_type" {
+		t.Fatalf("应指向重新配置的错误键，得到 %v", perr)
+	}
+}
+
+// 父级软链也必须拒：O_NOFOLLOW 只保护最后一段，`~/.config` 被换成指向
+// 实例 root 之外的软链时，MkdirAll/OpenFile 会跟着它跑出去。
+func TestPrepareBindTargetsRejectsSymlinkAncestor(t *testing.T) {
+	e := testEnv(t)
+	app, p := seedApp(t, e)
+	in, err := e.CreateInstance(context.Background(), app, p, "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	abs, err := e.Resolver.Expand(p.Paths[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	src, err := instanceChild(in.Root, abs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	outside := t.TempDir()
+	// 把实例里的 .config 整个换成指向 root 之外的软链。
+	ancestor := filepath.Dir(src)
+	if err := os.RemoveAll(ancestor); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, ancestor); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.prepareBindTargets(p, in); ExitCode(err) != CodeInput {
+		t.Fatalf("父级软链应被拒（2），得到 %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(outside, filepath.Base(src))); !os.IsNotExist(err) {
+		t.Fatal("拒绝之后不得沿父软链在 root 之外创建目录")
+	}
+}

@@ -87,7 +87,11 @@ func (r *PathResolver) isSharedWrite(abs string) bool {
 	base := filepath.Base(abs)
 	// GTK 最近文件与书签：几行文本，两个实例互相追加是可接受代价，
 	// 隔离开才是故障（§5.4）。
-	if base == "recently-used.xbel" {
+	//
+	// `recently-used.xbel` 只认 XDG_DATA_HOME **顶层**那一个：按 basename
+	// 任意匹配会把"应用自己数据目录里的同名文件"也算共享，归并时整个应用
+	// 目录被升级成 shared_writes，私有配置跟着共享出去。
+	if samePathLoose(abs, filepath.Join(r.XDG["DATA_HOME"], "recently-used.xbel")) {
 		return true
 	}
 	if base == "bookmarks" {
@@ -96,7 +100,28 @@ func (r *PathResolver) isSharedWrite(abs string) bool {
 			return true
 		}
 	}
+	// 同一故障模式的其他桌面：KDE 文件对话框的书签（user-places.xbel）
+	// 与 GTK2 的 ~/.gtk-bookmarks。隔离它们，用户同样会看到"书签全没了"。
+	//
+	// 三处精确路径都必须用 loose 比较：HOME 是软链、或 XDG_DATA_HOME 指向
+	// 真实路径而 upper 里是词法路径时，单纯的字符串相等会判不出来，
+	// 书签/最近文件被隔离——那正是这里要避免的故障。
+	if samePathLoose(abs, filepath.Join(r.XDG["DATA_HOME"], "user-places.xbel")) {
+		return true
+	}
+	if samePathLoose(abs, filepath.Join(r.Home, ".gtk-bookmarks")) {
+		return true
+	}
 	return false
+}
+
+// samePathLoose 比较两个路径是否指向同一位置：词法相等，或解析软链后相等。
+// 任一侧不存在时 Real 退回 Clean，词法比较仍然兜底。
+func samePathLoose(a, b string) bool {
+	if filepath.Clean(a) == filepath.Clean(b) {
+		return true
+	}
+	return Real(a) == Real(b)
 }
 
 // hasCacheComponent 判定路径里是否出现 cache 段（大小写不敏感）。

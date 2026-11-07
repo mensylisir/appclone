@@ -19,6 +19,28 @@ GUI 方向定案：**GTK4 + libadwaita 原生控件，经 puregotk 绑定（零 
 **第十一轮：实现审查收口**（2026-11-07）。3 个 P0（bwrap 私有目录的 bind 源落进 `root/`、`run` 覆盖 `RuntimeDir`、
 `paths` 未做 `EvalSymlinks`）与主要 P1 修完并推送；本轮又清掉删除白名单、回滚链、GTK 版本探测三条，
 `gofmt`/`go vet` 干净、`go test ./...` 全绿（新增 8 个断言）。
+**第二十六轮：审计证据链对抗审查（REJECTED）修复 + S0 完成**（2026-11-07）。只读 subagent 对工作树判 REJECTED
+（2 P1 + 10 P2）；P1 全部修完：① 残留清扫改为按实例判断并在清扫期间**持有**该实例的 `run.lock`
+（判断与搬移之间不再有窗口；跳过已写完 `run.toml` 的证据，两个实例同时审计不会互相卸挂载）；② `run.toml` 增加 `binds_recorded` 与 `paths`，老凭证回退按档案推断
+（不再把 extract_failed 判成 leak）。P2 修完：声明但当时不存在的 `shared_writes` 算通过、父级软链逃逸拒绝、
+`extract_failed` 搬 quarantine 后摘要写失败带真实路径、`audit_incomplete` 输出最新 quarantine 路径、
+删除旧凭证失败拦住新审计、应用已启动后异常退出保留写层、跨设备拷贝 fsync 目录项 + dst 已存在拒绝、
+classify 精确路径改 loose 比较、老/坏凭证与 EXDEV 回退补齐断言。`gofmt`/`go vet`/`go test ./...` 全绿；
+`design/probe-smoke.sh /tmp/appclone` 仍退出码 0。
+**S0 spike 五条通过**：本机（GTK 4.24.1 / libadwaita 1.10.0）与 `ubuntu:24.04` 容器（GTK 4.14.5 / libadwaita 1.5.0，
+Xvfb）同一份 `CGO_ENABLED=0` 程序均跑通 SwitchRow notify→Go 回调、NavigationView push/pop、AlertDialog response
+分发、中文渲染；**Esc 会触发 NavigationView pop**，GUI 实现必须在窗口级拦截（§4.3 语义）。
+
+**第二十七轮：审计证据链复审收口（APPROVED）**（2026-11-08）。对抗性复审在工作树上判 **APPROVED**
+（0 P0/P1，2 P2 + 4 P3）；P2 两条已修并补断言：① 清扫时 `readUpperTree` 读失败不再 `RemoveAll`，
+改为搬进 `/var/tmp` quarantine（chmod 000 子目录曾会整棵删掉可能含用户文件的证据）；
+② 新审计开始时不再只是删 `run.toml`，而是写一条 `finished_at` 为空的**进行中凭证**——
+新审计若在写层建立前失败，verify 判 `audit_incomplete`，不会把旧 `summary.toml` 重放成"本次通过"
+（重放文案同时改成"上次审计"）。P3：`moveDir` 预检测试改用空 dst（去预检会真红）、
+`SharedBinds` 补断言、`run.toml` 增 version 超前拒绝、fsmove 测试标注禁 `t.Parallel`；
+`lockAuditWork` 清扫期瞬时 exit 7 与空 `paths` 回退保留为注释说明（前者是原子化代价，后者方向保守）。
+证据：`gofmt -l .` 空、`go vet ./...` 干净、`go test ./...` 全绿（GVM go1.26.5），
+`design/probe-smoke.sh /tmp/appclone` 退出码 0（9 步全过）。
 
 ## 下一步
 
@@ -44,7 +66,9 @@ GUI 方向定案：**GTK4 + libadwaita 原生控件，经 puregotk 绑定（零 
 2. ~~`core` 其余部分~~ **已完成**（`BuildBwrapArgs` 纯函数 + 单测、档案 TOML、实例 CRUD、`id`/`display_name` 校验）
 3. ~~CLI MVP~~ **已完成**（`add/run/list/rm/doctor/repair-desktop/version`）
 4. `cmd/appclone-gui`（puregotk + libadwaita 三屏，控件映射见 `tech-stack.md` §4.5）。
-   **前置**：拉 `puregotk` 依赖需要网络（本机 `proxy.golang.org` 502），且 S0 五条未做。
+   **前置已清**：S0 五条 2026-11-07 全过（见 `tech-stack.md` §4.3），依赖可获取。
+   实现顺序：先列表页（SwitchRow + 运行态）→ 首次配置（NavigationView push/pop，窗口级拦截 Esc）→
+   详情/删除确认（AlertDialog），每屏配一个 GTK 冒烟；`AdwSwitchRow` 必须放进 `AdwPreferencesGroup`。
 
 ## 被挡住的
 
@@ -424,5 +448,6 @@ GUI 方向定案：**GTK4 + libadwaita 原生控件，经 puregotk 绑定（零 
   （`audit_not_enabled`/`audit_incomplete`/`no_writes`/`audit_unreadable`/`extract_failed`）；
   `Expand` 对 `..` 直接报 2，所以 `~/..` 绕不过 `blanket_path`；`--purge-profile` 的目标是
   `profiles.d/` 的真子项，仍在删除白名单内；gofmt/vet/test 与 `node design/guitest.js`（58/58）全绿。
-  **下次开工第一件事**：把 `ab07b05` 交给只读 subagent 复审一遍（重点：`extract_failed` 是否掩盖真泄漏、
-  文件路径占位的竞态、shared 升级是否过度共享）。
+  **已于第二十六轮补做**：只读 subagent 判 REJECTED（2 P1 + 10 P2），findings 与修复见上；
+  **待复审**：修复后的工作树需再过一次只读审查才能把本轮标完成（重点：P1-1 清扫的锁窗口、
+  P1-2 老凭证回退是否还有反向误判、`moveDir` 失败语义）。

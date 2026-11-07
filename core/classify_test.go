@@ -341,3 +341,43 @@ func TestProfileFromCandidatesDropsCrossFieldDuplicates(t *testing.T) {
 		t.Fatalf("这条不该产生 unsupported：%+v", out.Unsupported)
 	}
 }
+
+// 收紧后的精确路径不能误伤正常应用：应用自己数据目录里的同名文件
+// 不是"GTK 最近文件"，把它标成 shared 会把整个应用目录升级成共享。
+func TestClassifyNestedXbelIsNotShared(t *testing.T) {
+	r := classifyEnv(t)
+	nested := filepath.Join(r.Home, ".config", "App", "recently-used.xbel")
+	if r.isSharedWrite(nested) {
+		t.Fatal("嵌套的 recently-used.xbel 不该被当成共享文件")
+	}
+	if class, _, _, _ := r.Classify(nested); class == ClassShared {
+		t.Fatalf("嵌套文件分类不能是 shared，得到 %v", class)
+	}
+}
+
+// HOME 是软链时，upper 里是真实路径、档案里是词法路径；精确路径判定必须
+// 两种形态都能认出来，否则书签/最近文件会被隔离（用户看到"书签全没了"）。
+func TestClassifySharedXbelWithSymlinkedHome(t *testing.T) {
+	root := t.TempDir()
+	realHome := filepath.Join(root, "realhome")
+	if err := os.MkdirAll(realHome, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	homeLink := filepath.Join(root, "home")
+	if err := os.Symlink(realHome, homeLink); err != nil {
+		t.Fatal(err)
+	}
+	r := newResolver(homeLink, realHome, 1000, func(string) string { return "" })
+	for _, name := range []string{"recently-used.xbel", "user-places.xbel"} {
+		abs := filepath.Join(realHome, ".local", "share", name)
+		if !r.isSharedWrite(abs) {
+			t.Fatalf("%s 在软链 HOME 下必须仍判共享", name)
+		}
+		if !r.isSharedWrite(filepath.Join(homeLink, ".local", "share", name)) {
+			t.Fatalf("%s 的词法路径也必须判共享", name)
+		}
+	}
+	if !r.isSharedWrite(filepath.Join(realHome, ".gtk-bookmarks")) {
+		t.Fatal("~/.gtk-bookmarks 在软链 HOME 下必须仍判共享")
+	}
+}

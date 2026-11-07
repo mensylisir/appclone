@@ -31,9 +31,22 @@ type Env struct {
 	// RunCmd 覆盖"跑一个只读外部命令拿输出"（测试注入）。空值走 exec。
 	// 只有 L0 的 `flatpak info --show-permissions` 用它，所以抽成字段而不是多一层接口。
 	RunCmd func(ctx context.Context, name string, args ...string) (string, error)
+	// TmpRoot 是探测/审计写层的根（默认 /var/tmp，必须与 $HOME 分离）。
+	// 测试注入独立目录：否则用例之间会通过 /var/tmp 共享残留写层，
+	// 一个用例的 upper 让另一个用例的 verify 读到"证据不完整"。
+	TmpRoot string
 
 	mu   sync.Mutex // 进程内先互斥，再抢 flock：GUI 的探测 goroutine 与列表刷新
 	lock *os.File   // 在同一进程里各开一次会自锁（flock 是进程级的，同进程不互斥）
+}
+
+// tmpRoot 是写层根目录。默认 /var/tmp：必须在 $HOME 之外（overlay 的 upper
+// 嵌在 lower 里会 ELOOP），且不与用户在 /tmp 的临时文件混在一起。
+func (e *Env) tmpRoot() string {
+	if e.TmpRoot != "" {
+		return e.TmpRoot
+	}
+	return "/var/tmp"
 }
 
 // NewEnv 从真实环境构造。

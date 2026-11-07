@@ -51,9 +51,9 @@ func (e *Env) ProbeContaminated(entries []UpperEntry, publicBinds []BindPair) []
 // ELOOP，而且删不掉（§3.2 的实测记录）。work/upper 在同一个 MkdirTemp 下，
 // 同文件系统这一条是隐含成立的。
 func (e *Env) newProbeWorkDir(app string) (string, error) {
-	root, err := os.MkdirTemp("/var/tmp", fmt.Sprintf("appclone-probe-%d-", e.UID))
+	root, err := os.MkdirTemp(e.tmpRoot(), fmt.Sprintf("appclone-probe-%d-", e.UID))
 	if err != nil {
-		return "", errEnv("err.env.mkdir", map[string]any{"path": "/var/tmp"}, err)
+		return "", errEnv("err.env.mkdir", map[string]any{"path": e.tmpRoot()}, err)
 	}
 	if err := os.Chmod(root, 0o700); err != nil {
 		os.RemoveAll(root)
@@ -77,7 +77,7 @@ func (e *Env) newProbeWorkDir(app string) (string, error) {
 // sweepStaleProbes 清掉上一轮残留（§3.2.3）：仍挂载的先 `fusermount -uz`，
 // 然后**先做污染检查再删**——残留的 upper 里可能就有用户文件。
 func (e *Env) sweepStaleProbes() error {
-	dirs, err := filepath.Glob(fmt.Sprintf("/var/tmp/appclone-probe-%d-*", e.UID))
+	dirs, err := filepath.Glob(filepath.Join(e.tmpRoot(), fmt.Sprintf("appclone-probe-%d-*", e.UID)))
 	if err != nil {
 		return nil
 	}
@@ -95,8 +95,8 @@ func (e *Env) sweepStaleProbes() error {
 			continue
 		}
 		// 有内容：可能含用户文件，改名保留而不是删。
-		q := fmt.Sprintf("/var/tmp/appclone-quarantine-%d-%s", e.UID,
-			time.Now().UTC().Format("20060102T150405")+"-"+randSuffix())
+		q := filepath.Join(e.tmpRoot(), fmt.Sprintf("appclone-quarantine-%d-%s", e.UID,
+			time.Now().UTC().Format("20060102T150405")+"-"+randSuffix()))
 		if err := os.Rename(d, q); err != nil {
 			return errEnv("err.probe.quarantine_failed", map[string]any{"path": d}, err)
 		}

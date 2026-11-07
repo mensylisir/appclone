@@ -92,9 +92,9 @@ func (e *Env) probeStrace(ctx context.Context, app string, opt ProbeOptions, run
 	} else if running {
 		return ProbeResult{}, errBusy("err.probe.app_running", map[string]any{"exec": filepath.Base(opt.Command[0])})
 	}
-	work, err := os.MkdirTemp("/var/tmp", fmt.Sprintf("appclone-strace-%d-", e.UID))
+	work, err := os.MkdirTemp(e.tmpRoot(), fmt.Sprintf("appclone-strace-%d-", e.UID))
 	if err != nil {
-		return ProbeResult{}, errEnv("err.env.mkdir", map[string]any{"path": "/var/tmp"}, err)
+		return ProbeResult{}, errEnv("err.env.mkdir", map[string]any{"path": e.tmpRoot()}, err)
 	}
 	defer os.RemoveAll(work)
 	runtimeDir := filepath.Join(work, "runtime")
@@ -227,8 +227,8 @@ func (e *Env) probeSession(ctx context.Context, app string, opt ProbeOptions, mo
 		}
 	}
 	quarantine := func() (string, error) {
-		q := fmt.Sprintf("/var/tmp/appclone-quarantine-%d-%s", e.UID,
-			time.Now().UTC().Format("20060102T150405")+"-"+randSuffix())
+		q := filepath.Join(e.tmpRoot(), fmt.Sprintf("appclone-quarantine-%d-%s", e.UID,
+			time.Now().UTC().Format("20060102T150405")+"-"+randSuffix()))
 		if err := os.Rename(work, q); err != nil {
 			// **绝不回退到 RemoveAll**：这里面可能就是用户刚存的文件（§3.2.1）。
 			// 留着、把真实路径告诉用户，让人自己决定。

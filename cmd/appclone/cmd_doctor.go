@@ -141,7 +141,13 @@ func (a *app) runVerify(cmd *cobra.Command, args []string) error {
 	}, func() {
 		switch {
 		case v.Conclusion == core.VerdictVerified:
-			fmt.Println("结论：verified（本次审计覆盖到了写入，且都在声明范围内）")
+			// GeneratedAt 非空 = 这是重放的已存摘要，不是本次新跑的对账。
+			// 说"本次审计"会让用户以为刚刚验证过（尤其在失败一次审计之后）。
+			if v.GeneratedAt != "" {
+				fmt.Println("结论：verified（上次审计覆盖到了写入，且都在声明范围内）")
+			} else {
+				fmt.Println("结论：verified（本次审计覆盖到了写入，且都在声明范围内）")
+			}
 			coverageLine()
 		case v.Conclusion == core.VerdictLeak:
 			fmt.Printf("结论：leak-detected（%d 处写到了声明范围之外）\n", len(v.Violations))
@@ -164,7 +170,7 @@ func (a *app) runVerify(cmd *cobra.Command, args []string) error {
 			fmt.Printf("结论：unverified（%s）\n", unverifiedWhy(v.Reason))
 			switch v.Reason {
 			case "audit_incomplete":
-				fmt.Println("上次审计没有正常结束（缺 run.toml 或 upper 被删），证据不完整，因此不下结论。")
+				fmt.Println("上次审计没有正常结束（凭证未完成、缺 run.toml 或 upper 被删），证据不完整，因此不下结论。")
 				fmt.Println("证据已保留，没有删除；可以重新跑一次 --audit。")
 			case "no_writes":
 				fmt.Println("审计跑了，但这次没有观测到任何写入，无法判断隔离是否有效。")
@@ -178,6 +184,11 @@ func (a *app) runVerify(cmd *cobra.Command, args []string) error {
 				for _, p := range v.Violations {
 					fmt.Println("  " + p)
 				}
+				if v.Quarantine != "" {
+					// 必须给真实路径：只说"在 quarantine 里"而用户找不到目录，
+					// 等于把取回文件这件事留给用户自己猜（§7 复杂度不泄漏）。
+					fmt.Println("证据已搬到：" + v.Quarantine)
+				}
 			default:
 				fmt.Println("本版本还没有审计写入器（run --audit），没有证据就无法归因。")
 				fmt.Println("这不是通过：没有证据不等于没有泄漏。")
@@ -188,7 +199,13 @@ func (a *app) runVerify(cmd *cobra.Command, args []string) error {
 			fmt.Printf("结论时间：%s（重放的已存摘要）\n", v.GeneratedAt)
 		}
 		if v.Retained {
-			fmt.Println("证据保留：是（audit/ 目录未清理）")
+			if v.Quarantine != "" {
+				fmt.Println("证据保留：是（已搬到 " + v.Quarantine + "）")
+			} else {
+				// 不写死 audit/：不完整证据通常在工作区（/var/tmp 的写层），
+				// 指错目录比只说"没删"更糟。
+				fmt.Println("证据保留：是（未自动清理）")
+			}
 		}
 		if len(v.Ignored) > 0 {
 			// §5：审计输出必须列出被忽略的类别，不许悄悄忽略。

@@ -20,6 +20,10 @@ func probeEnv(t *testing.T) *Env {
 	t.Helper()
 	r := classifyEnv(t)
 	e := NewEnvAt(filepath.Join(r.Home, ".local", "share", "appclone"), r)
+	e.TmpRoot = filepath.Join(filepath.Dir(r.Home), "tmp")
+	if err := os.MkdirAll(e.TmpRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
 	e.Trasher = func(paths ...string) error { return nil }
 	e.CliPath = "/usr/bin/appclone"
 
@@ -276,7 +280,7 @@ func TestProbeSessionQuarantinesOnContamination(t *testing.T) {
 		t.Fatalf("应是 err.probe.contaminated，得到 %v", err)
 	}
 	// 现场必须还在（名字带 uid + 时间 + 随机尾巴），并且里面真有那个文件。
-	ents, _ := filepath.Glob("/var/tmp/appclone-quarantine-*")
+	ents, _ := filepath.Glob(filepath.Join(e.TmpRoot, "appclone-quarantine-*"))
 	if len(ents) == 0 {
 		t.Fatal("污染现场必须保留（quarantine-*），不能删掉可能属于用户的文件")
 	}
@@ -315,7 +319,7 @@ func TestProbeSessionKeepsWorkOnUmountFailure(t *testing.T) {
 	if err == nil {
 		t.Fatal("卸载失败必须报错")
 	}
-	left, _ := filepath.Glob("/var/tmp/appclone-probe-*")
+	left, _ := filepath.Glob(filepath.Join(e.TmpRoot, "appclone-probe-*"))
 	if len(left) == 0 {
 		t.Fatal("卸载失败时工作目录必须保留（删了会碰用户家目录视图）")
 	}
