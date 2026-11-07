@@ -284,3 +284,14 @@ GUI 方向定案：**GTK4 + libadwaita 原生控件，经 puregotk 绑定（零 
 - 2026-11-06 方案体检后修订三份文档（14 项）：bwrap 参数契约（`--unshare-*`、挂载顺序）、共享可写文件、
   失败语义、三目录应用来源（系统级 397 vs 用户级 12）、`doctor --verify` 拆分、`<id>` 规则、
   去掉私有 `.trash/`、验证清单补反向断言、L0 平台前提、两轮探测。
+
+## 未完成的审查（明确记录，不是静默跳过）
+
+- 2026-11-07 修复提交 `ab07b05` 的**第二轮只读复审未能执行**：subagent 调用被频率限制挡住
+  （429，18:52 UTC+8 重置）。AGENTS.md 要求"subagent 不可用时明确记录阻塞"，故记在这里。
+  已做的替代自查（可复核）：`grep` 确认 `unverifiedWhy` 覆盖 `core/verify.go` 里全部五个 reason 值
+  （`audit_not_enabled`/`audit_incomplete`/`no_writes`/`audit_unreadable`/`extract_failed`）；
+  `Expand` 对 `..` 直接报 2，所以 `~/..` 绕不过 `blanket_path`；`--purge-profile` 的目标是
+  `profiles.d/` 的真子项，仍在删除白名单内；gofmt/vet/test 与 `node design/guitest.js`（58/58）全绿。
+  **下次开工第一件事**：把 `ab07b05` 交给只读 subagent 复审一遍（重点：`extract_failed` 是否掩盖真泄漏、
+  文件路径占位的竞态、shared 升级是否过度共享）。

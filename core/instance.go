@@ -188,6 +188,12 @@ func (e *Env) prepareBindTargets(p Profile, in Instance) (created []string, err 
 		// 直接写在 XDG 根或 $HOME 下的**单体文件**同样是应用状态（§3.2.4 明说
 		// "不能只 find -type d"）。把它们在实例里建成目录，bwrap 就是
 		// "目录 bind 到文件目标"，整条命令失败，而用户看到的是"应用起不来"。
+		//
+		// 已知边界：宿主路径**不存在**时形态无从判断，仍按目录处理。档案记的是路径
+		// 而不是类型（§5 的 paths 是字符串数组），所以"探测时是文件、创建时已被删"
+		// 这种竞态会退化成旧行为。根治要给档案加 `path_types`，属于 schema 变更，
+		// 与探测写入器一起做；在那之前 `ValidateRunnable` 会在 run 时因为源不存在
+		// 先报 stale（退出 2），不会把错误形态带进 bwrap。
 		st, statErr := os.Stat(abs)
 		isFile := statErr == nil && !st.IsDir()
 		if isFile {
