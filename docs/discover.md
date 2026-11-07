@@ -278,6 +278,17 @@ L2 语义分类（喂给 GUI 屏3 预勾选）
    └─ §5 规则表 → 绝大多数应用到屏3 时只剩"确认预勾选项"
 ```
 
+**strace 降级的实现**（2026-11-07，`core/strace.go`）：`Probe` 在 `mounter.Available()` 失败时
+检查 `strace` 是否存在，有则整条改成 strace 路径（否则退出 3）。几处必须写清的取舍：
+- strace 跑在 **bwrap 外面**（`strace -f -o <log> -- bwrap …`）：日志由宿主写，不用操心"沙箱里往哪写日志"；
+- 不罩 overlay（HOME 就是真实的），所以**没有"把公共目录绑回去"这回事**——那句话的前提是 overlay 罩住了它们；
+- 解析只认**带写入意图**的 `open/openat/openat2/creat/mkdir/rename/link/symlink/truncate/chmod/utimensat`，
+  `O_RDONLY`/`O_PATH`/`stat` 一律跳过；`unlink` 记 whiteout；**返回 -1 的调用一律跳过**
+  （`mkdir` 的 EEXIST 是第二次启动的常态，算成写入会给每个应用加一条假候选）；
+  多线程下 `<unfinished>`/`resumed` 的拼接行直接丢弃（拼起来太脆）；
+- 盲区（必须写进界面文案）：`O_PATH`+`openat2`、`mmap` 写、`io_uring`、以及被 `ptrace` 权限挡住的场景；
+  档案记 `probe_method = "strace"`，置信度必须按"可能写过"展示，不是"确定写过"。
+
 层间关系：L0 不执行任何代码，负责把"冷启动前就能猜到的"先填上；L1 定案；
 L2 把定案结果翻译成档案语义。**strace 降级为 L1 不可用时的兜底路径**
 （该分支尚未在 Go 中实现，`legacy/` 原型仅作行为参照）。

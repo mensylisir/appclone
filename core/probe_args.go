@@ -22,7 +22,10 @@ type ProbeSpec struct {
 	SharedWrite []string          // 共享可写文件（输入法/书签），尽量 bind 回真实
 	LockBinds   []BindPair        // 锁文件：Src = 探测期空文件，Dst = 宿主锁路径
 	Env         map[string]string // 额外注入的环境变量（字典序输出）
-	Command     []string          // 应用命令（argv[0] 之后全部原样）
+	// NoOverlay 是 strace 降级模式：不罩 overlay（HOME 就是真实的），
+	// 因此也没有"把公共目录绑回去"这回事——那句话的前提是 overlay 罩住了它们。
+	NoOverlay bool
+	Command   []string // 应用命令（argv[0] 之后全部原样）
 }
 
 // ProbeBwrapArgs 产出探测会话的完整 argv（纯函数，golden 断言）。
@@ -46,7 +49,7 @@ func ProbeBwrapArgs(s ProbeSpec) ([]string, error) {
 	if s.Home == "" || !filepath.IsAbs(s.Home) {
 		return nil, errInternal("err.internal.probe_spec", map[string]any{"field": "home"}, nil)
 	}
-	if s.Merged == "" || !filepath.IsAbs(s.Merged) {
+	if !s.NoOverlay && (s.Merged == "" || !filepath.IsAbs(s.Merged)) {
 		return nil, errInternal("err.internal.probe_spec", map[string]any{"field": "merged"}, nil)
 	}
 	if len(s.Command) == 0 {
@@ -58,10 +61,12 @@ func ProbeBwrapArgs(s ProbeSpec) ([]string, error) {
 		"--bind", "/", "/",
 		"--dev-bind", "/dev", "/dev",
 		"--proc", "/proc",
-		"--bind", s.Merged, s.Home,
 	}
-	for _, pb := range s.PublicBinds {
-		argv = append(argv, "--bind", pb.Src, pb.Dst)
+	if !s.NoOverlay {
+		argv = append(argv, "--bind", s.Merged, s.Home)
+		for _, pb := range s.PublicBinds {
+			argv = append(argv, "--bind", pb.Src, pb.Dst)
+		}
 	}
 	if s.Base != "" {
 		argv = append(argv, "--bind", s.Base, s.Base)
@@ -101,7 +106,7 @@ func ProbeBwrapArgs(s ProbeSpec) ([]string, error) {
 	//
 	// 为什么不用"写标记文件再回读"：那要往用户的 ~/Downloads 里写东西，
 	// 中途被杀就留下一个残留文件。设备号比较不改任何用户数据。
-	if len(s.PublicBinds) > 0 {
+	if len(s.PublicBinds) > 0 && !s.NoOverlay {
 		argv = append(argv, "/bin/sh", "-c", probeBindGuard, "--")
 	}
 	return append(argv, s.Command...), nil

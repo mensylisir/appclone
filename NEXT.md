@@ -56,6 +56,16 @@ GUI 方向定案：**GTK4 + libadwaita 原生控件，经 puregotk 绑定（零 
 
 ## 最近完成
 
+- 2026-11-07 **第二十四轮：strace 降级落地**（没有 fuse 的机器不再直接放弃）：
+  - `Probe` 的降级判据：`mounter.Available()` 失败 + `strace` 存在 → 走 strace；两者都没有才报 3。
+  - `StraceCommand` 把 **bwrap 包在 strace 外层**：日志由宿主写，不用考虑"沙箱里往哪写日志"；
+    不罩 overlay（HOME 就是真实的），也就没有"公共目录绑回去"这回事。
+  - `ParseStrace` 的取舍：只认带写入意图的 open/mkdir/rename/link/truncate；`O_RDONLY`/`O_PATH`/`stat` 跳过；
+    **返回 -1 的调用跳过**（`mkdir` 的 EEXIST 是第二次启动的常态）；`unlink` 记 whiteout；
+    `<unfinished>`/`resumed` 拼接行直接丢。
+  - 断言：读操作被过滤、失败调用被跳过、whiteout 单列、命令形状、降级链路产出可建实例的档案。
+  - **未用真实日志校准**：本沙箱 `ptrace` 被禁（`PTRACE_TRACEME: Operation not permitted`），
+    只能 fixture 校准；真实机器的 strace 输出若有格式差异，改 `straceLine` 正则即可。
 - 2026-11-07 **第二十三轮：探测跑两轮**（§4 明确要求、之前只跑一轮）：
   - 登录态/token 常常第二次启动才落盘，跑一轮的典型结果是"探到配置目录、没探到凭据目录"。
     现在 `ProbeOptions.Rounds` 默认 2，两轮**共用同一份 overlay 写层**（结果是并集），

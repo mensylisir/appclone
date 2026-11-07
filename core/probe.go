@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -64,7 +65,110 @@ func (e *Env) Probe(ctx context.Context, app string, opt ProbeOptions) (ProbeRes
 	if runner == nil {
 		runner = setsidRunner{}
 	}
+	// 降级判据（§3.4）：overlay 挂不起来但有 strace，就走 strace；
+	// 两者都没有才报"环境给不出结论"。降级必须显式告知：strace 只能看到
+	// "打开过什么"，拿不到 overlay 那种零噪声的写入集。
+	if err := mounter.Available(); err != nil {
+		if _, serr := exec.LookPath("strace"); serr != nil {
+			return ProbeResult{}, err
+		}
+		if opt.Stderr != nil {
+			fmt.Fprintln(opt.Stderr, "appclone: 没有可用的 fuse-overlayfs，改用 strace 跟踪（结果置信度较低，且需要多开几次应用）")
+		}
+		return e.probeStrace(ctx, app, opt, runner)
+	}
 	return e.probeSession(ctx, app, opt, mounter, runner)
+}
+
+// probeStrace 是 §3.4 的降级路径：不罩 overlay（HOME 就是真实的），
+// 靠 strace 抓"带写入意图的 open/rename/unlink"。
+//
+// 与 overlay 路径的差别必须写在档案里（`probe_method = "strace"`），
+// 界面要按低置信展示——两套结果看起来一样，但一套是"确定写过"、
+// 一套是"可能写过"。
+func (e *Env) probeStrace(ctx context.Context, app string, opt ProbeOptions, runner SessionRunner) (ProbeResult, error) {
+	if running, err := e.AppRunning(opt.Command[0]); err != nil {
+		return ProbeResult{}, err
+	} else if running {
+		return ProbeResult{}, errBusy("err.probe.app_running", map[string]any{"exec": filepath.Base(opt.Command[0])})
+	}
+	work, err := os.MkdirTemp("/var/tmp", fmt.Sprintf("appclone-strace-%d-", e.UID))
+	if err != nil {
+		return ProbeResult{}, errEnv("err.env.mkdir", map[string]any{"path": "/var/tmp"}, err)
+	}
+	defer os.RemoveAll(work)
+	runtimeDir := filepath.Join(work, "runtime")
+	if err := os.MkdirAll(runtimeDir, 0o700); err != nil {
+		return ProbeResult{}, errEnv("err.env.mkdir", map[string]any{"path": runtimeDir}, err)
+	}
+	bus, stopBus := e.startProbeBus(filepath.Join(work, "dbus"))
+	if stopBus != nil {
+		defer stopBus()
+	}
+	locks, _, err := e.probeLockBinds(work, opt.LockFile)
+	if err != nil {
+		return ProbeResult{}, err
+	}
+	rounds := opt.Rounds
+	if rounds <= 0 {
+		rounds = 2
+	}
+	timeout := opt.Timeout
+	if timeout == 0 {
+		timeout = probeTimeoutDefault
+	}
+	var entries []UpperEntry
+	var last SessionResult
+	for round := 0; round < rounds; round++ {
+		logPath := filepath.Join(work, fmt.Sprintf("round-%d.log", round+1))
+		inner, aerr := ProbeBwrapArgs(ProbeSpec{
+			Home:        e.Resolver.Home,
+			Base:        e.Base,
+			RuntimeDir:  runtimeDir,
+			RuntimeSock: probeRuntimeSocks(e.Resolver.XDG["RUNTIME_DIR"], runtimeDir),
+			DBusAddress: bus,
+			SharedWrite: e.probeSharedWrites(),
+			LockBinds:   locks,
+			Command:     opt.Command,
+			NoOverlay:   true,
+		})
+		if aerr != nil {
+			return ProbeResult{}, aerr
+		}
+		if opt.Stderr != nil && rounds > 1 {
+			fmt.Fprintf(opt.Stderr, "appclone: 第 %d/%d 轮 —— 请打开应用用一下，然后把它关掉\n", round+1, rounds)
+		}
+		sctx, cancel := context.WithTimeout(ctx, timeout)
+		res, runErr := runner.Run(sctx, StraceCommand(logPath, inner), opt.Stderr)
+		cancel()
+		if runErr != nil {
+			if errors.Is(runErr, context.Canceled) {
+				return ProbeResult{}, ErrCanceled
+			}
+			if errors.Is(runErr, context.DeadlineExceeded) {
+				return ProbeResult{}, newErr(CodeProbe, "err.probe.timeout", map[string]any{
+					"app": app, "round": round + 1, "rounds": rounds,
+				}, runErr)
+			}
+			return ProbeResult{}, newErr(CodeEnv, "err.probe.session", map[string]any{
+				"app": app, "message": runErr.Error(),
+			}, runErr)
+		}
+		last = res
+		if f, ferr := os.Open(logPath); ferr == nil {
+			entries = append(entries, ParseStrace(f, e.Resolver.Home)...)
+			f.Close()
+		}
+	}
+	cands, whiteouts := e.Resolver.MergeUpper(entries)
+	p := e.Resolver.ProfileFromCandidates(app, "strace", cands)
+	p.Exec = opt.Command[0]
+	p.ExecArgs = append([]string{}, opt.Command[1:]...)
+	p.Ignored = DefaultIgnored()
+	p.LockFiles = e.lockHostPaths(locks)
+	p.Unsupported = append(p.Unsupported, probeUnsupported(e)...)
+	sort.Slice(p.Unsupported, func(i, j int) bool { return p.Unsupported[i].Path < p.Unsupported[j].Path })
+	return ProbeResult{Profile: p, Candidates: cands, Whiteouts: whiteouts, ExitCode: last.ExitCode}, nil
 }
 
 // probeRoundFailed 把"某一轮没跑起来"翻译成退出码。抽出来是因为它同时要
