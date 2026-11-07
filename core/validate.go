@@ -117,6 +117,30 @@ func ValidateProfile(p Profile, o BuildOptions) error {
 			}
 		}
 	}
+
+	// ignored 与 shared_writes 是 verify 的白名单：写一个 `~` 或 `/` 进去，
+	// `doctor --verify` 就会对**任何**越界写入都说 verified——最危险的一类假通过。
+	// 这两项过去只被读取、从没被校验（§5.5"非法值报错"）。
+	for _, field := range []struct {
+		name string
+		list []string
+	}{
+		{"ignored", p.Ignored},
+		{"shared_writes", p.SharedWrites},
+	} {
+		for _, raw := range field.list {
+			abs, err := o.expand(raw)
+			if err != nil {
+				return err
+			}
+			if abs == "/" {
+				return errInput("err.profile.blanket_path", map[string]any{"path": raw, "field": field.name})
+			}
+			if abs == filepath.Clean(o.Home) || abs == filepath.Clean(o.RealHome) {
+				return errInput("err.profile.blanket_path", map[string]any{"path": raw, "field": field.name})
+			}
+		}
+	}
 	return nil
 }
 
@@ -222,7 +246,15 @@ func (o BuildOptions) publicDirs() []string {
 func (o BuildOptions) protectedDirs() []string {
 	out := []string{}
 	if o.Resolver != nil {
-		out = append(out, o.Resolver.XDG["CONFIG_HOME"], o.Resolver.XDG["DATA_HOME"], o.Resolver.XDG["STATE_HOME"])
+		// 必须 Real：paths 里的条目在 expand 时已经解析过软链，而这里给的是词法
+		// 路径。`~/.config` 一旦是指向 `~/cfg` 的软链，`paths=["~/.config"]` 会被
+		// 归一成 `~/cfg`，既不等也不在 `~/.config` 之下 —— 整个配置根被隔离，
+		// 而检查看起来"做过了"。
+		for _, d := range []string{
+			o.Resolver.XDG["CONFIG_HOME"], o.Resolver.XDG["DATA_HOME"], o.Resolver.XDG["STATE_HOME"],
+		} {
+			out = append(out, Real(d))
+		}
 	}
 	return out
 }

@@ -232,7 +232,11 @@ func (r *PathResolver) PublicDirs() []string {
 				// 用户把某个公共目录指到了家目录本身：那不是公共目录，是家目录。
 				continue
 			}
-			configured[strings.TrimSuffix(k, "_DIR")] = v
+			// 键名是 `XDG_DOWNLOAD_DIR`：先剥 `XDG_` 再剥 `_DIR`，得到
+			// `DOWNLOAD`。只剥 `_DIR` 会留下 `XDG_DOWNLOAD`，下面按 `DOWNLOAD`
+			// 查表永远查不到——中文系统上 `~/下载` 就再也不会被认成公共目录，
+			// 而那正是"公共文件必须共享"这条第一原则的判据来源。
+			configured[strings.TrimSuffix(strings.TrimPrefix(k, "XDG_"), "_DIR")] = v
 		}
 	}
 	seen := map[string]bool{}

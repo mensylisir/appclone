@@ -4,7 +4,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"sort"
 	"strings"
 )
 
@@ -54,8 +53,10 @@ func (e *Env) trashable(p string) bool {
 	}
 	clean := filepath.Clean(p)
 	for _, pre := range e.trashPrefixes() {
+		// 必须是前缀的**真子项**：`clean == pre` 意味着要删整个 instances/
+		// 或整个 profiles.d/，那不是任何一次用户操作该产生的结果。
 		// 注意参数序：IsUnder(parent, child)。
-		if clean == pre || IsUnder(pre, clean) {
+		if clean != pre && IsUnder(pre, clean) {
 			return true
 		}
 	}
@@ -101,12 +102,9 @@ func (e *Env) Trash(paths ...string) error {
 	if t == nil {
 		t = Trash
 	}
-	// gio 一次收多个路径时按参数顺序处理，失败到中途会留下"删了一半"。
-	// 逐个调用只为让错误能指出是哪一个失败了；顺序按深度降序，先删子项
-	// 再删父项，避免父项先被搬走导致子项路径失效。
-	sort.SliceStable(keep, func(i, j int) bool {
-		return pathDepth(keep[i]) > pathDepth(keep[j])
-	})
+	// 按调用方给的顺序逐个调用：错误能指出是哪一个失败了（gio 一次收多个路径
+	// 时，中途失败只会给一句泛泛的 stderr）。顺序由调用方决定，`rm` 传的是
+	// "入口在前、实例在后"——入口失败时实例还在，还能用 repair-desktop 补回来。
 	for _, p := range keep {
 		if err := t(p); err != nil {
 			return err

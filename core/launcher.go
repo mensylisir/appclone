@@ -140,12 +140,10 @@ func (e *Env) renderLauncher(in Instance, d App) ([]byte, error) {
 }
 
 // RemoveLauncher 把入口移入回收站（与实例同一套删除语义）。
+// 走 Env.Trash 而不是裸 Trasher：后者会绕过删除白名单，成为一条"看起来有校验、
+// 实际没有"的旁路。
 func (e *Env) RemoveLauncher(app, id string) error {
-	p := e.LauncherPath(app, id)
-	if _, err := os.Stat(p); err != nil {
-		return nil
-	}
-	return e.Trasher(p)
+	return e.Trash(e.LauncherPath(app, id))
 }
 
 // escapeDesktopValue 转义 .desktop 值里的 \、换行、制表符。

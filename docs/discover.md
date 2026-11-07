@@ -297,12 +297,16 @@ GUI 只对用户说"打开应用用一下，然后关掉"，两轮循环由工�
 档案落点 = `ProfileFromCandidates`。三处的断言在 `core/classify_test.go`。
 **任何视图层不得重写这套判断**——两套判断分叉的最终表现是"界面显示会隔离，实际没进 `paths`"。
 
+归并还有两条实现口径（都对应上面 §3.2.4 的要求）：**XDG 根的祖先**（`~/.local`、`~/.var`）
+一律剔除，勾中 `~/.var` 会把所有 Flatpak 应用的数据一起隔离；`Observed` 只数**非目录条目**
+（目录只是被顺带造出来的），否则屏3 的「N 个写入条目」会偏大。
+
 | 匹配规则 | 分类 | 默认勾选 | 依据 |
 |---|---|---|---|
 | `~/.config/*`、`~/.local/share/*`、`~/.var/app/*` | 配置/数据 | ✅ 隔离（**见下方例外**） | XDG 规范目录，天然属于应用自身状态 |
 | 路径**某一段**是 `cache` / `.cache`（大小写不敏感，只看主目录之内的部分） | 缓存 | ❌ 不隔离 | 丢失只影响首启速度；隔离则双份缓存。**按"段"而不是子串**：`CacheManager/` 里的 cache 只是名字的一部分，子串匹配会把整个应用目录错判成缓存、默认不勾 |
 | XDG 公共目录（**Desktop**/Downloads/Documents/Pictures/Music/Videos/Public/Templates，共 8 项，实际清单解析 `~/.config/user-dirs.dirs`） | 公共 | ❌ 强制排除 | 项目核心语义：公共文件必须共享（见方案设计 §1）；进入 `paths` 视为档案非法 |
-| 共享可写文件（`recently-used.xbel`、gtk bookmarks、输入法状态） | 共享可写 | ❌ 不隔离，进 `shared_writes` | 隔离后功能会坏（输入法失效、书签消失）；两实例互相追加是可接受代价，但要在界面说明（方案设计 §5.4） |
+| 共享可写文件（`recently-used.xbel`、gtk bookmarks、输入法状态） | 共享可写 | ❌ 不隔离，进 `shared_writes` | 隔离后功能会坏（输入法失效、书签消失）；两实例互相追加是可接受代价，但要在界面说明（方案设计 §5.4）。**实现上按"目录"硬排除**：`~/.config/fcitx5`、`~/.config/fcitx`、`~/.config/ibus`、`~/.config/gtk-3.0`、`~/.config/gtk-4.0`。理由是归并把条目收成"XDG 根下第一级"，只认文件级名字会在归并这一步丢掉——`bookmarks` 被并进 `~/.config/gtk-3.0` 后，目录按 config 勾选，隔离照样生效、书签照样消失 |
 | keyring / Secret Service（凭证） | **不可隔离** | ❌ 标 `unsupported` | 凭证存在 DBus 服务里，不在文件路径上——**不进 `shared_writes`**（那是"可共享但可写"的白名单，放进去会让 `doctor --verify` 对账口径失效）；见方案设计 §5.4/§9 |
 | `~/.<name>` 顶层点目录 | 灰区 | ⚠️ 人工确认 | 硬编码路径的重点难点，交给屏3 勾选 |
 | `/var`、`/opt`、`/etc` 下路径 | 系统级 | ⚠️ 进 `extra_binds` 提示 | 方案设计 §9：写 /etc 的应用不建议分身 |

@@ -70,6 +70,11 @@ func (r *PathResolver) sharedWriteDirs() []string {
 		filepath.Join(r.XDG["CONFIG_HOME"], "fcitx5"),
 		filepath.Join(r.XDG["CONFIG_HOME"], "fcitx"),
 		filepath.Join(r.XDG["CONFIG_HOME"], "ibus"),
+		// GTK 的配置目录整体算共享：它的内容几乎全是"会话级共享状态"
+		// （bookmarks、最近使用、打印设置），而应用自己的配置在 dconf 里，
+		// 不在这个目录。整体隔离它换来的是"书签没了"。
+		filepath.Join(r.XDG["CONFIG_HOME"], "gtk-3.0"),
+		filepath.Join(r.XDG["CONFIG_HOME"], "gtk-4.0"),
 	}
 }
 

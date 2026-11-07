@@ -95,7 +95,7 @@ func newDoctorCmd(a *app) *cobra.Command {
 		},
 	}
 	c.Flags().BoolVar(&strict, "strict", false, "必需项失败时返回退出码 3")
-	c.Flags().BoolVar(&verify, "verify", false, "对账上次运行的审计证据（本版本只会给出 unverified）")
+	c.Flags().BoolVar(&verify, "verify", false, "对账审计证据给出隔离结论（无证据时只给 unverified，不是通过）")
 	return c
 }
 
@@ -113,34 +113,83 @@ func (a *app) runVerify(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
+	// coverage 按 §11 的 schema 给字符串（脚本与测试都读它）：单一路径就是
+	// `$HOME`，多路径用「、」拼接。数组形态另放 coverage_paths，方便排障。
+	coverage := "$HOME"
+	if len(v.Coverage) != 1 || v.Coverage[0] != a.env.Resolver.Home {
+		coverage = strings.Join(v.Coverage, "、")
+	}
 	a.ok(map[string]any{
-		"conclusion": v.Conclusion,
-		"coverage":   v.Coverage,
-		"violations": v.Violations,
-		"ignored":    v.Ignored,
-		"retained":   v.Retained,
-		"reason":     v.Reason,
+		"conclusion":     v.Conclusion,
+		"coverage":       coverage,
+		"coverage_paths": v.Coverage,
+		"violations":     v.Violations,
+		"ignored":        v.Ignored,
+		"retained":       v.Retained,
+		"reason":         v.Reason,
 	}, func() {
-		switch v.Conclusion {
-		case core.VerdictVerified:
-			fmt.Println("结论：verified（本次审计未发现越界写入）")
-			fmt.Printf("覆盖范围：%s 之内的写入\n", strings.Join(v.Coverage, "、"))
-		case core.VerdictLeak:
-			fmt.Printf("结论：leak-detected（%d 处写到了隔离范围之外）\n", len(v.Violations))
+		switch {
+		case v.Conclusion == core.VerdictVerified:
+			fmt.Println("结论：verified（本次审计覆盖到了写入，且都在声明范围内）")
+			fmt.Printf("覆盖范围：%s 之内的写入\n", coverage)
+		case v.Conclusion == core.VerdictLeak:
+			fmt.Printf("结论：leak-detected（%d 处写到了声明范围之外）\n", len(v.Violations))
 			for _, p := range v.Violations {
 				fmt.Println("  " + p)
 			}
-			fmt.Println("证据已保留在实例的 audit/ 目录里，没有删除。建议重新探测后再运行。")
+			fmt.Println("证据已保留在实例子目录 audit/ 里，没有删除。建议重新探测后再运行。")
 		default:
-			fmt.Println("结论：unverified（未开启运行期审计，无法判定是否有越界写入）")
-			fmt.Println("这不是通过。要拿到结论需要先用 --audit 跑一次（本版本尚未实现）。")
-			fmt.Printf("覆盖范围：%s 之内的写入\n", strings.Join(v.Coverage, "、"))
+			// unverified 的下一步取决于原因：跑过一次崩掉的和从没跑过的
+			// 是完全不同的两件事，共用一句"未开启审计"等于什么都没说。
+			fmt.Printf("结论：unverified（%s）\n", unverifiedWhy(v.Reason))
+			switch v.Reason {
+			case "audit_incomplete":
+				fmt.Println("上次审计没有正常结束（缺 run.toml 或 upper 被删），证据不完整，因此不下结论。")
+				fmt.Println("证据已保留，没有删除；可以重新跑一次 --audit。")
+			case "no_writes":
+				fmt.Println("审计跑了，但这次没有观测到任何写入，无法判断隔离是否有效。")
+				fmt.Println("空集不算通过。请把应用真正用一遍再审计一次。")
+			case "audit_unreadable":
+				fmt.Println("已存的审计摘要读不出来（文件损坏），因此不下结论；摘要已保留。")
+			case "extract_failed":
+				fmt.Println("审计层本该把公共目录 / 数据目录 bind 回真实位置，但它们的路径出现在隔离层里——")
+				fmt.Println("说明摘出没有生效，本次审计作废。**先别清理 quarantine**，检查 ~/Downloads 等目录是否缺文件。")
+				for _, p := range v.Violations {
+					fmt.Println("  " + p)
+				}
+			default:
+				fmt.Println("本版本还没有审计写入器（run --audit），没有证据就无法归因。")
+				fmt.Println("这不是通过：没有证据不等于没有泄漏。")
+			}
+			fmt.Printf("覆盖范围：%s 之内的写入\n", coverage)
+		}
+		if v.Retained {
+			fmt.Println("证据保留：是（audit/ 目录未清理）")
+		}
+		if len(v.Ignored) > 0 {
+			// §5：审计输出必须列出被忽略的类别，不许悄悄忽略。
+			fmt.Printf("已忽略的类别：%s\n", strings.Join(v.Ignored, "、"))
 		}
 	})
 	if code := v.ExitCode(); code != core.CodeOK {
 		os.Exit(code)
 	}
 	return nil
+}
+
+// unverifiedWhy 把 reason 代号翻成一句话。没有 case 落到"未开启审计"。
+func unverifiedWhy(reason string) string {
+	switch reason {
+	case "audit_incomplete":
+		return "上次审计未正常结束"
+	case "no_writes":
+		return "审计跑了但没有观测到写入"
+	case "audit_unreadable":
+		return "已存的审计摘要无法解析"
+	case "extract_failed":
+		return "审计层的目录摘出没有生效，本次审计作废"
+	}
+	return "未开启运行期审计，无法判定"
 }
 
 // required 区分"没有它产品起不来"和"没有它只是降级"。
@@ -214,10 +263,18 @@ func runChecks(a *app) []check {
 		add("libadwaita", st, dt)
 	}
 
-	// 数据目录可写性：只读检查，不写探针文件——doctor 是只读命令，
-	// 往 AC_BASE 里写东西超出了 §4 的写入白名单。
-	if err := os.MkdirAll(a.env.Base, 0o700); err != nil {
-		add("state-dir", "fail", "数据目录不可创建："+a.env.Base)
+	// 数据目录可写性：doctor 是**只读**命令，不创建目录、不写探针文件——
+	// 那超出了 §4 的写入白名单，而且一个"检查环境"的命令顺手改环境会让人不敢用。
+	if _, err := os.Stat(a.env.Base); err != nil {
+		if os.IsNotExist(err) {
+			if parent := filepath.Dir(a.env.Base); unix.Access(parent, unix.W_OK) != nil {
+				add("state-dir", "fail", "数据目录的上级不可写："+parent)
+			} else {
+				add("state-dir", "warn", "数据目录还不存在（首次运行时会创建）："+a.env.Base)
+			}
+		} else {
+			add("state-dir", "fail", "数据目录不可访问："+a.env.Base)
+		}
 	} else if err := unix.Access(a.env.Base, unix.W_OK); err != nil {
 		add("state-dir", "fail", "数据目录不可写："+a.env.Base)
 	} else {

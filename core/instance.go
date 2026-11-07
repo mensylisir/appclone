@@ -182,10 +182,28 @@ func (e *Env) prepareBindTargets(p Profile, in Instance) (created []string, err 
 		if err != nil {
 			return fail(err)
 		}
+		// 宿主侧目标：目录 0700，文件 0600。
+		//
+		// **必须按宿主的实际形态建**：`~/.config/mimeapps.list`、`~/.apprc` 这类
+		// 直接写在 XDG 根或 $HOME 下的**单体文件**同样是应用状态（§3.2.4 明说
+		// "不能只 find -type d"）。把它们在实例里建成目录，bwrap 就是
+		// "目录 bind 到文件目标"，整条命令失败，而用户看到的是"应用起不来"。
+		st, statErr := os.Stat(abs)
+		isFile := statErr == nil && !st.IsDir()
+		if isFile {
+			if err := os.MkdirAll(filepath.Dir(src), 0o700); err != nil {
+				return fail(errEnv("err.env.mkdir", map[string]any{"path": src}, err))
+			}
+			f, err := os.OpenFile(src, os.O_CREATE|os.O_WRONLY, 0o600)
+			if err != nil {
+				return fail(errEnv("err.env.write", map[string]any{"path": src}, err))
+			}
+			f.Close()
+			continue
+		}
 		if err := os.MkdirAll(src, 0o700); err != nil {
 			return fail(errEnv("err.env.mkdir", map[string]any{"path": src}, err))
 		}
-		// 宿主侧目标：目录 0700。
 		if _, statErr := os.Stat(abs); os.IsNotExist(statErr) {
 			made, err := mkdirAllTracked(abs, 0o700)
 			created = append(created, made...)
@@ -363,13 +381,17 @@ func (e *Env) DeleteInstance(ctx context.Context, app, id string) error {
 	}
 	defer unix.Flock(int(f.Fd()), unix.LOCK_UN)
 
-	paths := []string{e.InstancePath(app, id)}
+	// 先删入口、再删实例：反过来的话，一旦入口这一步失败，用户就在概览里
+	// 留着一个指向不存在实例的死图标——而 repair-desktop 只重建"有实例"的入口，
+	// 修不了它。反过来（入口先没、实例还在）还能靠 repair-desktop 补回来。
+	paths := make([]string, 0, 2)
 	if lp := e.LauncherPath(app, id); lp != "" {
 		if _, err := os.Stat(lp); err == nil {
 			paths = append(paths, lp)
 		}
 	}
-	// 走 Env.Trash 而不是直接 Trasher：它会先断言两个路径都落在 appclone
+	paths = append(paths, e.InstancePath(app, id))
+	// 走 Env.Trash 而不是直接 Trasher：它会先断言路径都落在 appclone
 	// 自己的范围内（§6.3 第 775 行），越界报 5 而不是交给 gio 碰运气。
 	return e.Trash(paths...)
 }

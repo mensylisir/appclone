@@ -33,16 +33,39 @@ type Verdict struct {
 
 // ExitCode 是结论对应的退出码：只有 leak-detected 是失败（8）。
 // verified 与 unverified 都是 0——后者是"不知道"，不是"出错"（§6.3）。
+// 例外是 `extract_failed`：公共目录/AC_BASE/shared_writes 出现在 upper 里，
+// 说明审计层的摘出没生效，这次审计本身作废（退出 4，§6.5 反向断言）。
 func (v Verdict) ExitCode() int {
-	if v.Conclusion == VerdictLeak {
+	switch {
+	case v.Conclusion == VerdictLeak:
 		return CodeLeak
+	case v.Reason == "extract_failed":
+		return CodeProbe
 	}
 	return CodeOK
 }
 
-// AuditDir 返回实例的审计目录（证据元数据 + upper）。
+// AuditDir 返回实例的审计目录：**只放轻量证据元数据**
+// （run.toml / summary.toml / quarantine-*），不含 upper。
 func (e *Env) AuditDir(app, id string) string {
 	return filepath.Join(e.InstancePath(app, id), "audit")
+}
+
+// AuditWorkDir 是审计 overlay 的写层位置（§4.4/§6.5）：`upper/`、`work/`、`merged/`
+// 必须在有效 HOME **之外**——overlay 的 upper 落在它自己的 lower 里会 ELOOP，
+// 而且 AC_BASE 默认就在 `$HOME` 内。所以这里落在 `/var/tmp`，与实例目录分开。
+func (e *Env) AuditWorkDir(app, id string) string {
+	return filepath.Join("/var/tmp", "appclone", fmt.Sprintf("audit.%d", e.UID), app+"."+id)
+}
+
+// upperDir 定位要读的 upper：优先标准位置（审计写层），回退到实例内的
+// `audit/upper`（写入器落地前，手工排障与测试把证据放这里）。
+func (e *Env) upperDir(app, id string) string {
+	work := filepath.Join(e.AuditWorkDir(app, id), "upper")
+	if _, err := os.Stat(work); err == nil {
+		return work
+	}
+	return filepath.Join(e.AuditDir(app, id), "upper")
 }
 
 // Verify 判定"这个分身有没有写到实例目录之外"（§6.5）。
@@ -76,14 +99,18 @@ func (e *Env) Verify(app, id string) (Verdict, error) {
 	if err != nil {
 		return Verdict{}, err
 	}
-	// 档案里没写 ignored 时补默认值：不给默认噪声白名单，任何真实应用都会"泄漏"
-	// （正常启动就写 ~/.cache），结论会变成噪声而不是信号（§5）。
-	if len(p.Ignored) == 0 {
+	// 档案里"没写 ignored"时补默认值：不给默认噪声白名单，任何真实应用都会
+	// "泄漏"（正常启动就写 ~/.cache），结论会变成噪声而不是信号（§5）。
+	//
+	// 只补**缺字段**，不碰显式空数组：`ignored = []` 是用户关掉噪声白名单的
+	// 选择，把它覆盖成默认值等于静默推翻用户意图（§5.5"缺字段用默认值，
+	// 非法值报错"——在这里 nil 才是"没写"）。
+	if p.Ignored == nil {
 		p.Ignored = DefaultIgnored()
 	}
 
 	audit := e.AuditDir(app, id)
-	entries, present, err := readUpperTree(filepath.Join(audit, "upper"))
+	entries, present, err := readUpperTree(e.upperDir(app, id))
 	if err != nil {
 		return Verdict{}, err
 	}
@@ -110,6 +137,10 @@ func (e *Env) Verify(app, id string) (Verdict, error) {
 		// 重放时也不改 Retained：摘要里写着证据留没留。
 		summary.Ignored = p.Ignored
 		return summary, nil
+	case !present && runInfo:
+		// 有 run.toml 却没有 upper：upper 被误删或审计层中途崩了。
+		// 这是"证据不完整"，不是"从没审计"——两者的下一步完全不同。
+		return unverified("audit_incomplete", true), nil
 	case !present:
 		// 从没审计过。这是当前版本的常态：没有审计写入器（run --audit 未实现）。
 		return unverified("audit_not_enabled", false), nil
@@ -191,58 +222,85 @@ func fileExists(p string) bool {
 // （摘出后不该出现，出现了说明摘出失效，那本身是泄漏，所以**不**在白名单里，
 // 见下）、`AC_BASE`（工具自己的写入）。
 func (e *Env) Judge(p Profile, entries []UpperEntry) Verdict {
-	// 预期可写范围。
-	var allowed []string
-	add := func(list []string) {
+	// 三档范围，优先级即顺序（§6.5）：
+	//  ① 摘出失效档：公共目录 / AC_BASE / shared_writes 本该被 bind 回真实路径，
+	//    它们出现在 upper 里就说明摘出没生效——此时任何结论都不算数（退出 4）。
+	//    这一档必须排在对账之前：否则摘出失效会被当成"预期共享"，而下一轮
+	//    "verified 才删 upper" 就会把用户文件一起删掉。
+	//  ② 通过档：paths（已隔离，写进去也等于隔离生效）、unsupported（不在
+	//    文件路径上，用路径判定没有意义）、ignored（噪声类别，本来就该进 upper）。
+	//  ③ 其余 → 越界。
+	var mustExtract, allowed []string
+	expandInto := func(dst *[]string, list []string) {
 		for _, raw := range list {
 			if abs, err := e.Resolver.Expand(raw); err == nil {
-				allowed = append(allowed, abs)
+				*dst = append(*dst, abs)
 			}
 		}
 	}
-	add(p.Ignored)
-	add(p.SharedWrites)
+	expandInto(&mustExtract, p.SharedWrites)
+	for _, pub := range e.Resolver.PublicDirs() {
+		mustExtract = append(mustExtract, pub)
+	}
 	if e.Base != "" {
-		allowed = append(allowed, e.Base)
+		mustExtract = append(mustExtract, e.Base)
+	}
+	expandInto(&allowed, p.Paths)
+	expandInto(&allowed, p.Ignored)
+	for _, u := range p.Unsupported {
+		if u.Path != "" {
+			expandInto(&allowed, []string{u.Path})
+		}
 	}
 
-	// 先收候选越界项（绝对路径 → 去重）。
+	v := Verdict{
+		Conclusion: VerdictVerified,
+		Coverage:   []string{e.Resolver.Home},
+		Violations: []string{},
+		Ignored:    p.Ignored,
+	}
 	seen := map[string]bool{}
-	var cand []string
+	var extractFailed []string
+	var leaked []string
 	for _, en := range entries {
 		abs := filepath.Clean(filepath.Join(e.Resolver.Home, filepath.FromSlash(en.Path)))
 		if !IsUnder(e.Resolver.Home, abs) || seen[abs] {
 			continue
 		}
-		// 公共目录的优先级最高，**压过 shared_writes**：审计层把这些目录 bind 回
-		// 真实位置，它们出现在 upper 里就说明摘出失效——那是第一红线，不许被
-		// 档案里的 shared_writes 洗白（§6.5 准入条件）。
-		if !e.Resolver.isPublic(abs) {
-			if underAny(abs, allowed...) {
-				continue
-			}
-			// 父目录是被子项"顺带"造出来的（`.config` 只因 `.config/X/y` 存在），
-			// 它本身不是一次写入，报出来只会淹没真正的那条。
-			if ancestorOfAny(abs, entries, e.Resolver.Home) {
-				continue
-			}
-		}
 		seen[abs] = true
-		cand = append(cand, abs)
+		// 父目录是被子项"顺带"造出来的（`.config` 只因 `.config/X/y` 存在），
+		// 它本身不是一次写入，报出来只会淹没真正的那条。
+		isAncestor := ancestorOfAny(abs, entries, e.Resolver.Home)
+		if underAny(abs, mustExtract...) {
+			if !isAncestor {
+				extractFailed = append(extractFailed, abs)
+			}
+			continue
+		}
+		if underAny(abs, allowed...) {
+			continue
+		}
+		if isAncestor {
+			continue
+		}
+		leaked = append(leaked, abs)
 	}
 
-	// cand 已经是最深的那批：父项在上一轮就被剔掉了，用户看到的正是
-	// "哪里真的写了文件"（也是从 quarantine 里找回文件的位置）。
-	// cand 的顺序是 walk 顺序，下面统一排序。
-	v := Verdict{
-		Conclusion: VerdictVerified,
-		Coverage:   []string{e.Resolver.Home},
-		Violations: append([]string{}, cand...),
-		Ignored:    p.Ignored,
+	if len(extractFailed) > 0 {
+		sort.Strings(extractFailed)
+		return Verdict{
+			Conclusion: VerdictUnverified,
+			Coverage:   []string{e.Resolver.Home},
+			Violations: extractFailed,
+			Ignored:    p.Ignored,
+			Retained:   true,
+			Reason:     "extract_failed",
+		}
 	}
-	if len(v.Violations) > 0 {
-		sort.Strings(v.Violations)
+	if len(leaked) > 0 {
+		sort.Strings(leaked)
 		v.Conclusion = VerdictLeak
+		v.Violations = leaked
 		// 越界文件就在 upper 里：此刻删证据等于销毁用户数据。
 		v.Retained = true
 	}
@@ -291,6 +349,9 @@ func readUpperTree(dir string) (entries []UpperEntry, present bool, err error) {
 			kind = EntryDir
 		case strings.HasPrefix(d.Name(), ".wh."):
 			kind = EntryWhiteout
+			// `.wh.foo` 指的是 `foo` 被删了：去掉前缀再记录，否则对账会把
+			// 一个叫 `.wh.foo` 的"路径"报成越界，恢复提示也会指向不存在的文件。
+			rel = filepath.Join(filepath.Dir(rel), strings.TrimPrefix(d.Name(), ".wh."))
 		case d.Type()&fs.ModeDevice != 0 && d.Type()&fs.ModeCharDevice != 0:
 			kind = EntryWhiteout // overlayfs 的 whiteout：字符设备 0,0
 		}

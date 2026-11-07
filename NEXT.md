@@ -54,6 +54,27 @@ GUI 方向定案：**GTK4 + libadwaita 原生控件，经 puregotk 绑定（零 
 
 ## 最近完成
 
+- 2026-11-07 **第十四轮：实现审查判 REJECTED 后的修复**（1 P0 + 8 P1，其余记入待办）：
+  - **P0 公共目录清单一直在退化**：`user-dirs.dirs` 的键是 `XDG_DOWNLOAD_DIR`，解析只剥了 `_DIR`
+    留下 `XDG_DOWNLOAD`，而查表用 `DOWNLOAD` → 永远查不到，`PublicDirs()` 一直只返回英文默认名。
+    中文系统的 `~/下载` 因此既不被判公共目录、也不挡 `paths`（第一原则的判据来源失效）。
+    已修 + 断言（临时 `user-dirs.dirs` 写 `$HOME/下载` 后必须命中）。
+  - **硬排除被归并抹掉**（P1）：`bookmarks` 是文件级 shared，归并成 `~/.config/gtk-3.0` 后又按
+    config 勾选 → 集成隔离、书签消失。改为"目录内的条目是 shared 就把目录升级成 shared"，
+    并把 `gtk-3.0`/`gtk-4.0`/`fcitx5`/`ibus` 直接列进硬排除表。
+  - **单体文件进 paths 会炸**（P1）：`~/.config/mimeapps.list`、`~/.apprc` 在实例里被 `MkdirAll`
+    建成目录，bwrap 就成了"目录 bind 到文件目标"，整条命令失败。改为按宿主实际形态建文件占位。
+  - **XDG 根的祖先成了候选**（P1）：`~/.local`、`~/.var` 只因下级有写入而出现在 upper，
+    勾中 `~/.var` 会隔离所有 Flatpak 数据。已在 `ownerOf` 里剔除。
+  - **verify 的假通过**（P1 ×3）：`ignored`/`shared_writes` 从不校验，写 `~` 进去等于全部放行
+    → 新增 `err.profile.blanket_path`；`paths`/`unsupported` 漏出通过档；摘出失效（公共目录 /
+    AC_BASE / shared_writes 出现在 upper）过去被当成"预期共享"→ 改为 `extract_failed`（退出 4、保留现场）。
+  - 其余：`.wh.` whiteout 去掉前缀再对账；`ignored` 只补缺失不覆盖显式空数组；`RemoveLauncher`
+    绕过删除白名单；白名单不再接受前缀本身；`rm` 改为先删入口再删实例（否则留下死图标，
+    `repair-desktop` 修不了）；`doctor` 不再 `MkdirAll` 数据目录（它宣称只读）。
+  - **仍未修（记在待办）**：软链 XDG 根时归并会退化成灰区、`summary.toml` 的 `ignored`/时间字段、
+    `libVersion` 对 libadwaita 仍可能猜出版本、`Shared`/`State` 与 `DefaultIgnored` 的口径冲突、
+    CLI 人类文案未 i18n（全仓既有问题）。
 - 2026-11-07 **第十三轮：`doctor --verify` 从桩变成判定引擎**（缺的只剩证据生产者）：
   - `core/verify.go`：`Verify` 把 §6.5 表格的六种情形全实现——从没审计（`audit_not_enabled`）、
     upper 有而 `run.toml` 缺（`audit_incomplete`）、空 upper（`no_writes`，"空集不算通过"）、

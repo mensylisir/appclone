@@ -1,6 +1,7 @@
 package core
 
 import (
+	"os"
 	"path/filepath"
 	"testing"
 )
@@ -192,5 +193,102 @@ func TestProfileFromCandidatesSplitsFields(t *testing.T) {
 	}
 	if p.ProbeMethod != "overlay" || p.Version != ProfileVersion {
 		t.Fatalf("档案元信息没写对：%+v", p)
+	}
+}
+
+// 公共目录清单来自 ~/.config/user-dirs.dirs，键名是 `XDG_DOWNLOAD_DIR`。
+// 解析时少剥一层前缀，中文系统的 `~/下载` 就永远不被认成公共目录——
+// 而"公共目录出现在 paths 里即档案非法"这条红线全靠这份清单。
+func TestPublicDirsParsesRealUserDirsFile(t *testing.T) {
+	r := classifyEnv(t)
+	cfg := filepath.Join(r.XDG["CONFIG_HOME"], "user-dirs.dirs")
+	if err := os.MkdirAll(filepath.Dir(cfg), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	body := "# written by xdg-user-dirs-update\n" +
+		"XDG_DOWNLOAD_DIR=\"$HOME/下载\"\n" +
+		"XDG_DESKTOP_DIR=\"$HOME/桌面\"\n"
+	if err := os.WriteFile(cfg, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]bool{}
+	for _, p := range r.PublicDirs() {
+		got[p] = true
+	}
+	for _, want := range []string{
+		filepath.Join(r.Home, "下载"),
+		filepath.Join(r.Home, "桌面"),
+	} {
+		if !got[want] {
+			t.Fatalf("公共目录应包含 %q，实际 %v", want, got)
+		}
+	}
+	// 配置里没写的类别仍要有默认值，否则 Documents 之类的隔离检查会漏。
+	if !got[filepath.Join(r.Home, "Documents")] {
+		t.Fatalf("未配置的类别应回退到默认名，实际 %v", got)
+	}
+	if class, checked, _, _ := r.Classify(filepath.Join(r.Home, "下载", "a.txt")); class != ClassPublic || checked {
+		t.Fatalf("中文公共目录之下应强制排除，得到 %s/%v", class, checked)
+	}
+}
+
+// bookmarks 是文件级硬排除；被归并进 `~/.config/gtk-3.0` 后如果还按 config
+// 勾选，隔离生效、书签消失——正是 §5 优先级 2 说的那种坑。
+func TestMergeUpperEscalatesSharedWriteDirs(t *testing.T) {
+	r := classifyEnv(t)
+	cands, _ := r.MergeUpper([]UpperEntry{
+		{Path: ".config/gtk-3.0/bookmarks", Kind: EntryFile},
+		{Path: ".config/gtk-3.0/gtk.css", Kind: EntryFile},
+	})
+	if len(cands) != 1 {
+		t.Fatalf("应归并成 1 条候选，得到 %+v", cands)
+	}
+	if cands[0].Class != ClassShared || cands[0].Checked {
+		t.Fatalf("含 bookmarks 的目录必须走 shared_writes（默认不勾），得到 %s/%v",
+			cands[0].Class, cands[0].Checked)
+	}
+	// 落档案时它必须进 shared_writes，不能进 paths。
+	p := r.ProfileFromCandidates("x", "overlay", cands)
+	if len(p.Paths) != 0 || len(p.SharedWrites) != 1 {
+		t.Fatalf("落点错：paths=%v shared=%v", p.Paths, p.SharedWrites)
+	}
+}
+
+// XDG 根的祖先（~/.local、~/.var）在 upper 里只因下级有写入而存在，
+// 绝不是"应用目录"：勾中 ~/.var 会把所有 Flatpak 应用的数据一起隔离。
+func TestMergeUpperDropsXdgRootAncestors(t *testing.T) {
+	r := classifyEnv(t)
+	cands, _ := r.MergeUpper([]UpperEntry{
+		{Path: ".local", Kind: EntryDir},
+		{Path: ".local/share/DingTalk/x", Kind: EntryFile},
+		{Path: ".var", Kind: EntryDir},
+		{Path: ".var/app/org.x.App/data", Kind: EntryFile},
+	})
+	want := map[string]bool{
+		filepath.Join(r.Home, ".local", "share", "DingTalk"): true,
+		filepath.Join(r.Home, ".var", "app", "org.x.App"):    true,
+	}
+	for _, c := range cands {
+		if !want[c.Path] {
+			t.Fatalf("不该出现候选 %s（XDG 根的祖先必须剔除）", c.Path)
+		}
+		delete(want, c.Path)
+	}
+	if len(want) != 0 {
+		t.Fatalf("少了候选：%v", want)
+	}
+}
+
+// Observed 是"写入条目数"：目录条目只是被顺带造出来的，不能算进去，
+// 否则屏3 的"N 个写入条目"会偏大（文案红线）。
+func TestMergeUpperCountsOnlyNonDirEntries(t *testing.T) {
+	r := classifyEnv(t)
+	cands, _ := r.MergeUpper([]UpperEntry{
+		{Path: ".config/App", Kind: EntryDir},
+		{Path: ".config/App/a.json", Kind: EntryFile},
+		{Path: ".config/App/b.json", Kind: EntryFile},
+	})
+	if len(cands) != 1 || cands[0].Observed != 2 {
+		t.Fatalf("应记 2 条写入条目，得到 %+v", cands)
 	}
 }

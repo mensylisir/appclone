@@ -247,3 +247,55 @@ func TestTimeFormatIsUTC(t *testing.T) {
 		t.Fatalf("时间必须是 RFC3339 UTC：\n%s", raw)
 	}
 }
+
+// 单体文件也是应用状态（`~/.config/mimeapps.list`、`~/.apprc`）。
+// 实例里把它建成目录，bwrap 就是"目录 bind 到文件目标"，整条命令失败——
+// 而用户看到的只是"应用起不来"。
+func TestCreateInstanceHandlesSingleFilePath(t *testing.T) {
+	e := testEnv(t)
+	app, p := seedApp(t, e)
+	if err := os.MkdirAll(filepath.Join(e.Resolver.Home, ".config"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	hostFile := filepath.Join(e.Resolver.Home, ".config", "mimeapps.list")
+	if err := os.WriteFile(hostFile, []byte("[Default Applications]\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	p.Paths = []string{"~/.config/mimeapps.list"}
+	in, err := e.CreateInstance(context.Background(), app, p, "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	src := filepath.Join(in.Root, strings.TrimPrefix(hostFile, "/"))
+	st, err := os.Stat(src)
+	if err != nil {
+		t.Fatalf("实例侧占位物不存在：%v", err)
+	}
+	if st.IsDir() {
+		t.Fatal("文件路径在实例里被建成了目录：bwrap 会把目录 bind 到文件目标，整条命令失败")
+	}
+}
+
+// ignored / shared_writes 是 verify 的白名单：写一个 `~` 或 `/` 进去，
+// 任何越界写入都会被判通过。这是最危险的一类假通过，必须在档案校验就拒掉。
+func TestValidateProfileRejectsBlanketWhitelist(t *testing.T) {
+	e := testEnv(t)
+	_, p := seedApp(t, e)
+	for _, bad := range []string{"~", "/"} {
+		p.Ignored = []string{bad}
+		if err := ValidateProfile(p, e.BuildOptions()); ExitCode(err) != CodeInput {
+			t.Fatalf("ignored=[%q] 应被拒（2），得到 %v", bad, err)
+		}
+		p.Ignored = nil
+		p.SharedWrites = []string{bad}
+		if err := ValidateProfile(p, e.BuildOptions()); ExitCode(err) != CodeInput {
+			t.Fatalf("shared_writes=[%q] 应被拒（2），得到 %v", bad, err)
+		}
+		p.SharedWrites = nil
+	}
+	// 正常值不能被误伤：公共目录写进 shared_writes 是合法的（"应用就是会写 Downloads"）。
+	p.SharedWrites = []string{"~/Downloads"}
+	if err := ValidateProfile(p, e.BuildOptions()); err != nil {
+		t.Fatalf("公共目录在 shared_writes 里应合法，得到 %v", err)
+	}
+}
