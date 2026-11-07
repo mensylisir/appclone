@@ -25,6 +25,9 @@ type Env struct {
 	CliPath string
 	// AppDirList 覆盖 .desktop 来源目录（测试注入）。空值走 AppDirs() 的三目录。
 	AppDirList []string
+	// RunCmd 覆盖"跑一个只读外部命令拿输出"（测试注入）。空值走 exec。
+	// 只有 L0 的 `flatpak info --show-permissions` 用它，所以抽成字段而不是多一层接口。
+	RunCmd func(ctx context.Context, name string, args ...string) (string, error)
 
 	mu   sync.Mutex // 进程内先互斥，再抢 flock：GUI 的探测 goroutine 与列表刷新
 	lock *os.File   // 在同一进程里各开一次会自锁（flock 是进程级的，同进程不互斥）

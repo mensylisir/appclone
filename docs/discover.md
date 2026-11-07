@@ -282,6 +282,17 @@ L2 语义分类（喂给 GUI 屏3 预勾选）
 L2 把定案结果翻译成档案语义。**strace 降级为 L1 不可用时的兜底路径**
 （该分支尚未在 Go 中实现，`legacy/` 原型仅作行为参照）。
 
+**实现（2026-11-07，`core/static.go`）**：
+- 已知模式：`~/.config/<key>`、`~/.local/share/<key>`、`~/.<key>`、`~/.var/app/<desktop-id>`，
+  **只收已存在的目录**（猜出来的空目录会让 `prepareTargets` 建一堆用户没见过的目录）；
+- AppArmor：profile 名按"可执行路径 `/`→`.`"与 basename 两种试；规则解析取**最后一个字段**为权限集
+  （`owner <path>… <perms>,` 里前面可能有多个路径——把权限当路径解析的结果是"一条也解析不出来"）；
+- Flatpak：`flatpak info --show-permissions <id>` 的 `filesystems=` 项，只取 `~` 开头；
+  `home` / `xdg-download` 这类过宽项**必须丢**，否则用户会勾出一个"隔离一切"的档案；
+- 锁文件：`SingletonLock` / `singleton.lock` / `lockfile` / `lock` / `.lock` / `LOCK`，仅普通文件
+  （目录同名不算）。它是 L0 唯一被探测直接消费的产出：bind 成空文件后，主实例在跑时应用才不会
+  把参数转发过去然后自己退出（§3.2.2）。
+
 **L0 的真实召回预期**：Arch 上 AppArmor 与 Flatpak 两项大概率都拿不到，
 L0 实际只剩"`~/.config/<id>` 模式匹配"——对守 XDG 规范的应用够用，
 对写 `~/.<app>` 的老式应用召回为零（那正是 L1 存在的理由）。**不要把 L0 描述成主力**。
