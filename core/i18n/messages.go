@@ -91,6 +91,17 @@ var messages = map[string]map[string]string{
 		"err.audit.unavailable":   "运行期审计层（--audit）还没有实现，本版本无法开启。不加这个参数可以直接运行；关闭审计不影响隔离本身。",
 		"ui.add.reconfigure_note": "「{app}」的档案已失效，正在用内置模板重建；若应用的数据目录已变化，请用「重新探测」校正。",
 
+		// 语义分类（屏3 每条候选的说明文案，discover.md §5）
+		"probe.why.config":  "应用配置或数据目录 — 建议隔离",
+		"probe.why.data":    "数据库/索引文件 — 建议隔离",
+		"probe.why.cache":   "缓存 — 默认不隔离（首次启动略慢，但省空间）",
+		"probe.why.public":  "公共目录 — 强制共享，不能隔离",
+		"probe.why.shared":  "共享可写 — 隔离后功能会坏（输入法、书签）",
+		"probe.why.keyring": "凭证在密钥服务里，不在文件系统上 — 隔离不了",
+		"probe.why.dotdir":  "写死在主目录顶层的目录 — 需要你确认里面没有你自己的文件",
+		"probe.why.system":  "系统级路径 — 不建议隔离（会改到宿主）",
+		"probe.why.unknown": "规则表没覆盖 — 需要你确认",
+
 		// 桌面入口
 		"desktop.clone_name_suffix": "（分身 {name}）",
 
@@ -179,6 +190,16 @@ var messages = map[string]map[string]string{
 		"err.probe.unavailable":   "\"{app}\" has no usable isolation profile yet, and this build does not ship the probe pipeline. Wait for the probe feature, or use an app that ships a bundled template.",
 		"err.audit.unavailable":   "The runtime audit layer (--audit) is not implemented yet in this build. Run without the flag; isolation itself is unaffected.",
 		"ui.add.reconfigure_note": "The profile for \"{app}\" was stale; rebuilding it from the bundled template. If the app's data directories moved, run Rediscover to correct it.",
+
+		"probe.why.config":  "App config or data directory — isolate",
+		"probe.why.data":    "Database/index file — isolate",
+		"probe.why.cache":   "Cache — not isolated by default (slower first launch, but saves space)",
+		"probe.why.public":  "Shared folder — must stay shared, cannot be isolated",
+		"probe.why.shared":  "Shared writable — isolating breaks features (input method, bookmarks)",
+		"probe.why.keyring": "Credentials live in the secret service, not on disk — cannot be isolated",
+		"probe.why.dotdir":  "Directory written at the top of your home — please confirm it holds no files of your own",
+		"probe.why.system":  "System path — should not be isolated (it would touch the host)",
+		"probe.why.unknown": "Not covered by the rules — please confirm",
 
 		"desktop.clone_name_suffix": " (Clone · {name})",
 

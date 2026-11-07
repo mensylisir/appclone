@@ -26,9 +26,9 @@ GUI 方向定案：**GTK4 + libadwaita 原生控件，经 puregotk 绑定（零 
 但容器内没有 `/dev/fuse` 设备节点（`mknod` 被沙箱拒），`fuse-overlayfs` 挂不起来。
 所以探测要拆成两半，先后顺序按"现在能不能验证"排：
 
-1a. **可离线验证的部分**（先做）：`upper` 条目收集与归并（纯函数：目录/单文件都算、whiteout 三形态、
-   剔除 XDG 根及其祖先）+ L2 语义分类规则表（`discover.md` §5 的有序规则，含"公共目录强制排除"
-   与"共享可写压过 ~/.config 默认勾选"两条硬优先级）→ 单测可覆盖，不需要 fuse。
+1a. **可离线验证的部分**（**已完成** 2026-11-07）：`MergeUpper`（upper 归并：取应用目录/单文件本身、
+   剔除 XDG 根、whiteout 单列、按路径稳定排序）+ `Classify`（§5 有序规则表）+ `ProfileFromCandidates`
+   （paths / shared_writes / unsupported 三落点互斥）→ `core/classify_test.go` 8 组断言。
 1b. **需要真实会话的部分**（被挡）：overlay 会话编排、strace 降级、两轮探测循环。
 
 其余路线图项（编号沿用 `docs/方案设计.md` §10）：
@@ -54,6 +54,18 @@ GUI 方向定案：**GTK4 + libadwaita 原生控件，经 puregotk 绑定（零 
 
 ## 最近完成
 
+- 2026-11-07 **第十二轮：L2 语义分类与 upper 归并落地**（探测管线里唯一能离线验证的一半）：
+  - `core/classify.go`：§5 有序规则表，先命中先定。三条硬优先级各有断言——公共目录（含其下任意路径）
+    压过一切、共享可写压过 `~/.config/*` 默认勾选、凭证进 `unsupported` 而不是 `shared_writes`。
+  - `core/upper.go`：`MergeUpper` 取"XDG 根下第一级 / `$HOME` 下第一级"，剔除 `~/.config` 这类纯父目录，
+    whiteout 单列（"删过"不是"写过"，摆给用户勾会让人去隔离一个已经删掉的路径），输出按路径排序
+    （不排序 GUI 分组会跳、golden 也无从写起）。`ProfileFromCandidates` 把候选翻成档案三落点。
+  - **踩到的坑（值得记）**：`hasCacheComponent` 最初扫整条绝对路径，结果测试环境的 `$TMPDIR`
+    恰好在 `~/.cache` 下，整棵临时树被判成缓存。改成只看主目录之内的相对段——这也正是真实
+    用户 `~/.cache` 语义该有的范围。断言抓到了它，否则线上表现是"所有路径都默认不勾"。
+  - **设计稿与实现的已知偏差（GUI 落地时必须改稿，不许照抄）**：稿子把 `~/.dingtalk` 这类顶层点目录
+    画成 `config` 且默认勾选，core 按 §5 判为 `dotdir`/`unsure`（灰区不勾）。`discover.md` §5 早已
+    写明那是演示简化，但这意味着**屏3 原生实现要新增一个 chip 与一组灰区**，不能照搬稿子的两组。
 - 2026-11-07 **第十一轮：实现审查的剩余 P1/P2 收口**（3 P0 已在上一提交修完）：
   - **删除白名单**（P1）：`Env.Trash` 先断言目标确属 `instances/`、`profiles.d/`、`appclone-*.desktop`，
     越界报 5 且**不调用 `gio`**；`LauncherPath` 与白名单共用 `LauncherDir()`，避免两处 `filepath.Join` 漂移；
