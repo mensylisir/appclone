@@ -183,10 +183,16 @@ func relUnder(parent, child string) (string, bool) {
 	if parent == child {
 		return "", true
 	}
-	if !strings.HasPrefix(child, parent+string(filepath.Separator)) {
+	// 根目录要特殊处理：`parent + "/"` 会拼成 "//"，`IsUnder("/", "/etc")` 于是
+	// 恒为 false —— 那会让"拒绝 `/`"这类判断依赖调用方自己记得补一条。
+	prefix := parent
+	if prefix != string(filepath.Separator) {
+		prefix += string(filepath.Separator)
+	}
+	if !strings.HasPrefix(child, prefix) {
 		return "", false
 	}
-	return child[len(parent)+1:], true
+	return child[len(prefix):], true
 }
 
 // IsUnder 报告 child 是否等于 parent 或位于其下。所有"危险路径"判定都靠它，

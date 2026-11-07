@@ -182,3 +182,55 @@ func TestValidateDisplayName(t *testing.T) {
 		t.Fatalf("换行应被拒，得到 %v", err)
 	}
 }
+
+// 根目录这条边界：`relUnder("/", "/etc")` 曾经恒为 false（拼出 "//"），
+// 于是"拒绝 `/`"只能靠调用方记得单独补一条 —— 漏一次就是全量放行。
+func TestIsUnderRootParent(t *testing.T) {
+	if !IsUnder("/", "/etc/passwd") {
+		t.Fatal(`IsUnder("/", "/etc/passwd") 应为 true`)
+	}
+	if IsUnder("/etc", "/etcetera") {
+		t.Fatal("前缀相同但不是子路径，不得判 true")
+	}
+	if rel, ok := relUnder("/", "/etc"); !ok || rel != "etc" {
+		t.Fatalf(`relUnder("/", "/etc") = %q,%v，期望 "etc",true`, rel, ok)
+	}
+}
+
+// ignored / shared_writes 里写"家目录的祖先"同样等于全部放行：
+// `ignored = ["/home"]` 会让 verify 对任何越界写入都说通过。
+func TestValidateProfileRejectsHomeAncestor(t *testing.T) {
+	root := t.TempDir()
+	home := "/home/appclone-test-user/u" // 刻意不存在的家目录，只验证祖先判定
+	r := newResolver(home, home, 1000, func(string) string { return "" })
+	e := NewEnvAt(filepath.Join(root, "base"), r)
+	base := Profile{Exec: "/usr/bin/true", Paths: []string{"~/.config/App"}}
+	for _, bad := range []string{"/", "/home", "/home/appclone-test-user"} {
+		p := base
+		p.Ignored = []string{bad}
+		if err := ValidateProfile(p, e.BuildOptions()); ExitCode(err) != CodeInput {
+			t.Fatalf("ignored=[%q]（家目录的祖先）应被拒（2），得到 %v", bad, err)
+		}
+	}
+	// 正常的具体目录不受影响。
+	p := base
+	p.Ignored = []string{"~/.cache"}
+	if err := ValidateProfile(p, e.BuildOptions()); err != nil {
+		t.Fatalf("正常的忽略目录应合法，得到 %v", err)
+	}
+}
+
+// 同一路径既隔离又共享：bwrap 里谁生效取决于 bind 顺序，档案必须自相矛盾才报错。
+func TestValidateProfileRejectsIsolateAndShare(t *testing.T) {
+	e := testEnv(t)
+	_, p := seedApp(t, e)
+	p.SharedWrites = []string{"~/.config/TestApp"}
+	if err := ValidateProfile(p, e.BuildOptions()); ExitCode(err) != CodeInput {
+		t.Fatalf("同时隔离与共享应被拒（2），得到 %v", err)
+	}
+	// 共享目录在隔离目录之下也算冲突（子项被父项隔离后共享就失效了）。
+	p.SharedWrites = []string{"~/.config/TestApp/cache"}
+	if err := ValidateProfile(p, e.BuildOptions()); ExitCode(err) != CodeInput {
+		t.Fatalf("共享项落在隔离目录之下也应被拒（2），得到 %v", err)
+	}
+}

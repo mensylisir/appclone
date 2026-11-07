@@ -136,7 +136,12 @@ func (e *Env) Verify(app, id string) (Verdict, error) {
 	case !present && hasSummary:
 		// upper 已被消费过：**重放**已存结论，不重新对账（§6.5 表格第 4 行）。
 		// 重放时也不改 Retained：摘要里写着证据留没留。
-		summary.Ignored = p.Ignored
+		//
+		// ignored 优先用摘要里的：那是**审计当时**的忽略清单，用现在的档案覆盖它
+		// 等于篡改证据（用户可能已经改过档案）。
+		if len(summary.Ignored) == 0 {
+			summary.Ignored = p.Ignored
+		}
 		return summary, nil
 	case !present && runInfo:
 		// 有 run.toml 却没有 upper：upper 被误删或审计层中途崩了。
@@ -194,7 +199,9 @@ func readSummary(path string) (Verdict, bool, error) {
 	var s Summary
 	// 结论必须是枚举里的三选一：手写 `conclusion = "OK"` 会被 ExitCode 当成 0
 	// （"通过"），而 CLI 的 switch 落到 default 打印 unverified —— 同一份证据两种说法。
-	if _, derr := toml.Decode(string(data), &s); derr != nil || !isVerdict(s.Conclusion) {
+	// reason 同理：它决定 CLI 说"哪种不知道"，未知值会落到错误的下一步提示。
+	if _, derr := toml.Decode(string(data), &s); derr != nil || !isVerdict(s.Conclusion) ||
+		(s.Conclusion == VerdictUnverified && !isKnownReason(s.Reason)) {
 		return Verdict{
 			Conclusion: VerdictUnverified,
 			Coverage:   []string{},
@@ -210,16 +217,20 @@ func readSummary(path string) (Verdict, bool, error) {
 	if s.Violations == nil {
 		s.Violations = []string{}
 	}
-	// 摘要自己写矛盾时按"保守"读：说泄漏却不保留证据 = 证据已经被删了，
-	// 这一点必须如实反映给用户，不能被 summary 里的 false 抹平。
-	if s.Conclusion == VerdictLeak {
-		s.Retained = true
-	}
 	return s.Verdict(), true, nil
 }
 
 func isVerdict(s string) bool {
 	return s == VerdictVerified || s == VerdictLeak || s == VerdictUnverified
+}
+
+// isKnownReason 是 unverified 的合法原因集。空串也合法（老摘要没写 reason）。
+func isKnownReason(s string) bool {
+	switch s {
+	case "", "audit_not_enabled", "audit_incomplete", "no_writes", "audit_unreadable", "extract_failed":
+		return true
+	}
+	return false
 }
 
 func fileExists(p string) bool {
@@ -235,15 +246,16 @@ func fileExists(p string) bool {
 // （摘出后不该出现，出现了说明摘出失效，那本身是泄漏，所以**不**在白名单里，
 // 见下）、`AC_BASE`（工具自己的写入）。
 func (e *Env) Judge(p Profile, entries []UpperEntry) Verdict {
-	// 三档范围，优先级即顺序（§6.5）：
-	//  ① 摘出失效档：公共目录 / AC_BASE / shared_writes 本该被 bind 回真实路径，
-	//    它们出现在 upper 里就说明摘出没生效——此时任何结论都不算数（退出 4）。
-	//    这一档必须排在对账之前：否则摘出失效会被当成"预期共享"，而下一轮
-	//    "verified 才删 upper" 就会把用户文件一起删掉。
-	//  ② 通过档：paths（已隔离，写进去也等于隔离生效）、unsupported（不在
-	//    文件路径上，用路径判定没有意义）、ignored（噪声类别，本来就该进 upper）。
+	// 两档范围，优先级即顺序（§6.5）：
+	//  ① 本该被 bind 走的路径：公共目录、AC_BASE、`shared_writes`、**`paths`**。
+	//    审计层把它们 bind 回真实位置/实例目录，它们出现在 upper 里就说明 bind
+	//    没生效——此时任何结论都不算数（`extract_failed`，退出 4，保留现场）。
+	//    `paths` 必须在这一档：应用数据落进 upper 正是"实例 bind 被公共目录 bind
+	//    盖掉"的症状，把它算通过等于把 bind 失败静默掉。
+	//  ② 通过档：`ignored`（噪声类别，本来就该进 upper）、`unsupported`（不在
+	//    文件路径上，用路径判定没有意义）。
 	//  ③ 其余 → 越界。
-	var mustExtract, allowed []string
+	var mustBind, allowed []string
 	expandInto := func(dst *[]string, list []string) {
 		for _, raw := range list {
 			if abs, err := e.Resolver.Expand(raw); err == nil {
@@ -251,14 +263,14 @@ func (e *Env) Judge(p Profile, entries []UpperEntry) Verdict {
 			}
 		}
 	}
-	expandInto(&mustExtract, p.SharedWrites)
+	expandInto(&mustBind, p.SharedWrites)
+	expandInto(&mustBind, p.Paths)
 	for _, pub := range e.Resolver.PublicDirs() {
-		mustExtract = append(mustExtract, pub)
+		mustBind = append(mustBind, pub)
 	}
 	if e.Base != "" {
-		mustExtract = append(mustExtract, e.Base)
+		mustBind = append(mustBind, e.Base)
 	}
-	expandInto(&allowed, p.Paths)
 	expandInto(&allowed, p.Ignored)
 	for _, u := range p.Unsupported {
 		if u.Path != "" {
@@ -284,7 +296,7 @@ func (e *Env) Judge(p Profile, entries []UpperEntry) Verdict {
 		// 父目录是被子项"顺带"造出来的（`.config` 只因 `.config/X/y` 存在），
 		// 它本身不是一次写入，报出来只会淹没真正的那条。
 		isAncestor := ancestorOfAny(abs, entries, e.Resolver.Home)
-		if underAny(abs, mustExtract...) {
+		if underAny(abs, mustBind...) {
 			if !isAncestor {
 				extractFailed = append(extractFailed, abs)
 			}

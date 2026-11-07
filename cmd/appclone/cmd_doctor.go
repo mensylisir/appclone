@@ -115,9 +115,18 @@ func (a *app) runVerify(cmd *cobra.Command, args []string) error {
 	}
 	// coverage 按 §11 的 schema 给字符串（脚本与测试都读它）：单一路径就是
 	// `$HOME`，多路径用「、」拼接。数组形态另放 coverage_paths，方便排障。
-	coverage := "$HOME"
-	if len(v.Coverage) != 1 || v.Coverage[0] != a.env.Resolver.Home {
+	coverage := ""
+	switch {
+	case len(v.Coverage) == 1 && v.Coverage[0] == a.env.Resolver.Home:
+		coverage = "$HOME"
+	case len(v.Coverage) > 0:
 		coverage = strings.Join(v.Coverage, "、")
+	}
+	// 覆盖范围为空（摘要损坏）时不打印"覆盖范围： 之内的写入"这种半句话。
+	coverageLine := func() {
+		if coverage != "" {
+			fmt.Printf("覆盖范围：%s 之内的写入\n", coverage)
+		}
 	}
 	a.ok(map[string]any{
 		"conclusion":     v.Conclusion,
@@ -127,17 +136,24 @@ func (a *app) runVerify(cmd *cobra.Command, args []string) error {
 		"ignored":        v.Ignored,
 		"retained":       v.Retained,
 		"reason":         v.Reason,
+		"generated_at":   v.GeneratedAt,
 	}, func() {
 		switch {
 		case v.Conclusion == core.VerdictVerified:
 			fmt.Println("结论：verified（本次审计覆盖到了写入，且都在声明范围内）")
-			fmt.Printf("覆盖范围：%s 之内的写入\n", coverage)
+			coverageLine()
 		case v.Conclusion == core.VerdictLeak:
 			fmt.Printf("结论：leak-detected（%d 处写到了声明范围之外）\n", len(v.Violations))
 			for _, p := range v.Violations {
 				fmt.Println("  " + p)
 			}
-			fmt.Println("证据已保留在实例子目录 audit/ 里，没有删除。建议重新探测后再运行。")
+			// 摘要自己说"证据没保留"时必须照实说：那意味着越界文件可能已经被删了。
+			if v.Retained {
+				fmt.Println("证据保留在实例子目录 audit/ 里，没有删除。建议重新探测后再运行。")
+			} else {
+				fmt.Println("注意：这份摘要记录为「证据未保留」——如果这不是你有意为之，越界文件可能已经无法从 audit/ 取回。")
+			}
+			coverageLine()
 		default:
 			// unverified 的下一步取决于原因：跑过一次崩掉的和从没跑过的
 			// 是完全不同的两件事，共用一句"未开启审计"等于什么都没说。
@@ -152,8 +168,9 @@ func (a *app) runVerify(cmd *cobra.Command, args []string) error {
 			case "audit_unreadable":
 				fmt.Println("已存的审计摘要读不出来（文件损坏），因此不下结论；摘要已保留。")
 			case "extract_failed":
-				fmt.Println("审计层本该把公共目录 / 数据目录 bind 回真实位置，但它们的路径出现在隔离层里——")
-				fmt.Println("说明摘出没有生效，本次审计作废。**先别清理 quarantine**，检查 ~/Downloads 等目录是否缺文件。")
+				fmt.Println("审计层本该把公共目录 / 数据目录 / 实例目录 bind 回真实位置，但它们的路径出现在隔离层里——")
+				fmt.Println("说明 bind 没有生效，本次审计作废。**先别清理 quarantine**，检查 ~/Downloads 等目录是否缺文件，")
+				fmt.Println("处理完之后重新跑一次 --audit + --verify 才是有效结论。")
 				for _, p := range v.Violations {
 					fmt.Println("  " + p)
 				}
@@ -161,7 +178,10 @@ func (a *app) runVerify(cmd *cobra.Command, args []string) error {
 				fmt.Println("本版本还没有审计写入器（run --audit），没有证据就无法归因。")
 				fmt.Println("这不是通过：没有证据不等于没有泄漏。")
 			}
-			fmt.Printf("覆盖范围：%s 之内的写入\n", coverage)
+			coverageLine()
+		}
+		if v.GeneratedAt != "" {
+			fmt.Printf("结论时间：%s（重放的已存摘要）\n", v.GeneratedAt)
 		}
 		if v.Retained {
 			fmt.Println("证据保留：是（audit/ 目录未清理）")
@@ -271,8 +291,11 @@ func runChecks(a *app) []check {
 
 	// 数据目录可写性：doctor 是**只读**命令，不创建目录、不写探针文件——
 	// 那超出了 §4 的写入白名单，而且一个"检查环境"的命令顺手改环境会让人不敢用。
-	if _, err := os.Stat(a.env.Base); err == nil {
-		if err := unix.Access(a.env.Base, unix.W_OK); err != nil {
+	if fi, err := os.Stat(a.env.Base); err == nil {
+		if !fi.IsDir() {
+			// 同名普通文件：Access(W_OK) 会说"可写"，然后第一次 add 就报错。
+			add("state-dir", "fail", "数据目录的位置被一个普通文件占着："+a.env.Base)
+		} else if err := unix.Access(a.env.Base, unix.W_OK); err != nil {
 			add("state-dir", "fail", "数据目录不可写："+a.env.Base)
 		} else {
 			add("state-dir", "ok", a.env.Base)

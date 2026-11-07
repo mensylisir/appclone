@@ -192,8 +192,8 @@ func (e *Env) prepareBindTargets(p Profile, in Instance) (created []string, err 
 		// 已知边界：宿主路径**不存在**时形态无从判断，仍按目录处理。档案记的是路径
 		// 而不是类型（§5 的 paths 是字符串数组），所以"探测时是文件、创建时已被删"
 		// 这种竞态会退化成旧行为。根治要给档案加 `path_types`，属于 schema 变更，
-		// 与探测写入器一起做；在那之前 `ValidateRunnable` 会在 run 时因为源不存在
-		// 先报 stale（退出 2），不会把错误形态带进 bwrap。
+		// 与探测写入器一起做；在那之前 `CreateInstance` 的 `ValidateRunnable` 会先
+		// 用 `profile_stale`（退出 2）拦下不存在的源，不会把错误形态带进 bwrap。
 		st, statErr := os.Stat(abs)
 		isFile := statErr == nil && !st.IsDir()
 		if isFile {

@@ -121,6 +121,15 @@ func ValidateProfile(p Profile, o BuildOptions) error {
 	// ignored 与 shared_writes 是 verify 的白名单：写一个 `~` 或 `/` 进去，
 	// `doctor --verify` 就会对**任何**越界写入都说 verified——最危险的一类假通过。
 	// 这两项过去只被读取、从没被校验（§5.5"非法值报错"）。
+	//
+	// 判定必须同时挡住**家目录本身与它的所有祖先**：只挡 `/` 和 `~` 的话，
+	// `ignored = ["/home"]`（家目录的父目录）照样放行整个主目录。而且要比
+	// 词法与真实两种形态——`Expand` 返回的是解析过软链的路径，HOME 本身是软链时
+	// 纯词法比较连 `~` 都挡不住。
+	home := ""
+	if o.Home != "" {
+		home = filepath.Clean(o.Home)
+	}
 	for _, field := range []struct {
 		name string
 		list []string
@@ -133,11 +142,36 @@ func ValidateProfile(p Profile, o BuildOptions) error {
 			if err != nil {
 				return err
 			}
+			// 根目录单独判：relUnder("/", x) 拼前缀会得到 "//"，把它漏掉。
 			if abs == "/" {
 				return errInput("err.profile.blanket_path", map[string]any{"path": raw, "field": field.name})
 			}
-			if abs == filepath.Clean(o.Home) || abs == filepath.Clean(o.RealHome) {
+			if home != "" && isUnderLoose(abs, home) {
+				// abs 是 home 本身或它的祖先：等于"全部放行"。
 				return errInput("err.profile.blanket_path", map[string]any{"path": raw, "field": field.name})
+			}
+			if o.RealHome != "" && isUnderLoose(abs, filepath.Clean(o.RealHome)) {
+				return errInput("err.profile.blanket_path", map[string]any{"path": raw, "field": field.name})
+			}
+		}
+	}
+
+	// 同一路径不能既隔离又共享：bwrap 里两条 bind 的先后决定谁生效，
+	// 结果取决于参数顺序 —— 那是"看起来设置过、实际不确定"的状态（§3.1 ⑦）。
+	for _, pp := range p.Paths {
+		pabs, err := o.expand(pp)
+		if err != nil {
+			return err
+		}
+		for _, sw := range p.SharedWrites {
+			sabs, err := o.expand(sw)
+			if err != nil {
+				return err
+			}
+			if pabs == sabs || IsUnder(pabs, sabs) || IsUnder(sabs, pabs) {
+				return errInput("err.profile.isolate_and_share", map[string]any{
+					"path": pabs, "other": sabs,
+				})
 			}
 		}
 	}
