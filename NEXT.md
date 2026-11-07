@@ -54,6 +54,19 @@ GUI 方向定案：**GTK4 + libadwaita 原生控件，经 puregotk 绑定（零 
 
 ## 最近完成
 
+- 2026-11-07 **第十三轮：`doctor --verify` 从桩变成判定引擎**（缺的只剩证据生产者）：
+  - `core/verify.go`：`Verify` 把 §6.5 表格的六种情形全实现——从没审计（`audit_not_enabled`）、
+    upper 有而 `run.toml` 缺（`audit_incomplete`）、空 upper（`no_writes`，"空集不算通过"）、
+    只剩 `summary.toml`（重放已存结论）、摘要损坏（`audit_unreadable` + 保留）、正常对账。
+    顺手补上原先漏掉的 `run.lock` 守卫（运行中读到的 upper 是半截证据 → 退出 7）。
+  - `Judge` 是纯函数：不读盘、不删任何东西。"判定"与"删不删证据"分开是刻意的——
+    判定错会误导用户，删错不可逆。公共目录出现在 upper 里**压过 `shared_writes`** 判泄漏
+    （审计层把这些目录 bind 回真实位置，它出现在 upper 就说明摘出失效，那是第一红线）；
+    被顺带造出的父目录（`.config` 只因 `.config/X/y` 存在）不单独报，否则真凶被淹没。
+  - **本版本 verify 只读**：不写 `summary.toml`、不删 upper、不做 `quarantine-*`。没有生产者时，
+    任何"删除证据"的动作只可能删掉别人放进去的东西。
+  - 冒烟：手工构造实例后 `doctor --verify` → `unverified` + `audit_not_enabled`，退出 0，
+    `--json` 的 `ignored` 是默认噪声清单（不再输出 `null`）；实例不存在 → 5。
 - 2026-11-07 **第十二轮：L2 语义分类与 upper 归并落地**（探测管线里唯一能离线验证的一半）：
   - `core/classify.go`：§5 有序规则表，先命中先定。三条硬优先级各有断言——公共目录（含其下任意路径）
     压过一切、共享可写压过 `~/.config/*` 默认勾选、凭证进 `unsupported` 而不是 `shared_writes`。

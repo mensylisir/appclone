@@ -101,29 +101,45 @@ func newDoctorCmd(a *app) *cobra.Command {
 
 // runVerify 是 doctor --verify 的实现口径（§6.5）。
 //
-// 关键点：运行期审计层还没实现，所以这里**只能**给 unverified——"没有证据"不等于
-// "没有泄漏"。把它显示成通过，会让用户以为隔离被验证过（这是本产品最不该犯的错）。
+// 判定本身在 core（`Env.Verify`/`Env.Judge`），这里只负责把结论翻成人话与退出码。
+// 本版本没有审计写入器，正常情况下结论必然是 unverified——**"没有证据"不等于
+// "没有泄漏"**，把它显示成通过会让用户以为隔离被验证过（本产品最不该犯的错）。
 func (a *app) runVerify(cmd *cobra.Command, args []string) error {
 	if len(args) < 2 {
 		return core.NewUsage("doctor --verify 需要 <app> <id>")
 	}
 	appKey, id := args[0], args[1]
-	if _, err := a.env.GetInstance(appKey, id); err != nil {
+	v, err := a.env.Verify(appKey, id)
+	if err != nil {
 		return err
 	}
-	data := map[string]any{
-		"conclusion": "unverified",
-		"coverage":   "$HOME",
-		"violations": []string{},
-		"ignored":    core.DefaultIgnored(),
-		"retained":   false,
-		"reason":     "audit_not_enabled",
-	}
-	a.ok(data, func() {
-		fmt.Println("结论：unverified（未开启运行期审计，无法判定是否有越界写入）")
-		fmt.Println("这不是通过。要拿到结论需要先用 --audit 跑一次（本版本尚未实现）。")
-		fmt.Println("覆盖范围：$HOME 之内的写入")
+	a.ok(map[string]any{
+		"conclusion": v.Conclusion,
+		"coverage":   v.Coverage,
+		"violations": v.Violations,
+		"ignored":    v.Ignored,
+		"retained":   v.Retained,
+		"reason":     v.Reason,
+	}, func() {
+		switch v.Conclusion {
+		case core.VerdictVerified:
+			fmt.Println("结论：verified（本次审计未发现越界写入）")
+			fmt.Printf("覆盖范围：%s 之内的写入\n", strings.Join(v.Coverage, "、"))
+		case core.VerdictLeak:
+			fmt.Printf("结论：leak-detected（%d 处写到了隔离范围之外）\n", len(v.Violations))
+			for _, p := range v.Violations {
+				fmt.Println("  " + p)
+			}
+			fmt.Println("证据已保留在实例的 audit/ 目录里，没有删除。建议重新探测后再运行。")
+		default:
+			fmt.Println("结论：unverified（未开启运行期审计，无法判定是否有越界写入）")
+			fmt.Println("这不是通过。要拿到结论需要先用 --audit 跑一次（本版本尚未实现）。")
+			fmt.Printf("覆盖范围：%s 之内的写入\n", strings.Join(v.Coverage, "、"))
+		}
 	})
+	if code := v.ExitCode(); code != core.CodeOK {
+		os.Exit(code)
+	}
 	return nil
 }
 
