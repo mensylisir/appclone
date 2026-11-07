@@ -4,9 +4,10 @@
 # 为什么需要这个脚本：开发沙箱里没有 /dev/fuse，overlay 挂不起来，所以探测的
 # 挂载/会话部分只能在真机上验。这个脚本用假 HOME 走完整条链路：
 #   挂载 → 会话 → 收集 upper → 归并 → 落档案 → 建实例 → 删除
-# 并且专门验证两件最容易做错的事：
+# 并且专门验证三件最容易做错的事：
 #   ① 公共目录摘出真的生效（往 ~/Downloads 存一个哨兵文件，探测后必须还在）
 #   ② 探测结束后没有残留挂载点（残留会让下一次探测 EBUSY）
+#   ③ 审计层跑完后 verify 真能读到证据并给出结论（而不是永远 unverified）
 #
 # 用法：design/probe-smoke.sh [appclone 可执行文件路径]
 set -euo pipefail
@@ -102,8 +103,25 @@ inst=$(find "$AC_BASE/instances/probedemo" -maxdepth 1 -mindepth 1 -type d | hea
 [ -d "$inst/root" ] || { echo "实例里没有 root/（持久写层）" >&2; exit 8; }
 
 echo
-echo "== 7) 删除分身（走回收站白名单）"
-"$CLI" rm probedemo main || exit 9
+echo "== 7) run --audit：审计层 → 证据 → 结论"
+"$CLI" run probedemo main --audit || exit 9
+auditdir="$inst/audit"
+[ -f "$auditdir/run.toml" ] || { echo "审计结束后应留下 run.toml（正常跑完的凭证）" >&2; exit 10; }
+workdir="/var/tmp/appclone/audit.$(id -u)/probedemo.main"
+[ -d "$workdir/upper" ] || { echo "审计写层不在预期位置：$workdir/upper" >&2; exit 10; }
 
 echo
-echo "全部通过：overlay 探测 → 归并 → 档案 → 建实例 → 清理 都在真机上跑通了。"
+echo "== 8) doctor --verify：判读审计证据"
+if ! "$CLI" doctor --verify probedemo main; then
+  echo "verify 退出码非 0：对照上面的结论判断是越界（8）还是摘出失效（4）。" >&2
+  exit 11
+fi
+[ ! -d "$workdir/upper" ] || { echo "verified 之后写层应被消费掉" >&2; exit 11; }
+[ -f "$auditdir/summary.toml" ] || { echo "verify 应留下 summary.toml" >&2; exit 11; }
+
+echo
+echo "== 9) 删除分身（走回收站白名单）"
+"$CLI" rm probedemo main || exit 12
+
+echo
+echo "全部通过：探测 → 档案 → 实例 → 审计 → verify → 清理 都在真机上跑通了。"
