@@ -3,6 +3,9 @@ package main
 import (
 	"context"
 	"fmt"
+	"os"
+	"os/signal"
+	"syscall"
 
 	"github.com/spf13/cobra"
 
@@ -44,7 +47,10 @@ func newAddCmd(a *app) *cobra.Command {
 			if len(args) == 2 {
 				id = args[1]
 			}
-			ctx := context.Background()
+			// 探测会把应用跑起来，用户随时可能 Ctrl-C：信号要能传到 context，
+			// 否则 defer 全部跳过、/var/tmp 下留下挂载点与写层（§3.2.3）。
+			ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+			defer stop()
 			// 写操作全程持全局锁：命名空间变更必须串行化（§4.2）。
 			st, err := a.env.OpenState(ctx, lockTimeout)
 			if err != nil {

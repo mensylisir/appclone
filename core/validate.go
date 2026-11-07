@@ -312,26 +312,19 @@ func ValidateCreatable(p Profile) error {
 	return nil
 }
 
-// ValidateRunnable 是"这份档案现在还能不能用"的门禁：paths 里的源**必须全部存在**。
-// 部分存在不算——BuildBwrapArgs 产出的是一条命令，缺一个源整条失败，
-// 而且失败发生在容器里，用户看不懂（§6.3 profile_stale）。
-func (e *Env) ValidateRunnable(p Profile) error {
+// ValidateBindable 是"能不能建实例"的门禁：Exec 存在、extra_binds 源存在、paths 非空。
+//
+// **它不要求 paths 的源已经存在**。理由是一次具体的事故：探测刚跑完、应用目录还
+// 没在宿主上落地（首次配置时它本来就不存在，写入只发生在 overlay 的 upper 里），
+// 若这里要求存在，`add` 会在探测成功后立刻报"档案已失效"，而"重新探测"仍然得到
+// 同一份结果——用户陷在一个永远出不去的循环里。目标由 prepareBindTargets 补建
+// （§4 白名单里的唯一显式例外），存在性只有 `run` 才需要。
+func (e *Env) ValidateBindable(p Profile) error {
 	if err := ValidateCreatable(p); err != nil {
 		return err
 	}
 	if st, err := os.Stat(p.Exec); err != nil || st.IsDir() {
 		return errInput("err.profile.exec_missing", map[string]any{"app": p.App, "exec": p.Exec})
-	}
-	for _, raw := range p.Paths {
-		abs, err := e.Resolver.Expand(raw)
-		if err != nil {
-			return err
-		}
-		if _, err := os.Stat(abs); err != nil {
-			return newErr(CodeInput, "err.profile.stale", map[string]any{
-				"app": p.App, "path": abs,
-			}, err)
-		}
 	}
 	// extra_binds 的源必须存在：它用的是 --bind 不是 -try，缺失会让整条 bwrap 命令
 	// 在容器里失败，而错误看起来像"应用自己退出"（§3.1 ⑦）。
@@ -343,6 +336,30 @@ func (e *Env) ValidateRunnable(p Profile) error {
 		if _, err := os.Stat(src); err != nil {
 			return newErr(CodeInput, "err.profile.extra_bind_missing", map[string]any{
 				"app": p.App, "path": src,
+			}, err)
+		}
+	}
+	return nil
+}
+
+// ValidateRunnable 是"这份档案现在还能不能用"的门禁：paths 里的源**必须全部存在**。
+// 部分存在不算——BuildBwrapArgs 产出的是一条命令，缺一个源整条失败，
+// 而且失败发生在容器里，用户看不懂（§6.3 profile_stale）。
+//
+// 只有 `run` 用它。建实例用 ValidateBindable：目录不存在是可以补建的，
+// 而"现在就跑得起来"是另一件事。
+func (e *Env) ValidateRunnable(p Profile) error {
+	if err := e.ValidateBindable(p); err != nil {
+		return err
+	}
+	for _, raw := range p.Paths {
+		abs, err := e.Resolver.Expand(raw)
+		if err != nil {
+			return err
+		}
+		if _, err := os.Stat(abs); err != nil {
+			return newErr(CodeInput, "err.profile.stale", map[string]any{
+				"app": p.App, "path": abs,
 			}, err)
 		}
 	}
@@ -370,7 +387,10 @@ func (e *Env) ProfileState(app string) (hasProfile, creatable bool, err error) {
 	if err := ValidateCreatable(p); err != nil {
 		return true, false, nil
 	}
-	if err := e.ValidateRunnable(p); err != nil {
+	// creatable 的语义是"现在能建出实例"，不是"现在就能跑"：paths 的源不存在时
+	// 目标会由 prepareBindTargets 补建，不该因此把档案判成失效（那会让用户
+	// 在"重新配置 → 仍然失效"之间打转）。
+	if err := e.ValidateBindable(p); err != nil {
 		return true, false, nil
 	}
 	return true, true, nil

@@ -66,7 +66,8 @@ probe_available() {
 **写层位置是硬约束（不是布局偏好）**：`upper/`、`work/`、`merged/` 必须整体位于 lower（有效 `HOME`）**之外**。
 实测（2026-11-06）：upper 嵌在 lower 里时 overlay **挂载成功**，但视图立刻递归——
 `ls merged/<更深层路径>` 直接 `ELOOP`，`rm -rf` 也删不掉。默认 `AC_BASE` 就在 `$HOME` 里，所以
-探测写层放 `/var/tmp/appclone/probe.<uid>.<rand>/`（`MkdirTemp`，0700），**不放 `$AC_BASE/probe`**（方案设计 §4.4）。
+探测写层放 `/var/tmp/appclone-probe-<uid>-<rand>/`（`MkdirTemp`，0700），**不放 `$AC_BASE/probe`**（方案设计 §4.4）；
+命中污染时整个目录改名为 `/var/tmp/appclone-quarantine-<uid>-<时间>-<随机>/` 保留（`core/probe_cleanup.go`）。
 
 挂载前断言（缺一不挂）：
 1. `realpath(upper)` 不是 `realpath(lower)` 的前缀（父子都不行）；
@@ -101,6 +102,8 @@ overlay 把整个 `$HOME` 罩住，**用户在探测会话里的每一次保存�
 --bind "$REAL_HOME/.local/share/recently-used.xbel" ...  # shared_writes：隔离会让输入法/书签在探测会话里失效
 ```
 
+- **实现**：`core/probe_args.go` 的 `probePublicBinds`。读不到 `user-dirs.dirs` 就**禁用探测**（退出 3），
+  逐项校验"必须是有效 HOME 的严格后代"，不合格同样拒绝（退出 2）——**不猜、不回退**。
 - 公共目录清单**不在代码里写死，也不能靠猜**：解析 `~/.config/user-dirs.dirs`（`XDG_DOWNLOAD_DIR` 等键，
   不依赖 `xdg-user-dirs` 二进制——它在最小安装里很可能不存在），并逐项校验：
   **必须是绝对路径、必须落在有效 `HOME` 之下（含等号）、`basename` 不为空且不等于 `HOME`**。
@@ -130,10 +133,14 @@ overlay 把整个 `$HOME` 罩住，**用户在探测会话里的每一次保存�
    否则探测会话里应用没有图形界面；
 3. 私有 DBus session bus（临时 `dbus-daemon --session --nofork --print-address`），
    地址经 `--setenv DBUS_SESSION_BUS_ADDRESS` 注入；
-4. L0 静态预填补到的锁文件路径，bind 一个空文件盖住（**仅普通文件**，socket 一律走第 2 条的私有 runtime）。
+4. L0 静态预填补到的锁文件路径，bind 一个**探测期新建的空文件**盖住（`probe/locks/<hash>` → 宿主路径）；
+   **仅普通文件**，socket 一律走第 2 条的私有 runtime（bind 空文件盖 socket 会 ENOTSOCK）。
 
-**探测开始前还要挡一道**：扫描目标应用是否已有进程在跑（按 `Exec` 的 basename 比对 `/proc/*/comm`，
-并用 `/proc/<pid>/ns/mnt` 排除掉已在本工具 namespace 里的分身进程）。在跑就让 GUI 提示
+**探测开始前还要挡一道**：扫描目标应用是否已有进程在跑。**实现**（`core/proc.go` 的 `AppRunning`）比对
+`/proc/<pid>/exe` 的真实路径与 basename（`comm` 只有 15 字符，`org.telegram.desktop` 这类必然截断），
+并用 `/proc/<pid>/ns/mnt` 排除掉已在本工具 namespace 里的分身进程。
+**已知局限**：解释器包装（`python3 x.py`）、AppImage（exe 在 `/tmp/.mount_*`）、`flatpak run` 都会漏判，
+表现是"零写入"而不是静默错误；`Exec=/usr/bin/python3` 这类会把无关 Python 进程误判成目标。在跑就让 GUI 提示
 「请先把「微信」完全退出，再开始跟踪」并禁用「开始」——**不要求用户自己去猜为什么没反应**，
 也不要在应用还开着的时候硬跑一轮然后报"未观测到写入"。
 
@@ -153,7 +160,7 @@ overlay 把整个 `$HOME` 罩住，**用户在探测会话里的每一次保存�
   "整组 kill 解决 daemonize"是过度承诺，不能这么写；
 - **`fuse-overlayfs` 进程要由 core 自己起自己收**（`SysProcAttr{Pdeathsig: SIGKILL}` + `auto_unmount` 挂载选项），
   否则 core 被 SIGKILL 后挂载点变成 `Transport endpoint is not connected`，下次挂载直接 EBUSY；
-- **启动前必须扫残留**：`/var/tmp/appclone/probe.*` 下属于本 uid 的目录 → 读 `/proc/self/mountinfo` 判断是否仍挂载
+- **启动前必须扫残留**：`/var/tmp/appclone-probe-<uid>-*` 下属于本 uid 的目录 → 读 `/proc/self/mountinfo` 判断是否仍挂载
   → 是则 `fusermount3 -uz` → **删前先做污染检查**（可能含用户文件）→ 校验通过才删；
   残留清理失败就报环境错误（3），不许"清理不了就继续跑"；
 - **探测期的 `dbus-daemon` 要单独回收**：它是 `core` 起的兄弟子进程，不在 bwrap 那个 session/pgid 里，

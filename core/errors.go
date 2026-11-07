@@ -51,6 +51,13 @@ func errEnv(key string, args map[string]any, err error) *Error {
 	return newErr(CodeEnv, key, args, err)
 }
 
+// errProbe 是"环境给不出结论"（探测污染/超时这类）——4，不是 3。
+// 3 是"环境坏了跑不起来"，4 是"跑起来了但这个结果不能用"，下一步不同：
+// 前者要装东西，后者要重跑。
+func errProbe(key string, args map[string]any) *Error {
+	return newErr(CodeProbe, key, args, nil)
+}
+
 func errConflict(key string, args map[string]any) *Error {
 	return newErr(CodeConflict, key, args, nil)
 }

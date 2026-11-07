@@ -33,7 +33,7 @@ func (e *Env) CreateInstance(ctx context.Context, app string, p Profile, id stri
 	if err := ValidateCreatable(p); err != nil {
 		return Instance{}, err
 	}
-	if err := e.ValidateRunnable(p); err != nil {
+	if err := e.ValidateBindable(p); err != nil {
 		return Instance{}, err
 	}
 

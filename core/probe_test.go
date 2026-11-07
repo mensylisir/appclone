@@ -5,10 +5,39 @@ import (
 	"errors"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
 )
+
+// probeEnv 造一个 XDG 全在家目录里、且带 user-dirs.dirs 的环境。
+//
+// 探测的 upper 是相对 $HOME 的，所以 XDG 必须在家目录内（testEnv 的 XDG 在
+// 家目录外，那里本来就进不了 upper）；公共目录解析也不允许回退默认名，
+// 所以必须有一份可读的 user-dirs.dirs。
+func probeEnv(t *testing.T) *Env {
+	t.Helper()
+	r := classifyEnv(t)
+	e := NewEnvAt(filepath.Join(r.Home, ".local", "share", "appclone"), r)
+	e.Trasher = func(paths ...string) error { return nil }
+	e.CliPath = "/usr/bin/appclone"
+
+	if err := os.MkdirAll(r.XDG["CONFIG_HOME"], 0o700); err != nil {
+		t.Fatal(err)
+	}
+	body := "XDG_DOWNLOAD_DIR=\"$HOME/Downloads\"\n"
+	if err := os.WriteFile(filepath.Join(r.XDG["CONFIG_HOME"], "user-dirs.dirs"), []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(r.Home, "Downloads"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(r.Home, ".local", "share"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	return e
+}
 
 // 探测 argv 的顺序是契约：公共目录的 bind 排在 overlay 之后，否则会被 overlay
 // 罩回去——用户在探测会话里存进 ~/Downloads 的文件会落进 upper，探测结束删
@@ -16,15 +45,17 @@ import (
 func TestProbeBwrapArgsOrder(t *testing.T) {
 	spec := ProbeSpec{
 		Home:        "/home/u",
-		RealHome:    "/home/u",
 		Base:        "/home/u/.local/share/appclone",
 		Merged:      "/var/tmp/probe/merged",
 		RuntimeDir:  "/var/tmp/probe/runtime",
 		RuntimeSock: []BindPair{{Src: "/run/user/1000/wayland-0", Dst: "/var/tmp/probe/runtime/wayland-0"}},
 		DBusAddress: "unix:path=/var/tmp/probe/dbus/bus",
-		PublicDirs:  []string{"/home/u/Downloads", "/home/u/Documents"},
+		PublicBinds: []BindPair{
+			{Src: "/home/u/Downloads", Dst: "/home/u/Downloads"},
+			{Src: "/home/u/Documents", Dst: "/home/u/Documents"},
+		},
 		SharedWrite: []string{"/home/u/.local/share/recently-used.xbel"},
-		LockFiles:   []string{"/home/u/.config/App/lock"},
+		LockBinds:   []BindPair{{Src: "/var/tmp/probe/locks/abc", Dst: "/home/u/.config/App/lock"}},
 		Command:     []string{"/usr/bin/app", "--flag"},
 	}
 	argv, err := ProbeBwrapArgs(spec)
@@ -41,7 +72,7 @@ func TestProbeBwrapArgsOrder(t *testing.T) {
 		"--bind /home/u/.local/share/appclone /home/u/.local/share/appclone",
 		"--tmpfs /home/u/.local/share/appclone/instances",
 		"--bind-try /home/u/.local/share/recently-used.xbel /home/u/.local/share/recently-used.xbel",
-		"--bind /home/u/.config/App/lock /home/u/.config/App/lock",
+		"--bind /var/tmp/probe/locks/abc /home/u/.config/App/lock",
 		"--bind /var/tmp/probe/runtime /var/tmp/probe/runtime",
 		"--ro-bind-try /run/user/1000/wayland-0 /var/tmp/probe/runtime/wayland-0",
 		"--setenv XDG_RUNTIME_DIR /var/tmp/probe/runtime",
@@ -60,29 +91,6 @@ func TestProbeBwrapArgsOrder(t *testing.T) {
 	}
 }
 
-// AC_HOME 生效时 HOME 与真实 HOME 不同：公共目录的 bind 源必须取真实的那个，
-// 目标取有效 HOME 下的同名路径——否则探测会话里看到的是一个空目录。
-func TestProbeBwrapArgsSplitsEffectiveAndRealHome(t *testing.T) {
-	spec := ProbeSpec{
-		Home:       "/tmp/fakehome",
-		RealHome:   "/home/u",
-		Merged:     "/var/tmp/probe/merged",
-		PublicDirs: []string{"/home/u/Downloads"},
-		Command:    []string{"/usr/bin/app"},
-	}
-	argv, err := ProbeBwrapArgs(spec)
-	if err != nil {
-		t.Fatal(err)
-	}
-	joined := strings.Join(argv, " ")
-	if !strings.Contains(joined, "--bind /home/u/Downloads /tmp/fakehome/Downloads") {
-		t.Fatalf("公共目录的源应取真实 HOME、目标取有效 HOME：%s", joined)
-	}
-	if !strings.Contains(joined, "--setenv HOME /tmp/fakehome") {
-		t.Fatalf("HOME 必须设成有效 HOME（AC_HOME）：%s", joined)
-	}
-}
-
 func TestProbeBwrapArgsRejectsEmptyCommand(t *testing.T) {
 	if _, err := ProbeBwrapArgs(ProbeSpec{Home: "/home/u", Merged: "/m"}); ExitCode(err) != CodeInput {
 		t.Fatalf("没有命令应报输入错误（2），得到 %v", err)
@@ -92,10 +100,53 @@ func TestProbeBwrapArgsRejectsEmptyCommand(t *testing.T) {
 	}
 }
 
-// 反向断言：公共目录的路径出现在 upper 里，说明"摘出"没生效。
+// 公共目录解析不许回退默认名（§3.2.1）：读不到 user-dirs.dirs 就禁用探测，
+// 否则中文系统的 `~/下载` 漏出摘出清单，用户存的文件会落进 upper 被删。
+func TestProbePublicBindsStrict(t *testing.T) {
+	e := probeEnv(t)
+	binds, err := e.probePublicBinds()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(binds) != 1 || binds[0].Src != filepath.Join(e.Resolver.Home, "Downloads") {
+		t.Fatalf("应只解析出 user-dirs.dirs 里配置的那一项，得到 %+v", binds)
+	}
+	// 目录不存在就不 bind：--bind 的源不存在会让整条命令失败。
+	if err := os.RemoveAll(filepath.Join(e.Resolver.Home, "Downloads")); err != nil {
+		t.Fatal(err)
+	}
+	if binds, err = e.probePublicBinds(); err != nil || len(binds) != 0 {
+		t.Fatalf("不存在的公共目录不该 bind，得到 %+v / %v", binds, err)
+	}
+	// 缺 user-dirs.dirs → 报环境错误，不是静默回退。
+	if err := os.Remove(filepath.Join(e.Resolver.XDG["CONFIG_HOME"], "user-dirs.dirs")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.probePublicBinds(); ExitCode(err) != CodeEnv {
+		t.Fatalf("缺 user-dirs.dirs 应报 3，得到 %v", err)
+	}
+}
+
+// 公共目录被指到家目录之外/本身：禁用探测，不许"猜一个"（否则 bind 会把
+// 整个 overlay 遮掉，探测变成在真实家目录里跑）。
+func TestProbePublicBindsRejectsOutsideHome(t *testing.T) {
+	e := probeEnv(t)
+	cfg := filepath.Join(e.Resolver.XDG["CONFIG_HOME"], "user-dirs.dirs")
+	for _, bad := range []string{"\"$HOME\"", "\"/etc\""} {
+		body := "XDG_DOWNLOAD_DIR=" + bad + "\n"
+		if err := os.WriteFile(cfg, []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := e.probePublicBinds(); ExitCode(err) != CodeInput {
+			t.Fatalf("%s 应被拒（2），得到 %v", bad, err)
+		}
+	}
+}
+
+// 反向断言：被 bind 回真实的路径（公共目录 / AC_BASE / shared）出现在 upper 里。
 func TestProbeContaminated(t *testing.T) {
 	e := probeEnv(t)
-	pubs := []string{filepath.Join(e.Resolver.Home, "Downloads")}
+	pubs := []BindPair{{Src: filepath.Join(e.Resolver.Home, "Downloads"), Dst: filepath.Join(e.Resolver.Home, "Downloads")}}
 	entries := []UpperEntry{
 		{Path: "Downloads/important.docx", Kind: EntryFile},
 		{Path: ".config/App/x", Kind: EntryFile},
@@ -107,23 +158,17 @@ func TestProbeContaminated(t *testing.T) {
 	if len(e.ProbeContaminated(entries[1:], pubs)) != 0 {
 		t.Fatal("非公共目录的写入不算污染")
 	}
-}
-
-// probeEnv 造一个 XDG 全在家目录里的环境：探测的 upper 是相对 $HOME 的，
-// 而 testEnv 的 XDG 指在家目录外（那里本来就进不了 upper）。
-func probeEnv(t *testing.T) *Env {
-	t.Helper()
-	r := classifyEnv(t)
-	e := NewEnvAt(filepath.Join(r.Home, ".local", "share", "appclone"), r)
-	e.Trasher = func(paths ...string) error { return nil }
-	e.CliPath = "/usr/bin/appclone"
-	return e
+	// AC_BASE 出现在 upper 里同样是 bind 失效（工具自己的写入不该进隔离层）。
+	baseEntry := UpperEntry{Path: filepath.ToSlash(strings.TrimPrefix(filepath.Join(e.Base, "profiles.d", "x.toml"), e.Resolver.Home+"/")), Kind: EntryFile}
+	if len(e.ProbeContaminated([]UpperEntry{baseEntry}, pubs)) != 1 {
+		t.Fatalf("AC_BASE 下的写入应算污染：%+v", baseEntry)
+	}
 }
 
 // fakeMounter 把"应用写了什么"直接写进 upper，模拟一次会话；
 // 真实现要 /dev/fuse，单测环境没有。
 type fakeMounter struct {
-	entries []string // 相对 upper 的路径
+	entries []string
 	failOn  string
 	mounted bool
 }
@@ -139,6 +184,12 @@ func (f *fakeMounter) Mount(lower, upper, work, merged string) (func() error, er
 	if f.failOn == "mount" {
 		return nil, errEnv("err.probe.mount_failed", map[string]any{"output": "boom"}, nil)
 	}
+	if f.failOn == "umount" {
+		f.mounted = true
+		return func() error {
+			return errEnv("err.probe.umount_failed", map[string]any{"output": "busy"}, nil)
+		}, nil
+	}
 	f.mounted = true
 	for _, rel := range f.entries {
 		p := filepath.Join(upper, filepath.FromSlash(rel))
@@ -153,22 +204,14 @@ func (f *fakeMounter) Mount(lower, upper, work, merged string) (func() error, er
 }
 
 type fakeRunner struct {
-	exit int
+	res  SessionResult
 	err  error
 	argv []string
 }
 
-func (f *fakeRunner) Run(_ context.Context, argv []string, _ io.Writer) (int, error) {
+func (f *fakeRunner) Run(_ context.Context, argv []string, _ io.Writer) (SessionResult, error) {
 	f.argv = argv
-	return f.exit, f.err
-}
-
-func probeTestOpt(f *fakeMounter, r *fakeRunner) ProbeOptions {
-	return ProbeOptions{
-		Command: []string{"/usr/bin/testapp"},
-		Mounter: f,
-		Runner:  r,
-	}
+	return f.res, f.err
 }
 
 // 正常一次探测：upper 里的写入 → 候选 → 档案；探测目录必须被清掉。
@@ -181,14 +224,25 @@ func TestProbeSessionBuildsProfile(t *testing.T) {
 		".config/gtk-3.0/bookmarks",
 	}}
 	r := &fakeRunner{}
-	// 探测闸门要"应用没在跑"：给一个必然不存在的名字。
-	res, err := e.probeSession(context.Background(), "testapp",
-		ProbeOptions{Command: []string{"/nonexistent/zz-probe-test-app"}, Mounter: m, Runner: r}, m, r)
+	res, err := e.probeSession(context.Background(), "testapp", ProbeOptions{
+		Command: []string{"/nonexistent/zz-probe-test-app", "--flag"},
+		Mounter: m, Runner: r,
+	}, m, r)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if res.Profile.ProbeMethod != "overlay" {
 		t.Fatalf("档案应记 probe_method=overlay，得到 %q", res.Profile.ProbeMethod)
+	}
+	// 档案必须自带启动命令：ValidateProfile 会因为它为空直接拒（§5）。
+	if res.Profile.Exec != "/nonexistent/zz-probe-test-app" {
+		t.Fatalf("Exec 必须回填，得到 %q", res.Profile.Exec)
+	}
+	if len(res.Profile.ExecArgs) != 1 || res.Profile.ExecArgs[0] != "--flag" {
+		t.Fatalf("ExecArgs 必须回填，得到 %v", res.Profile.ExecArgs)
+	}
+	if err := ValidateProfile(res.Profile, e.BuildOptions()); err != nil {
+		t.Fatalf("探测产物必须能过 ValidateProfile：%v", err)
 	}
 	paths := strings.Join(res.Profile.Paths, ",")
 	if !strings.Contains(paths, "~/.config/TestApp") || !strings.Contains(paths, "~/.local/share/TestApp") {
@@ -197,43 +251,73 @@ func TestProbeSessionBuildsProfile(t *testing.T) {
 	if strings.Contains(paths, "~/.cache/TestApp") {
 		t.Fatalf("缓存不该进 paths：%v", res.Profile.Paths)
 	}
-	shared := strings.Join(res.Profile.SharedWrites, ",")
-	if !strings.Contains(shared, "gtk-3.0") {
+	if shared := strings.Join(res.Profile.SharedWrites, ","); !strings.Contains(shared, "gtk-3.0") {
 		t.Fatalf("书签所在目录应进 shared_writes：%v", res.Profile.SharedWrites)
 	}
-	if !m.mounted == false {
+	if m.mounted {
 		t.Fatal("探测结束后必须卸载")
-	}
-	// 探测目录不许留下：留着下一轮会 EBUSY。
-	if ents, _ := filepath.Glob("/var/tmp/appclone-probe-*"); len(ents) != 0 {
-		for _, d := range ents {
-			if strings.Contains(d, "quarantine") {
-				continue
-			}
-			os.RemoveAll(d) // 只清本测试留下的（可能是别的测试失败残留）
-		}
 	}
 }
 
-// 污染：公共目录里出现写入 → 结果作废、**保留现场**、报环境错误。
+// 污染：公共目录里出现写入 → 结果作废（4）、**保留现场**、不删任何东西。
 func TestProbeSessionQuarantinesOnContamination(t *testing.T) {
 	e := probeEnv(t)
 	m := &fakeMounter{entries: []string{"Downloads/important.docx"}}
 	r := &fakeRunner{}
-	_, err := e.probeSession(context.Background(), "testapp.probe", // 用独立 app 名避免与上一条互相干扰
+	_, err := e.probeSession(context.Background(), "testapp",
 		ProbeOptions{Command: []string{"/nonexistent/zz-probe-test-app"}, Mounter: m, Runner: r}, m, r)
-	if ExitCode(err) != CodeEnv {
-		t.Fatalf("污染应报环境错误（3），得到 %v", err)
+	if ExitCode(err) != CodeProbe {
+		t.Fatalf("污染是「环境给不出结论」（4），得到 %v", err)
 	}
 	var ce *Error
 	if !errors.As(err, &ce) || ce.Key != "err.probe.contaminated" {
 		t.Fatalf("应是 err.probe.contaminated，得到 %v", err)
 	}
+	// 现场必须还在（名字带 uid + 时间 + 随机尾巴），并且里面真有那个文件。
 	ents, _ := filepath.Glob("/var/tmp/appclone-quarantine-*")
 	if len(ents) == 0 {
 		t.Fatal("污染现场必须保留（quarantine-*），不能删掉可能属于用户的文件")
 	}
+	found := false
 	for _, d := range ents {
+		if _, err := os.Stat(filepath.Join(d, "upper", "Downloads", "important.docx")); err == nil {
+			found = true
+			os.RemoveAll(d) // 只清理本测试造出来的那个现场
+		}
+	}
+	if !found {
+		t.Fatal("quarantine 里应含被写进 upper 的用户文件")
+	}
+}
+
+// 会话跑起来了但立刻失败（bwrap 建不了 namespace / Exec 不存在）≠ 零写入：
+// 前者是环境问题（3），必须和"应用正常退出但没写"分开。
+func TestProbeSessionDistinguishesFailedSession(t *testing.T) {
+	e := probeEnv(t)
+	m := &fakeMounter{}
+	r := &fakeRunner{res: SessionResult{ExitCode: 1}}
+	_, err := e.probeSession(context.Background(), "testapp",
+		ProbeOptions{Command: []string{"/nonexistent/zz-probe-test-app"}, Mounter: m, Runner: r}, m, r)
+	if ExitCode(err) != CodeEnv {
+		t.Fatalf("会话起不来应报 3，得到 %v", err)
+	}
+}
+
+// 卸载失败时**不许**删工作目录：那时删会遍历用户家目录视图并制造 whiteout。
+func TestProbeSessionKeepsWorkOnUmountFailure(t *testing.T) {
+	e := probeEnv(t)
+	m := &fakeMounter{failOn: "umount", entries: []string{".config/App/x"}}
+	r := &fakeRunner{}
+	_, err := e.probeSession(context.Background(), "testapp",
+		ProbeOptions{Command: []string{"/nonexistent/zz-probe-test-app"}, Mounter: m, Runner: r}, m, r)
+	if err == nil {
+		t.Fatal("卸载失败必须报错")
+	}
+	left, _ := filepath.Glob("/var/tmp/appclone-probe-*")
+	if len(left) == 0 {
+		t.Fatal("卸载失败时工作目录必须保留（删了会碰用户家目录视图）")
+	}
+	for _, d := range left {
 		os.RemoveAll(d)
 	}
 }
@@ -250,6 +334,32 @@ func TestProbeSessionGateOnMounter(t *testing.T) {
 	}
 }
 
+// 目标应用在跑：退出码是 6（并发），不是 7（实例在跑）。
+func TestProbeSessionGateOnRunningApp(t *testing.T) {
+	e := probeEnv(t)
+	m := &fakeMounter{}
+	r := &fakeRunner{}
+	// 需要一个**别的进程**在跑目标可执行文件（自己的 pid 会被排除）。
+	dir := t.TempDir()
+	target := filepath.Join(dir, "zzappclone-probe-target")
+	payload, err := os.ReadFile("/bin/sleep")
+	if err != nil {
+		t.Skipf("读不到 /bin/sleep：%v", err)
+	}
+	if err := os.WriteFile(target, payload, 0o700); err != nil {
+		t.Skipf("写不了目标可执行文件：%v", err)
+	}
+	cmd := exec.Command(target, "30")
+	if err := cmd.Start(); err != nil {
+		t.Skipf("起不了目标进程：%v", err)
+	}
+	defer func() { _ = cmd.Process.Kill(); _, _ = cmd.Process.Wait() }()
+	if _, err := e.probeSession(context.Background(), "testapp",
+		ProbeOptions{Command: []string{target}, Mounter: m, Runner: r}, m, r); ExitCode(err) != CodeBusy {
+		t.Fatalf("应用在跑应报 6，得到 %v", err)
+	}
+}
+
 // root 必须拒绝：探测会 bind 宿主目录，root 下的行为掩盖非特权问题。
 func TestProbeRefusesRoot(t *testing.T) {
 	if os.Geteuid() != 0 {
@@ -258,5 +368,49 @@ func TestProbeRefusesRoot(t *testing.T) {
 	e := probeEnv(t)
 	if _, err := e.Probe(context.Background(), "testapp", ProbeOptions{Command: []string{"/bin/true"}}); ExitCode(err) != CodeEnv {
 		t.Fatalf("root 下探测应被拒（3），得到 %v", err)
+	}
+}
+
+// 端到端：探测产物必须能直接建出实例，即使宿主上那个目录**还不存在**
+// （首次配置就是这样：写入只发生在 overlay 的 upper 里）。
+// 这条断言是上一轮 P0 的回归锁：缺 Exec 或要求源已存在，用户会卡在
+// "探测成功 → 档案已失效 → 再探测 → 仍然失效"的循环里。
+func TestProbeProfileCreatesInstanceForFreshApp(t *testing.T) {
+	e := probeEnv(t)
+	// 桌面项：Exec 指向真实存在的可执行文件。
+	bin := filepath.Join(e.Resolver.Home, "freshapp-bin")
+	if err := os.WriteFile(bin, []byte("#!/bin/sh\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	appsDir := filepath.Join(e.Resolver.XDG["DATA_HOME"], "applications")
+	if err := os.MkdirAll(appsDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	desktop := "[Desktop Entry]\nType=Application\nName=Fresh App\nExec=" + bin + "\nIcon=fresh\nCategories=Utility;\n"
+	if err := os.WriteFile(filepath.Join(appsDir, "freshapp.desktop"), []byte(desktop), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	m := &fakeMounter{entries: []string{".config/FreshApp/settings.ini"}}
+	r := &fakeRunner{}
+	res, err := e.probeSession(context.Background(), "freshapp",
+		ProbeOptions{Command: []string{bin}, Mounter: m, Runner: r}, m, r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 宿主上确实还不存在（探测只写 upper）。
+	hostDir := filepath.Join(e.Resolver.Home, ".config", "FreshApp")
+	if _, err := os.Stat(hostDir); !os.IsNotExist(err) {
+		t.Fatalf("这一步宿主目录不该已经存在：%v", err)
+	}
+	in, err := e.CreateInstance(context.Background(), "freshapp", res.Profile, "")
+	if err != nil {
+		t.Fatalf("探测产物应能直接建实例：%v", err)
+	}
+	if _, err := os.Stat(hostDir); err != nil {
+		t.Fatalf("建实例时应补建宿主目录：%v", err)
+	}
+	if in.ID == "" {
+		t.Fatal("实例 id 不能为空")
 	}
 }

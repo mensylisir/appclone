@@ -56,6 +56,24 @@ GUI 方向定案：**GTK4 + libadwaita 原生控件，经 puregotk 绑定（零 
 
 ## 最近完成
 
+- 2026-11-07 **第十八轮：对抗性审查判 REJECTED 后的修复 + 按职责拆文件**：
+  - **文件粒度**：`probe.go` 一度写到 907 行（把纯函数、syscall、生命周期、清理全塞一起），
+    违反 `AGENTS.md` 的"core 保持纯函数优先、可单测"。拆成 `probe.go` 246 / `probe_args.go` 219 /
+    `probe_overlay.go` 168 / `probe_session.go` 154 / `probe_cleanup.go` 121 / `proc.go` 47 行。
+  - **P0-1 探测产物没有 `exec`**：`ValidateProfile` 直接拒 → `add` 走探测后 100% 失败（上一轮的
+    "现在真的能配出来"是错的）。改为探测时回填 `Exec/ExecArgs`，并加端到端断言。
+  - **P0-2 首次配置死循环**：`CreateInstance` 用 `ValidateRunnable` 要求宿主路径已存在，而探测只写
+    overlay 的 upper → 探测成功也报"档案已失效"，重新探测还是同一结果。拆出 `ValidateBindable`
+    （建实例只要求 Exec/extra_binds，路径由 `prepareBindTargets` 补建），`ValidateRunnable` 只留给 `run`。
+  - **P0-3 quarantine 失败会删现场**：`os.Rename` 失败后回退到 `RemoveAll`——那里面可能就是用户刚存的
+    文件。改成保留 + 报错，名字加 uid/时间/随机尾巴防撞名。
+  - **P0-4/P0-5 公共目录**：不再无条件 `--bind`（缺一个公共目录整条命令就失败），只 bind 存在的；
+    并且**不再回退八个英文默认名**——读不到 `user-dirs.dirs` 就禁用探测（3）。
+  - 其余：污染退出码改 4（原 3）、应用在跑改 6（原 7）、会话起不来 3（与"零写入"区分）、
+    超时/取消不产出档案、卸载失败不删工作目录、`noatime`（防伪 copy-up）、宿主 `bus` 不进探测 runtime、
+    污染检查纳入 AC_BASE 与 shared 并改用软链容错比较、`add` 接管 SIGINT。
+  - 仍未做（记在 discover.md 的已知局限）：会话内**正向断言**（写标记文件回读）、
+    strace 降级、两轮探测循环。
 - 2026-11-07 **第十七轮：L1 overlay 探测落地（待真机验证）**：
   - `core/probe.go`：四道闸门、`ProbeBwrapArgs` 全序、会话生命周期、污染反向断言、quarantine 保留现场。
     几个关键决定：`fuse-overlayfs` 用 `-f` 前台跑（拿得到句柄才能确定它真的退出了）+ `auto_unmount`
