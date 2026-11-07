@@ -32,6 +32,20 @@ func BuildBwrapArgs(p Profile, in Instance, o BuildOptions) ([]string, error) {
 		"--proc", "/proc",
 	}
 
+	// ④.5 审计层（§6.5）：只在 `run --audit` 时存在。顺序写死——
+	//   overlay 先罩住 HOME，再把**公共目录 / AC_BASE** 绑回真实位置，
+	//   最后才是 ⑤ 的实例私有目录。反过来（实例 bind 在前）会被公共目录的
+	//   bind 盖掉，应用数据反而落进 upper，verify 会把正常数据当越界。
+	if o.Audit != nil {
+		args = append(args, "--bind", o.Audit.Merged, o.Home)
+		for _, pb := range o.Audit.PublicBinds {
+			args = append(args, "--bind", pb.Src, pb.Dst)
+		}
+		if o.Base != "" {
+			args = append(args, "--bind", o.Base, o.Base)
+		}
+	}
+
 	// ⑤ 仅 paths 声明的目录，父先子后（normalizePaths 已给出全序）。
 	for _, abs := range paths {
 		src, err := instanceChild(in.Root, abs)

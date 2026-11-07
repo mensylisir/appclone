@@ -40,10 +40,6 @@ func newRunCmd(a *app) *cobra.Command {
 				pass = args[2:]
 			}
 
-			if audit {
-				// 审计层还没实现：明确拒绝，不做静默 no-op（§6.5）。
-				return core.NewAuditUnavailable()
-			}
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
 			// Ctrl-C 交给 Run 内部的进程组处理：它要先把应用带走，再自己退。
@@ -96,7 +92,7 @@ func newRunCmd(a *app) *cobra.Command {
 	// 关掉 flag 交错解析：`run app main --user-data-dir=x` 必须把 --user-data-dir
 	// 当成应用参数，而不是 appclone 的未知 flag（§6 语法边界）。
 	c.Flags().SetInterspersed(false)
-	c.Flags().BoolVar(&audit, "audit", false, "开启运行期审计层（供 doctor --verify 对账；本版本未实现）")
+	c.Flags().BoolVar(&audit, "audit", false, "开启运行期审计层：结束后保留证据，用 doctor --verify 对账")
 	c.Flags().BoolVar(&wait, "wait", false, "该分身已在运行时等待它退出（默认立刻返回）")
 	c.Flags().BoolVar(&propagateExit, "propagate-exit", false, "原样返回应用的退出码")
 	return c

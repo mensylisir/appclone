@@ -25,6 +25,9 @@ type Env struct {
 	CliPath string
 	// AppDirList 覆盖 .desktop 来源目录（测试注入）。空值走 AppDirs() 的三目录。
 	AppDirList []string
+	// Mounter 覆盖 overlay 挂载（测试注入）。空值走 fuse-overlayfs。
+	// 审计与探测共用它：两处各写一个挂着实现，迟早只有一处被修。
+	Mounter OverlayMounter
 	// RunCmd 覆盖"跑一个只读外部命令拿输出"（测试注入）。空值走 exec。
 	// 只有 L0 的 `flatpak info --show-permissions` 用它，所以抽成字段而不是多一层接口。
 	RunCmd func(ctx context.Context, name string, args ...string) (string, error)
@@ -58,6 +61,15 @@ func NewEnvAt(base string, r *PathResolver) *Env {
 		Clock:    time.Now,
 		Trasher:  Trash,
 	}
+}
+
+// AuditLayers 是 `run --audit` 才有的那一层（§6.5）：overlay 的 merged 视图
+// 与"绑回真实"的公共目录。放在 BuildOptions 里而不是另写一个 argv 构造器，
+// 是因为审计会话与运行期会话的其余部分（runtime/dbus/env/锁文件）必须完全一致——
+// 两套构造器迟早分叉，而分叉的表现是"审计期能跑、平时跑不起来"。
+type AuditLayers struct {
+	Merged      string     // overlay 的 merged 视图，bind 到 HOME
+	PublicBinds []BindPair // Src = 真实目录，Dst = HOME 下的目标
 }
 
 // BuildOptions 把 Env 摊平成 BuildBwrapArgs 的输入。运行时相关的项

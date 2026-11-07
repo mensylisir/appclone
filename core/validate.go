@@ -27,6 +27,8 @@ type BuildOptions struct {
 	RuntimeSocks []BindPair // 已探测存在的宿主 socket → 私有 runtime 内目标（只读）
 	DBusAddress  string     // dbus-daemon --print-address 原文；空 = 不隔离
 	XDG          map[string]string
+	// Audit 非空时在 ④ 与 ⑤ 之间插入审计层（只有 `run --audit` 会设置它）。
+	Audit *AuditLayers
 }
 
 // BindPair 表示一次 bind 的源与目标。

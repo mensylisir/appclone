@@ -113,6 +113,7 @@ var messages = map[string]map[string]string{
 		"err.probe.unavailable":        "「{app}」还没有可用的隔离档案，而本版本尚未接入探测管线。请等待探测功能，或使用带内置模板的应用。",
 		"err.probe.no_writes":          "没有跟踪到「{app}」的任何写入。请确认应用确实启动了（它可能已经在运行、或没有图形环境），然后重试。",
 		"err.audit.unavailable":        "运行期审计层（--audit）还没有实现，本版本无法开启。不加这个参数可以直接运行；关闭审计不影响隔离本身。",
+		"err.audit.pending_evidence":   "上一次审计的现场还在（{path}）：里面可能是你的文件。请先运行 doctor --verify 处理（或手动取回文件）再开启新的审计。",
 		"ui.add.reconfigure_note":      "「{app}」的档案已失效，正在用内置模板重建；若应用的数据目录已变化，请用「重新探测」校正。",
 
 		// 语义分类（屏3 每条候选的说明文案，discover.md §5）
@@ -236,6 +237,7 @@ var messages = map[string]map[string]string{
 		"err.probe.unavailable":        "\"{app}\" has no usable isolation profile yet, and this build does not ship the probe pipeline. Wait for the probe feature, or use an app that ships a bundled template.",
 		"err.probe.no_writes":          "No writes were observed for \"{app}\". Check that the app actually started (it may already be running, or lack a graphical session), then retry.",
 		"err.audit.unavailable":        "The runtime audit layer (--audit) is not implemented yet in this build. Run without the flag; isolation itself is unaffected.",
+		"err.audit.pending_evidence":   "Evidence from the previous audit is still here ({path}); it may contain your files. Run doctor --verify first (or retrieve the files manually) before starting a new audit.",
 		"ui.add.reconfigure_note":      "The profile for \"{app}\" was stale; rebuilding it from the bundled template. If the app's data directories moved, run Rediscover to correct it.",
 
 		"probe.why.config":  "App config or data directory — isolate",

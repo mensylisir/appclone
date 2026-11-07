@@ -103,6 +103,25 @@ func (e *Env) Run(ctx context.Context, app, id string, opt RunOptions) (RunResul
 	o := e.BuildOptions()
 	o.RuntimeSocks = FilterExisting(RuntimeSocketCandidates(o.RuntimeDir))
 
+	// 审计层（§6.5）：overlay 罩住 HOME + 把公共目录/AC_BASE 绑回真实。
+	// 这三件事必须发生在实例 bind 之前，所以它走 BuildOptions 而不是另拼 argv。
+	var audit *AuditSession
+	if opt.Audit {
+		sess, layers, aerr := e.beginAudit(in)
+		if aerr != nil {
+			return RunResult{}, aerr
+		}
+		audit = sess
+		o.Audit = layers
+		// 兜底：没走到 finish 就退出（启动失败、panic）时不清写层会更糟——
+		// 但那时应用没跑，写层里不可能有用户文件，所以 abort 是安全的。
+		defer func() {
+			if audit != nil {
+				audit.abort()
+			}
+		}()
+	}
+
 	// 私有 DBus 总线：必须先起 daemon（要 socket 存在才能 bind），
 	// 且 --nofork 不能少——fork 模式下 --print-address 的父进程会先退出（§6.6）。
 	var stopDBus func()
@@ -164,17 +183,36 @@ func (e *Env) Run(ctx context.Context, app, id string, opt RunOptions) (RunResul
 	terminateGroup(pgid)
 
 	res := RunResult{}
+	// 审计会话在这里落账：写 run.toml、保留 upper（证据交给 verify 消费）。
+	// 必须在应用退出之后写——中途崩掉就不该留下"正常跑完"的凭证。
+	finishAudit := func(code int) error {
+		if audit == nil {
+			return nil
+		}
+		ferr := audit.finish(code)
+		audit = nil // 置空让 defer 的 abort 不再执行
+		return ferr
+	}
 	if waitErr != nil {
 		if ee, ok := waitErr.(*exec.ExitError); ok {
 			if ws, ok := ee.Sys().(syscall.WaitStatus); ok && ws.Signaled() {
 				res.Signaled = true
 				res.Signal = ws.Signal()
+				if ferr := finishAudit(128 + int(ws.Signal())); ferr != nil {
+					return res, ferr
+				}
 				return res, nil
 			}
 			res.AppExitCode = ee.ExitCode()
+			if ferr := finishAudit(res.AppExitCode); ferr != nil {
+				return res, ferr
+			}
 			return res, nil
 		}
 		return res, errEnv("err.run.start_failed", map[string]any{"exec": p.Exec}, waitErr)
+	}
+	if ferr := finishAudit(0); ferr != nil {
+		return res, ferr
 	}
 	_ = e.TouchLastUsed(app, id)
 	return res, nil

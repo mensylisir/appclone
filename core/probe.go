@@ -52,6 +52,9 @@ func (e *Env) Probe(ctx context.Context, app string, opt ProbeOptions) (ProbeRes
 	}
 	mounter := opt.Mounter
 	if mounter == nil {
+		mounter = e.Mounter
+	}
+	if mounter == nil {
 		mounter = fuseOverlayMounter{}
 	}
 	runner := opt.Runner

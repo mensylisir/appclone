@@ -56,6 +56,18 @@ GUI 方向定案：**GTK4 + libadwaita 原生控件，经 puregotk 绑定（零 
 
 ## 最近完成
 
+- 2026-11-07 **第二十二轮：`run --audit` 落地——§6.5 的生产者补上了**：
+  - 审计层不是另写一个 argv 构造器，而是**插进 `BuildBwrapArgs` 的 ④ 与 ⑤ 之间**
+    （`BuildOptions.Audit`）：overlay 罩住 HOME → 公共目录/AC_BASE 绑回真实 → 实例私有目录。
+    另写一套的话，runtime/dbus/锁文件那部分迟早与运行期分叉，表现是"审计期能跑、平时跑不起来"。
+  - `core/audit.go`：写层路径**确定性**（`/var/tmp/appclone/audit.<uid>/<app>.<id>`）——
+    verify 必须自己能找到证据，随机目录名只能靠扫描猜；`run.lock` 已保证同一实例不会有两个会话。
+  - `run.toml` 在**应用退出之后**才写：它是"这次审计正常跑完"的凭证，中途崩掉就不该留下它
+    （那正是"证据不完整"的定义）。结束**保留**写层（不删），交给 verify 消费。
+  - 上一轮还有未消费的证据（`quarantine-*` 或摘要写着 retained）→ **拒绝开始新审计**（3），
+    否则会把可能含用户文件的现场覆盖掉。
+  - 断言（不需要 fuse）：审计层顺序（公共目录/AC_BASE 在实例 bind 之前）、`run.toml` 只在结束后存在、
+    完整生命周期（begin → finish → verify 消费）、pending 证据拒开。
 - 2026-11-07 **第二十一轮：`doctor --verify` 开始按结论处置证据**（§6.5 剩下的另一半）：
   - 之前 verify 只判不落账：判完什么都不写，证据永远留在盘上，也没有 `summary.toml` 可重放。
     现在 `finalize`：`verified` → 写摘要 + 删 upper/run.toml（证据已消费）；`leak-detected` →
