@@ -520,6 +520,16 @@ GTK 闸门补结构断言：无实例时 `GetVisibleChildName()=="all"`、创建
   证据：`gofmt -l .` 空、`go vet ./...` 与 `go vet -tags gtk_e2e` 干净、`go test -count=1 ./...` 全绿、
   `staticcheck ./...` 零输出、`node design/guitest.js` **62/62**、`design/guitest-gtk.sh` **18/18 PASS**
   （退出码 0）；本地 nfpm 出包后 CI 的每条 deb 断言均实跑通过。
+- **CI 兼容性预演（ubuntu:24.04 / libadwaita 1.5）**（2026-11-08）：用容器跑同一份
+  `design/guitest-gtk.sh`，抓到测试辅助函数用了 `adw.PreferencesGroup.GetRow`——
+  `adw_preferences_group_get_row` 在 libadwaita **1.5 不存在**（**1.8** 才加），puregotk 注册出的
+  函数指针为 nil，用例直接 panic；首次 CI 的 gtk job 本来必红，本机 GTK 4.24 从来跑不出来。
+  改为在控件树里找 `GtkListBox`、按 `title` 认行（`typeNameOf` 读 GType 名），不再依赖 1.8 API。
+  预演结果：非 root 下 **17/18 PASS**；唯一失败的 `TestGtkRapidRepush` 是嵌套容器不允许
+  探测用 bwrap 挂 `/proc`（`Can't mount proc on /newroot/proc: Operation not permitted`），
+  预计在 GitHub 的 VM runner 上不成立（待首次 CI 实跑确认），不是代码缺陷。
+  顺带给两个 GTK step 加 `GSK_RENDERER=cairo`（容器里非 root 跑 Xvfb 时 GLX 报过 `BadAccess`；
+  闸门不需要 GL 渲染）。证据：宿主机（GTK 4.24 / libadwaita 1.10）重跑 **18/18 PASS**、退出码 0。
 
 **第三十八轮：GUI 分身生命周期解耦（ADR-028）**（2026-11-08）。用户拍板：**分离运行 + 停止按钮**。
 - GUI 点「启动」不再在自己的进程里跑 `core.Run`，而是以自身二进制 fork 一个会话首进程（runner，

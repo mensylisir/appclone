@@ -25,6 +25,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unsafe"
 
 	"codeberg.org/puregotk/puregotk/v4/adw"
 	"codeberg.org/puregotk/puregotk/v4/gio"
@@ -1286,19 +1287,36 @@ func TestGtkEnglishStrings(t *testing.T) {
 	}
 }
 
+// typeNameOf 返回 GObject 类型名（如 AdwActionRow）。puregotk 没有暴露
+// GetType 包装，只能按 GTypeInstance 布局读；GoPointer 是 C 对象地址，
+// 先落到 unsafe.Pointer 再转（直接 uintptr→unsafe.Pointer 会被 vet 拦）。
+func typeNameOf(w *gtk.Widget) string {
+	p := w.GoPointer()
+	return gobject.TypeNameFromInstance((*gobject.TypeInstance)(*(*unsafe.Pointer)(unsafe.Pointer(&p))))
+}
+
 // findListRow 在一组行里按标题找控件。标题是产品自己 SetTitle 写进去的，
 // 读它等于问"用户看到的这一行是不是它"。返回的包装带引用，调用方负责 Unref。
+//
+// 不用 `adw.PreferencesGroup.GetRow`：`adw_preferences_group_get_row` 在
+// libadwaita 1.5（ubuntu-24.04，CI 的 GTK job）不存在，puregotk 注册出的
+// 函数指针为 nil，一调用就 panic（2026-11-08 在 ubuntu:24.04 容器里实测）。
+// 改为在控件树里找 GtkListBox，它的直接子节点就是行。
 func findListRow(g *adw.PreferencesGroup, title string) *gtk.Widget {
-	for i := uint32(0); ; i++ {
-		w := g.GetRow(i)
-		if w == nil {
-			return nil
-		}
-		if stringProp(w, "title") == title {
-			return w
-		}
-		w.Unref()
+	boxes := findWidgets(&g.Widget, func(w *gtk.Widget) bool {
+		return typeNameOf(w) == "GtkListBox"
+	})
+	if len(boxes) == 0 {
+		return nil
 	}
+	for c := boxes[0].GetFirstChild(); c != nil; c = c.GetNextSibling() {
+		if stringProp(c, "title") == title {
+			// GetFirstChild 的包装已 IncreaseRef，与旧 GetRow 的语义相同；
+			// 不要再 Ref，调用方的 Unref 正好抵消这一份。
+			return c
+		}
+	}
+	return nil
 }
 
 // stringProp 读一个字符串属性（GetProperty 需要先按类型初始化 Value）。

@@ -457,7 +457,8 @@ activated / response / idle，地址恒定、注册一次后不再重新赋值�
   - `ubuntu-24.04` → 验 S0 第 5 条（libadwaita 1.5.0 下限，§4.3）；
   - `ubuntu-24.04-arm` → 验 arm64（**交叉编译出来能跑 ≠ 跑过**，见上方 CPU 架构段）。
   两个 job 的断言相同：能起、三屏能切换、**删除实例弹出 `AdwAlertDialog` 确认且可取消**（§4.6 要求补的那条），
-  不做像素比对。
+  不做像素比对。GTK step 固定 `GSK_RENDERER=cairo`：无 GPU 的 Xvfb 上 GLX 上下文可能被 X 拒绝（BadAccess），
+  闸门验的是交互语义与控件树，不是渲染路径，不因此降低真实性。
 - **许可证**：建议 GPL-3.0-or-later（与 GTK/libadwaita 生态一致性最好；puregotk 为 MIT，兼容；
   core 为 MIT 亦可接受，若希望被第三方嵌入）。
 

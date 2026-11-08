@@ -151,6 +151,10 @@ jobs:
             sudo apparmor_parser -r /etc/apparmor.d/bwrap
           fi
       - name: design/guitest-gtk.sh
+        env:
+          # 无 GPU 的 runner 上 GLX 上下文可能被 X 拒绝（BadAccess），
+          # 闸门不需要 GL 渲染；cairo 在有/无显示的机器上都稳。
+          GSK_RENDERER: cairo
         run: xvfb-run -a -s "-screen 0 1280x1024x24" design/guitest-gtk.sh
 
   gtk-arm:
@@ -176,4 +180,8 @@ jobs:
             sudo apparmor_parser -r /etc/apparmor.d/bwrap
           fi
       - name: design/guitest-gtk.sh
+        env:
+          # 无 GPU 的 runner 上 GLX 上下文可能被 X 拒绝（BadAccess），
+          # 闸门不需要 GL 渲染；cairo 在有/无显示的机器上都稳。
+          GSK_RENDERER: cairo
         run: xvfb-run -a -s "-screen 0 1280x1024x24" design/guitest-gtk.sh
