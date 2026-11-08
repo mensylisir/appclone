@@ -1,0 +1,10 @@
+abi <abi/4.0>,
+include <tunables/global>
+
+# Ubuntu 23.10+ 默认 kernel.apparmor_restrict_unprivileged_userns=1，未受限的
+# bwrap 无法创建 user namespace。这里只放开 bwrap 自身（unconfined），不改全局
+# sysctl——削弱整机加固的代价远大于本工具的收益。已存在同名 profile 时安装脚本
+# 会跳过，给发行版将来自己提供留出位置。
+profile bwrap /usr/bin/bwrap flags=(unconfined) {
+  userns,
+}

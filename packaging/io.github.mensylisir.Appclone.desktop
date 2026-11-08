@@ -1,0 +1,16 @@
+[Desktop Entry]
+Type=Application
+Name=应用分身
+Name[en]=App Clones
+Name[zh_CN]=应用分身
+GenericName=应用分身
+GenericName[en]=App Cloning
+Comment=为任意应用再开一个分身，只隔离它自己的数据
+Comment[en]=Run a second, isolated instance of an application
+Exec=/usr/bin/appclone-gui
+Icon=io.github.mensylisir.Appclone
+Terminal=false
+Categories=Settings;System;
+Keywords=分身;克隆;隔离;沙箱;应用;多开;
+Keywords[en]=clone;clones;isolate;sandbox;app;separate;
+StartupNotify=true

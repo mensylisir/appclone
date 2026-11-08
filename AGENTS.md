@@ -116,6 +116,7 @@ appclone 是把 Android「应用分身 / Cloned Apps」语义移植到 Linux 桌
 
 ```bash
 gofmt -l . && go vet ./... && go test ./...    # Go 门禁（go.mod 建成后才有意义）
+staticcheck ./...                              # CI 阻塞门禁；本地先 go install honnef.co/go/tools/cmd/staticcheck@v0.8.2（对应 2026.2.2）
 CGO_ENABLED=0 go build ./...                   # 全仓零 cgo（puregotk 不需要 C 工具链）
 # GUI 交互回归（项数以脚本内 EXPECTED 为准，当前 62 项；退出码 0 才算过；脚本自动发现 chromium 与 puppeteer-core）
 node design/guitest.js

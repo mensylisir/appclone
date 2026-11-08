@@ -1,0 +1,69 @@
+# nfpm 打包配置（deb / rpm / Arch 共用一份，见 docs/tech-stack.md「分发产物」）。
+# 二进制先按架构落到 dist/stage/ 再打包（nfpm 不对 contents.src 做环境变量展开）：
+#   mkdir -p dist/stage && cp dist/bin/<arch>/* dist/stage/
+#   VERSION=1.0.0 nfpm pkg --config packaging/nfpm.yaml --packager deb --target /tmp/
+name: appclone
+arch: ${GOARCH}
+platform: linux
+version: ${VERSION}
+section: utils
+priority: optional
+maintainer: mensylisir <710080675@qq.com>
+vendor: mensylisir
+homepage: https://github.com/mensylisir/appclone
+description: |
+  为任意 Linux 应用再开一个分身（只隔离它自己的数据）。
+  bubblewrap 实现 per-app 沙箱；公共文件与桌面会话照常共享；GUI 与 CLI 共用同一份
+  core 与实例目录。无需 root、无 daemon。
+depends:
+  - bubblewrap
+
+overrides:
+  deb:
+    depends:
+      - libgtk-4-1 (>= 4.14)
+      - libadwaita-1-0 (>= 1.5)
+      - bubblewrap
+      - desktop-file-utils
+    recommends:
+      - fuse-overlayfs
+      - strace
+      # postinstall 的图标缓存更新器在 Debian 系属于 libgtk-4-bin；
+      # 只装运行库时该步骤会 best-effort 跳过（SVG 仍能按路径加载）。
+      - libgtk-4-bin
+  rpm:
+    depends:
+      - gtk4 >= 4.14
+      - libadwaita >= 1.5
+      - bubblewrap
+      - desktop-file-utils
+    recommends:
+      - fuse-overlayfs
+      - strace
+  # nfpm v2.41 不表达 Arch 的 optdepends；fuse-overlayfs / strace 属推荐依赖，
+  # README 与 doctor 都会提示：缺 fuse 走 strace，两者都缺则探测不可用（分身仍可运行）。
+  archlinux:
+    depends:
+      - gtk4>=4.14
+      - libadwaita>=1.5
+      - bubblewrap
+      - desktop-file-utils
+
+contents:
+  - src: dist/stage/appclone
+    dst: /usr/bin/appclone
+    file_info:
+      mode: 0755
+  - src: dist/stage/appclone-gui
+    dst: /usr/bin/appclone-gui
+    file_info:
+      mode: 0755
+  - src: packaging/io.github.mensylisir.Appclone.desktop
+    dst: /usr/share/applications/io.github.mensylisir.Appclone.desktop
+  - src: packaging/io.github.mensylisir.Appclone.svg
+    dst: /usr/share/icons/hicolor/scalable/apps/io.github.mensylisir.Appclone.svg
+  - src: packaging/bwrap.apparmor
+    dst: /usr/share/appclone/bwrap.apparmor
+
+scripts:
+  postinstall: packaging/postinstall.sh

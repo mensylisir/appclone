@@ -385,14 +385,18 @@ activated / response / idle，地址恒定、注册一次后不再重新赋值�
 - **分发产物**（v1.0.0；**deb 与 rpm 各出 amd64 + arm64 两套，Arch 只出 x86_64**，见下）：
   三种包格式由 CI 用 **nfpm** 从同一份 `nfpm.yaml` 产出；`.tar.gz` 不走 nfpm——nfpm 没有 tarball packager，
   由 CI 另起一步按同一份 `contents` 清单打 tar。
-  - `.deb` → Ubuntu 24.04+ / Debian 13+；`Depends: libgtk-4-1 (>= 4.14), libadwaita-1-0 (>= 1.5), bubblewrap`，
-    `Recommends: fuse-overlayfs`；
+  - `.deb` → Ubuntu 24.04+ / Debian 13+；`Depends: libgtk-4-1 (>= 4.14), libadwaita-1-0 (>= 1.5), bubblewrap,
+    desktop-file-utils`，`Recommends: fuse-overlayfs, strace, libgtk-4-bin`（最后一项供图标缓存更新器，
+    缺失只影响缓存，不影响 SVG 按路径加载）；
   - `.rpm` → Fedora 41+ / CentOS Stream 10 / RHEL 10；
-    `Requires: gtk4 >= 4.14, libadwaita >= 1.5, bubblewrap`，`Recommends: fuse-overlayfs`；
+    `Requires: gtk4 >= 4.14, libadwaita >= 1.5, bubblewrap, desktop-file-utils`，
+    `Recommends: fuse-overlayfs, strace`；
     **openSUSE 不在 v1 承诺内**：Tumbleweed 的 GTK4/libadwaita 运行库包名与 Fedora 不同，单份 rpm 的 `Requires`
     只能命中一套，要支持得另建 spec——留待社区走 OBS，不写进承诺。
-  - `.pkg.tar.zst` → Arch / Manjaro（**仅 x86_64**）；`depends=(gtk4>=4.14 libadwaita>=1.5 bubblewrap)`，
-    `optdepends=(fuse-overlayfs)`；同时提交 AUR `appclone-bin`（预编译，只含 x86_64）。
+  - `.pkg.tar.zst` → Arch / Manjaro（**仅 x86_64**）；`depends=(gtk4>=4.14 libadwaita>=1.5 bubblewrap
+    desktop-file-utils)`；**nfpm v2.41 不支持表达 Arch 的 `optdepends`**，`fuse-overlayfs`/`strace`
+    只在 README 与 `doctor` 里提示（缺 fuse 走 strace，两者都缺则无法探测、但分身仍可运行）；
+    同时提交 AUR `appclone-bin`（预编译，只含 x86_64；**尚未提交**，README 不把它写成现成路径）。
     **Arch 的 arm64 走另一条路**：Arch Linux ARM 是独立项目、官方仓库只发 x86_64，所以 arm64 用户用 AUR 的
     源码包 `appclone`（本地编译，零 cgo 不需要装 GTK 开发包）或 `.tar.gz`——这条要写进 README，别让 arm64 用户去装
     `appclone-bin` 然后拿到一个跑不起来的 x86_64 二进制；
@@ -422,9 +426,19 @@ activated / response / idle，地址恒定、注册一次后不再重新赋值�
     （**文件名必须等于 app id**，见 §4.8；不一致会导致 Dock 出现重复图标、通知不归属本应用）
   - 图标 → `/usr/share/icons/hicolor/scalable/apps/io.github.mensylisir.Appclone.svg`
 
-  `postinstall` 必须做三件事：① AppArmor 检测与 profile 安装（上面那条）；② `update-desktop-database -q`；
-  ③ `gtk-update-icon-cache -q -t -f /usr/share/icons/hicolor || true`。
-  deb 没有 pacman 那样的自动触发器，漏了 ②③ 的表现是"应用列表里搜不到、图标空白"。
+  `postinstall` 必须做三件事：① AppArmor 检测与 profile 安装（上面那条；先写临时文件再 rename，
+  中断不留半截 profile）；② `update-desktop-database -q`（依赖 `desktop-file-utils`）；
+  ③ 图标缓存：优先 `gtk4-update-icon-cache`，回退 `gtk-update-icon-cache`，都失败则跳过（best-effort；
+  Debian 系的更新器在 `libgtk-4-bin` 里，只列为 Recommends，不因此把安装体积抬成硬依赖）。
+  deb 没有 pacman 那样的自动触发器：漏了 ② 的表现是"应用列表里搜不到"；③ 只是性能/旧主题优化，
+  缺了不影响 SVG 按路径加载。
+
+  **落地状态（2026-11-08）**：`packaging/nfpm.yaml` + `packaging/postinstall.sh` + 桌面入口/图标/
+  `bwrap.apparmor` 已在仓库；`.github/workflows/ci.yml`（Go 门禁、HTML 闸门、amd64/arm64 GTK 闸门）
+  与 `release.yml`（tag 触发、nfpm v2.41.0 固定版本、5 包 + 2 tar.gz + checksums）已编写。
+  **nfpm 的两个已知限制**写进配置注释：① 不对 `contents.src` 做环境变量展开，发布流程先把二进制
+  拷到 `dist/stage/`；② v2.41 无 Arch `optdepends`。本地已用 `VERSION=0.0.0-test` 走通全流程并解包核对
+  架构字段；GitHub Actions 尚未实跑，故暂标 `implemented`，首次 CI 全绿后才升 `verified`。
 - **v1 不做**（各有理由，不是遗漏）：
   - **Flatpak**：见 ADR-015；
   - **Snap**：同类问题（confinement 阻止调 bwrap），另需商店账号与审核流程；
@@ -435,6 +449,9 @@ activated / response / idle，地址恒定、注册一次后不再重新赋值�
 - **CI**：GitHub Actions——PR 触发 `gofmt`/`go vet`/`staticcheck`/`go test`，以及两个二进制 × 两个架构的交叉编译
   （无需装 GTK）；**tag 触发 nfpm 出包**并上传 Releases（矩阵同「架构命名」段：`{deb,rpm} × {amd64,arm64}`
   共 4 套 + `archlinux × amd64` 1 套 = 5 个包，`.tar.gz` 另出 amd64/arm64 两个）。
+  **发版前先复用 `ci.yml` 的全部 job**（`workflow_call`：Go/HTML/GTK/GTK-arm）——tag 可以打在
+  任意提交上，发版流程自己重跑一遍 Go 不够，HTML/GTK 回归也必须绿；tag 只接受 `vX.Y.Z`
+  （nfpm 会把预发布号在 Arch `.PKGINFO` 里写成正式版）。
   GUI 冒烟要装 GTK4 运行库（`xvfb-run` + `broadway` 可选），跑**两个 job**：
   - `ubuntu-24.04` → 验 S0 第 5 条（libadwaita 1.5.0 下限，§4.3）；
   - `ubuntu-24.04-arm` → 验 arm64（**交叉编译出来能跑 ≠ 跑过**，见上方 CPU 架构段）。

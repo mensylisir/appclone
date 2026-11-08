@@ -36,8 +36,9 @@ type Env struct {
 	// 一个用例的 upper 让另一个用例的 verify 读到"证据不完整"。
 	TmpRoot string
 
-	mu   sync.Mutex // 进程内先互斥，再抢 flock：GUI 的探测 goroutine 与列表刷新
-	lock *os.File   // 在同一进程里各开一次会自锁（flock 是进程级的，同进程不互斥）
+	mu sync.Mutex // 进程内先互斥，再抢 flock：GUI 的探测 goroutine 与列表刷新
+	// 在同一进程里各开一次文件锁会自锁（flock 是进程级的，同进程不互斥），
+	// 所以锁文件只在 OpenState 里局部持有，不挂在 Env 上。
 }
 
 // tmpRoot 是写层根目录。默认 /var/tmp：必须在 $HOME 之外（overlay 的 upper

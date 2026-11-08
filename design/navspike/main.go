@@ -82,8 +82,7 @@ func activate(app *adw.Application) {
 
 	// 交替 push / pop：给 pop 动画留一拍，再压下一页。
 	step := 0
-	var tick glib.SourceFunc
-	tick = func(uintptr) bool {
+	tick := glib.SourceFunc(func(uintptr) bool {
 		switch {
 		case step >= 80:
 			fmt.Println("navspike: 40 轮 push/pop 完成，无崩溃")
@@ -96,6 +95,6 @@ func activate(app *adw.Application) {
 		}
 		step++
 		return true
-	}
+	})
 	glib.TimeoutAdd(120, &tick, 0)
 }

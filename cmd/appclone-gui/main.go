@@ -13,6 +13,9 @@ import (
 	"github.com/mensylisir/appclone/core/i18n"
 )
 
+// version 由构建期 -ldflags -X main.version=… 注入（与 CLI 同一个版本串）。
+var version = "dev"
+
 func main() {
 	// ADR-028：启动分身时 GUI 以自身二进制 fork 一个 runner；它在
 	// GTK/GApplication 初始化之前分流，不建窗口、不进主循环。注意
@@ -32,6 +35,7 @@ func main() {
 
 	app := adw.NewApplication("io.github.mensylisir.Appclone", gio.GApplicationFlagsNoneValue)
 	defer app.Unref()
+	app.SetVersion(version)
 
 	// ADR-027 退场：三屏四态的静态文案已全部按 ui.* 进消息表（zh_CN + en），
 	// GTK 闸门走遍列表/配置/详情三屏与 probing/confirm/creating/error 四态，

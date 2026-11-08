@@ -1,0 +1,134 @@
+# 持续集成：每次 push/PR 都跑完整门禁。
+# 刻意与发版分开（release.yml）：打包失败不该阻塞日常开发，
+# 但代码门禁失败绝不该进 main。
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  # 发版前由 release.yml 复用整套门禁（Go/HTML/GTK/GTK-arm），
+  # tag 可以指向任意提交，不能只信 main 上那次 CI。
+  workflow_call:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  go:
+    name: Go 门禁（gofmt/vet/staticcheck/test/race/交叉编译）
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: gofmt（有输出即失败）
+        run: |
+          out=$(gofmt -l .)
+          if [ -n "$out" ]; then echo "以下文件未格式化："; echo "$out"; exit 1; fi
+
+      - name: go vet（默认）
+        run: go vet ./...
+
+      # gtk_e2e 测试文件只在 GTK 机器上运行；这里只做类型检查，
+      # puregotk 编译期不需要 GTK 开发包（dlopen 在运行期）。
+      - name: go vet（gtk_e2e）
+        run: go vet -tags gtk_e2e ./cmd/appclone-gui
+
+      - name: staticcheck
+        run: |
+          # 静态检查工具版本 2026.2.2 对应的 module tag 是 v0.8.2。
+          go install honnef.co/go/tools/cmd/staticcheck@v0.8.2
+          "$(go env GOPATH)/bin/staticcheck" -version
+          "$(go env GOPATH)/bin/staticcheck" ./...
+
+      - name: go test
+        run: go test -count=1 ./...
+
+      # -race 需要 cgo（构建仍按发布形态走 CGO_ENABLED=0）。
+      - name: go test -race
+        env:
+          CGO_ENABLED: "1"
+        run: go test -race -count=1 ./core/... ./cmd/appclone
+
+      - name: 零 cgo 构建 + 两架构交叉编译
+        env:
+          CGO_ENABLED: "0"
+        run: |
+          go build ./...
+          for arch in amd64 arm64; do
+            GOOS=linux GOARCH="$arch" go build -trimpath -o /tmp/appclone-"$arch" ./cmd/appclone
+            GOOS=linux GOARCH="$arch" go build -trimpath -o /tmp/appclone-gui-"$arch" ./cmd/appclone-gui
+          done
+
+  html:
+    name: GUI 设计稿交互回归（62 项）
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: browser-actions/setup-chrome@v1
+        id: chrome
+      - name: 安装 puppeteer-core 并跑 HTML 闸门
+        env:
+          CHROMIUM: ${{ steps.chrome.outputs.chrome-path }}
+        run: |
+          npm install --no-save puppeteer-core@25.16.0
+          node design/guitest.js
+
+  gtk:
+    name: GTK 闸门（ubuntu-24.04 / amd64）
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: 安装 GTK4/libadwaita 运行库与 xvfb
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libgtk-4-1 libadwaita-1-0 bubblewrap fuse-overlayfs xvfb libglib2.0-bin apparmor dbus strace
+      - name: 放行 bwrap 的 user namespace（Ubuntu 24.04 的 AppArmor 限制）
+        run: |
+          if [ "$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns 2>/dev/null || echo 0)" = "1" ]; then
+            sudo cp packaging/bwrap.apparmor /etc/apparmor.d/bwrap
+            sudo apparmor_parser -r /etc/apparmor.d/bwrap
+          fi
+      - name: design/guitest-gtk.sh
+        run: xvfb-run -a -s "-screen 0 1280x1024x24" design/guitest-gtk.sh
+
+  gtk-arm:
+    # arm64 是「能编译 ≠ 跑过」：必须在真实 arm64 上跑一遍 GUI 闸门
+    # （tech-stack §6「CPU 架构」）。GitHub 的 arm hosted runner 已 GA。
+    name: GTK 闸门（ubuntu-24.04-arm / arm64）
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: 安装 GTK4/libadwaita 运行库与 xvfb
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libgtk-4-1 libadwaita-1-0 bubblewrap fuse-overlayfs xvfb libglib2.0-bin apparmor dbus strace
+      - name: 放行 bwrap 的 user namespace（Ubuntu 24.04 的 AppArmor 限制）
+        run: |
+          if [ "$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns 2>/dev/null || echo 0)" = "1" ]; then
+            sudo cp packaging/bwrap.apparmor /etc/apparmor.d/bwrap
+            sudo apparmor_parser -r /etc/apparmor.d/bwrap
+          fi
+      - name: design/guitest-gtk.sh
+        run: xvfb-run -a -s "-screen 0 1280x1024x24" design/guitest-gtk.sh

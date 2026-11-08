@@ -434,9 +434,7 @@ func (e *Env) judge(p Profile, entries []UpperEntry, rec *runRecord) Verdict {
 		// 不能错（extract_failed 与 leak-detected 的下一步完全相反）。
 		expandInto(&mustBind, p.Paths)
 		expandInto(&mustBind, p.SharedWrites)
-		for _, pub := range e.Resolver.PublicDirs() {
-			mustBind = append(mustBind, pub)
-		}
+		mustBind = append(mustBind, e.Resolver.PublicDirs()...)
 		if e.Base != "" {
 			mustBind = append(mustBind, e.Base)
 		}

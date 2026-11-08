@@ -1,0 +1,117 @@
+# 发版：推 tag `v*` 时构建两架构二进制、三格式安装包与 tar.gz，并上传 Releases。
+# 矩阵与命名见 docs/tech-stack.md §6「分发产物 / 架构命名」：
+#   {deb,rpm} × {amd64,arm64} = 4 套，archlinux × amd64 = 1 套，共 5 个包；
+#   tar.gz 两架构各一个；附 checksums.txt。
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  # tag 校验放在最前面：非法 tag 不值得先跑完整 CI。
+  validate:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: 校验 tag 格式（只接受正式版 vX.Y.Z，禁止前导零）
+        run: |
+          if ! printf '%s' "$GITHUB_REF_NAME" | grep -Eq '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'; then
+            echo "::error::只支持 vX.Y.Z 形式的正式版 tag：nfpm 会把预发布版本号写成正式版（Arch pkgver 丢 rc），禁止发布"
+            exit 1
+          fi
+
+  # 复用 ci.yml 的全部 job：tag 可能打在未过门禁的提交上，
+  # release 自己重跑一遍不够（HTML/GTK 回归也必须绿）。
+  verify:
+    needs: validate
+    uses: ./.github/workflows/ci.yml
+
+  release:
+    needs: [validate, verify]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: 解析版本号
+        run: echo "VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
+
+      # verify job 已跑完整门禁；这里再做一次轻量 Go 检查，防止
+      # 构建步骤与 verify 之间工作树被意外改动（正常流程下恒过）。
+      - name: 发版前轻量 Go 检查
+        run: |
+          test -z "$(gofmt -l .)"
+          go vet ./...
+          go test -count=1 ./...
+
+      - name: 构建两架构二进制（零 cgo）
+        env:
+          CGO_ENABLED: "0"
+        run: |
+          for arch in amd64 arm64; do
+            mkdir -p "dist/bin/$arch"
+            GOOS=linux GOARCH="$arch" go build -trimpath \
+              -ldflags "-s -w -X main.version=$VERSION" \
+              -o "dist/bin/$arch/appclone" ./cmd/appclone
+            GOOS=linux GOARCH="$arch" go build -trimpath \
+              -ldflags "-s -w -X main.version=$VERSION" \
+              -o "dist/bin/$arch/appclone-gui" ./cmd/appclone-gui
+          done
+          file dist/bin/*/*
+
+      - name: 安装 nfpm（版本固定 + 校验和，避免打包行为漂移/供应链替换）
+        run: |
+          curl -fsSL -o /tmp/nfpm.tar.gz \
+            https://github.com/goreleaser/nfpm/releases/download/v2.41.0/nfpm_2.41.0_Linux_x86_64.tar.gz
+          echo "2fec509cc508fd7688b03f1426747725e93e024ff3c94a7f02022a50ddaa6c04  /tmp/nfpm.tar.gz" | sha256sum -c -
+          sudo tar -xzf /tmp/nfpm.tar.gz -C /usr/local/bin nfpm
+          nfpm --version
+
+      - name: 出 deb / rpm / Arch 包
+        run: |
+          mkdir -p dist/pkg
+          for arch in amd64 arm64; do
+            rm -rf dist/stage && mkdir -p dist/stage
+            cp "dist/bin/$arch/appclone" "dist/bin/$arch/appclone-gui" dist/stage/
+            for fmt in deb rpm; do
+              GOARCH="$arch" VERSION="$VERSION" \
+                nfpm pkg --config packaging/nfpm.yaml --packager "$fmt" --target dist/pkg/
+            done
+          done
+          # Arch 官方仓库只有 x86_64；arm64 用户走 .tar.gz 或 AUR 源码包。
+          rm -rf dist/stage && mkdir -p dist/stage
+          cp dist/bin/amd64/appclone dist/bin/amd64/appclone-gui dist/stage/
+          GOARCH=amd64 VERSION="$VERSION" \
+            nfpm pkg --config packaging/nfpm.yaml --packager archlinux --target dist/pkg/
+
+      - name: 出 tar.gz 与校验和
+        run: |
+          mkdir -p dist/tar
+          for arch in amd64 arm64; do
+            stage="dist/tar/appclone_${VERSION}_linux_${arch}"
+            mkdir -p "$stage"
+            cp "dist/bin/$arch/appclone" "dist/bin/$arch/appclone-gui" \
+              packaging/io.github.mensylisir.Appclone.desktop \
+              packaging/io.github.mensylisir.Appclone.svg \
+              packaging/bwrap.apparmor "$stage/"
+            tar -C "$stage" -czf "dist/tar/appclone_${VERSION}_linux_${arch}.tar.gz" .
+          done
+          (cd dist/pkg && sha256sum ./* > ../checksums.txt)
+          (cd dist/tar && sha256sum ./*.tar.gz >> ../checksums.txt)
+          cat dist/checksums.txt
+
+      - name: 上传 Releases
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/pkg/*
+            dist/tar/*.tar.gz
+            dist/checksums.txt
+          generate_release_notes: true
+          fail_on_unmatched_files: true

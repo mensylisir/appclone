@@ -237,7 +237,7 @@ func parseProfile(app, path string, data []byte) (Profile, error) {
 		p.Ignored = *w.Ignored
 	}
 	for _, u := range w.Unsupported {
-		p.Unsupported = append(p.Unsupported, Unsupported{Kind: u.Kind, Path: u.Path, Reason: u.Reason})
+		p.Unsupported = append(p.Unsupported, Unsupported(u))
 	}
 	for _, s := range w.ExtraBinds {
 		src, dst, ok := strings.Cut(s, "|")
@@ -280,7 +280,7 @@ func (e *Env) SaveProfile(p Profile) error {
 		w.ExtraBinds = append(w.ExtraBinds, b.Src+"|"+b.Dst)
 	}
 	for _, u := range p.Unsupported {
-		w.Unsupported = append(w.Unsupported, unsupportedWire{Kind: u.Kind, Path: u.Path, Reason: u.Reason})
+		w.Unsupported = append(w.Unsupported, unsupportedWire(u))
 	}
 
 	data, err := encodeProfileOf(w, p.Unknown)
@@ -326,7 +326,7 @@ func encodeProfile(p Profile) ([]byte, error) {
 		w.ExtraBinds = append(w.ExtraBinds, b.Src+"|"+b.Dst)
 	}
 	for _, u := range p.Unsupported {
-		w.Unsupported = append(w.Unsupported, unsupportedWire{Kind: u.Kind, Path: u.Path, Reason: u.Reason})
+		w.Unsupported = append(w.Unsupported, unsupportedWire(u))
 	}
 	return encodeProfileOf(w, p.Unknown)
 }

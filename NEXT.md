@@ -408,6 +408,68 @@ GTK 闸门补结构断言：无实例时 `GetVisibleChildName()=="all"`、创建
   `design/guitest-gtk.sh` **16/16 PASS**（约 4.6s，退出码 0）；
   另以 `CGO_ENABLED=1 -race -tags gtk_e2e` 单跑 Fork/图标两用例通过（数据竞争修复有实测）。
 
+**第四十一轮：打包与 CI（`implemented`）+ staticcheck 归零**（2026-11-08）。目标从"本机能跑"推进到"发布可用"。
+- **打包配置落地**：`packaging/nfpm.yaml` 一份配置出 deb/rpm/Arch 三格式；`depends` 按格式覆写
+  （deb `libgtk-4-1 (>=4.14)` / rpm `gtk4 >= 4.14` / Arch `gtk4>=4.14`），`fuse-overlayfs` 走推荐/可选。
+  **nfpm v2.41 不对 `contents.src` 做环境变量展开**，发布流程先把二进制落到 `dist/stage/` 再打包。
+  包内落点、postinstall 三件事（AppArmor profile / 桌面数据库 / 图标缓存）与 `tech-stack.md` §6 一致。
+- **postinstall 的 AppArmor 处理**：只在 `kernel.apparmor_restrict_unprivileged_userns=1` 且
+  `/etc/apparmor.d/bwrap` 不存在时安装；不改全局 sysctl，不覆盖发行版将来的同名 profile。
+  任一步失败都以 0 退出——安装事务不能失败，环境问题交给 `appclone doctor` 如实报告。
+- **发布资产**：`README.md`（安装/使用/排障/开发门禁）、`.desktop`（`Name[zh_CN]=应用分身`）、
+  hicolor SVG 图标、`bwrap.apparmor`。
+- **CI（`.github/workflows/ci.yml`）**：Go 门禁 job 跑 gofmt / vet（含 `gtk_e2e` 标签）/ staticcheck /
+  `go test` / `-race` / 零 cgo 构建与 amd64+arm64 交叉编译；HTML 闸门 job（Chrome for Testing +
+  puppeteer-core 25.16.0）；GTK 闸门 job 在 `ubuntu-24.04` 与 `ubuntu-24.04-arm` 各跑一次
+  `xvfb-run design/guitest-gtk.sh`——arm64 是"能编译 ≠ 跑过"的实机验证，不是可选项。
+- **发版（`.github/workflows/release.yml`）**：tag `v*` 触发；固定 nfpm v2.41.0；矩阵按文档
+  `{deb,rpm} × {amd64,arm64}` + `archlinux × amd64` = 5 包，另出两个架构化 `.tar.gz` 与 `checksums.txt`，
+  由 `softprops/action-gh-release` 上传。Arch 包名/架构、deb `Architecture: arm64`、
+  rpm `aarch64` 已在本地用 `VERSION=0.0.0-test` 全流程出包并解包核对。
+- **staticcheck 归零**：修掉 6 条既有告警（两处结构体转换、`Env.lock` 死字段、`append` 循环、
+  navspike 变量声明合并），`staticcheck ./...` 无输出，因此可作为 CI 阻塞门禁。
+- 证据：`gofmt -l .` 空、`go vet ./...` 干净、`go test -count=1 ./...` 全绿、`staticcheck ./...` 零输出；
+  本地模拟 release 步骤（两架构交叉编译 → 5 包 → 2 tar.gz → checksums）全部成功；
+  两个 workflow YAML 解析通过。**未验证**：GitHub Actions 实跑（本机无法复现 hosted runner 环境），
+  故打包能力只标 `implemented`，CI 首次绿之前不标 `verified`。
+- **只读复审 REJECTED 后的修复**（1 P1 + 5 P2 + 10 P3）：
+  ① **P1：CI 的 GTK job 缺 `strace`**——GTK 测试注入 `noFuseMounter`，探测只能走 strace；
+     两个 job 的 apt 列表补 `strace` 与 `dbus`，否则 `TestGtkRapidRepush` 会因探测直接报错而变红。
+  ② `.desktop` 按 §4.8 改为 `Name=应用分身`（另加 `Name[en]`）、`Categories=Settings;System;`，
+     删掉可能与应用 id 不匹配的 `StartupWMClass`。
+  ③ `postinstall` 的桌面数据库/图标缓存 helper 不在最小依赖里：加 `desktop-file-utils` 依赖，
+     图标缓存先试 `gtk4-update-icon-cache` 再回退 `gtk-update-icon-cache`（都缺则 best-effort 跳过）；
+     AppArmor profile 改临时文件 + rename，中断不再留半截文件。
+  ④ `.tar.gz` 补进 `bwrap.apparmor`，README 排障路径同步（手工安装不再引用仓库内路径）。
+  ⑤ 包与文档补上 strace 承诺：deb/rpm `Recommends: strace`，Arch 受 nfpm 限制写进 README；
+     `doctor` 新增 `probeBackend`（fuse + `/dev/fuse` + strace 三输入）——两者都缺时报 **fail** 而不是
+     warning，并新增 `TestProbeBackend` 钉住六种组合。
+  ⑥ README 修正：静态链接只描述 CLI（GUI 经 dlopen）、安装命令改 `apt install ./` / `dnf install ./`、
+     Arch 的 postinstall 一并说明、AUR 源码包改为"尚未提交"、Go 门禁补 staticcheck 与 `gtk_e2e` vet。
+  ⑦ release 硬化：tag 只接受 `vX.Y.Z`（nfpm 会把 `1.0.0-rc1` 在 Arch `.PKGINFO` 写成 `1.0.0`，等于
+     把预发布当正式版发出去）；发版前重跑 gofmt/vet/test；nfpm tarball 加 sha256 校验；
+     GUI 补 `main.version` 并用 `GApplication.SetVersion` 暴露。
+  **记录不修**：license 字段/`LICENSE` 是用户/法务决策（tech-stack 建议 GPL-3.0-or-later，未获确认前不写）；
+  `ubuntu-24.04-arm` hosted runner 是否在当前账号套餐内无法从本机验证，CI 保持必需 job 而不是静默跳过；
+  actions 仍钉 tag 未钉 SHA（供应链硬化留到发版流程稳定后）；卸载时清理 AppArmor profile 未做
+  （删除 `/etc` 文件比留着更危险，交给发行版/用户）。
+- **二次复审后的收口**（2 P2 + 6 P3）：
+  ① **P2：补 GTK 闸门证据**——`design/guitest-gtk.sh` 在最终树重跑，16 条全部 PASS、退出码 0
+     （本机首次因 /tmp 配额不足构建失败，清理自有临时产物后通过；不是测试失败）。
+  ② **P2：release 复用整套 CI**——`ci.yml` 增加 `workflow_call`，`release.yml` 的 `verify` job
+     直接调用它（Go/HTML/GTK/GTK-arm 全跑），`release` 再 `needs: verify`；tag 来自任意提交时
+     也不能跳过 HTML/GTK 回归。
+  ③ `doctor --strict` 口径修正：`fuse` 检查进入 `required`——只有 fuse 与 strace **都不可用**
+     时该检查才是 fail，`--strict` 才会红；只缺 fuse（有 strace）仍是 warn。补 `TestRequiredIncludesProbeBackendFailure`。
+  ④ 提示语按实际能力分档：区分"普通分身仍可运行"与"`--fork` 克隆起步会降级"；两者都缺时
+     明确"装 strace 最稳妥，fuse-overlayfs 还需 /dev/fuse 可读写"。`TestProbeBackend` 补
+     "二进制缺失但 /dev/fuse 存在"两种现实组合。
+  ⑤ deb `Recommends` 加 `libgtk-4-bin`（图标缓存更新器在 Debian 系属于它）；`docs/tech-stack.md`
+     同步说明缓存是 best-effort，不抬成硬依赖。
+  ⑥ AppArmor 安装再硬化：临时文件改为 `/etc/apparmor.d/.appclone-bwrap.new`（AppArmor 不扫描隐藏名），
+     `apparmor_parser` 失败时删除目标以便下次安装重试；`doctor` 在文件存在但找不到 parser 时给 warn。
+  ⑦ README 修正"两者都缺不能新建"的过强表述：已有合法档案仍可建普通分身，只是不能首次探测新应用。
+
 **第三十八轮：GUI 分身生命周期解耦（ADR-028）**（2026-11-08）。用户拍板：**分离运行 + 停止按钮**。
 - GUI 点「启动」不再在自己的进程里跑 `core.Run`，而是以自身二进制 fork 一个会话首进程（runner，
   `APPCLONE_GUI_DETACH_APP/ID` + `Setsid`）；runner 在 GTK 初始化前分流，复用与 CLI 同一条

@@ -59,3 +59,44 @@ func TestVersionLess(t *testing.T) {
 		}
 	}
 }
+
+// probeBackend 决定 doctor 报 ok/warn/fail：两样都没时装 warn 是假通过，
+// 用户会以为"不装 fuse 也能用"，直到第一次探测直接报错。
+func TestProbeBackend(t *testing.T) {
+	cases := []struct {
+		fuse, devFuse, strace bool
+		want                  string
+	}{
+		{true, true, false, "ok"},
+		{true, true, true, "ok"},
+		{true, false, true, "warn"},
+		{false, false, true, "warn"},
+		{false, true, true, "warn"},
+		{false, true, false, "fail"},
+		{true, false, false, "fail"},
+		{false, false, false, "fail"},
+	}
+	for _, c := range cases {
+		got, detail := probeBackend(c.fuse, c.devFuse, c.strace)
+		if got != c.want {
+			t.Fatalf("probeBackend(fuse=%v,devFuse=%v,strace=%v)=%q want %q", c.fuse, c.devFuse, c.strace, got, c.want)
+		}
+		if got == "ok" && detail != "" {
+			t.Fatalf("ok 的 detail 应由调用方填路径，得到 %q", detail)
+		}
+		if got != "ok" && detail == "" {
+			t.Fatalf("warn/fail 必须带可执行建议")
+		}
+	}
+}
+
+// --strict 的必需项必须与"产品能不能探测新应用"对齐：fuse 检查只有
+// 在 fuse 与 strace 都不可用时才是 fail，见 probeBackend。
+func TestRequiredIncludesProbeBackendFailure(t *testing.T) {
+	if !required("fuse") {
+		t.Fatal("fuse 检查在两种后端都缺时是 fail，--strict 必须把它算作必需项")
+	}
+	if required("dbus") || required("gtk4") {
+		t.Fatal("降级项不应影响 --strict")
+	}
+}

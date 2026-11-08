@@ -245,10 +245,12 @@ func unverifiedWhy(reason string) string {
 }
 
 // required 区分"没有它产品起不来"和"没有它只是降级"。
-// fuse 缺失只是探测降级到 strace，不该让 --strict 红。
+// fuse 本身不是必需（缺了可走 strace），但 probeBackend 在 fuse 与 strace
+// 两者都不可用时会把 "fuse" 检查标成 fail——那意味着**无法探测新应用**，
+// --strict 应当红。只缺 fuse 且 strace 在时该检查是 warn，不会触发退出码 3。
 func required(id string) bool {
 	switch id {
-	case "bwrap", "userns", "apparmor", "state-dir":
+	case "bwrap", "userns", "apparmor", "state-dir", "fuse":
 		return true
 	}
 	return false
@@ -283,7 +285,11 @@ func runChecks(a *app) []check {
 	restrict := strings.TrimSpace(readFile("/proc/sys/kernel/apparmor_restrict_unprivileged_userns"))
 	if restrict == "1" {
 		if _, err := os.Stat("/etc/apparmor.d/bwrap"); err == nil {
-			add("apparmor", "ok", "限制已开启，但存在 /etc/apparmor.d/bwrap（bwrap 已放行）")
+			if _, perr := exec.LookPath("apparmor_parser"); perr != nil {
+				add("apparmor", "warn", "存在 /etc/apparmor.d/bwrap，但找不到 apparmor_parser，无法确认已加载（重启后 AppArmor 会读取该文件）")
+			} else {
+				add("apparmor", "ok", "限制已开启，但存在 /etc/apparmor.d/bwrap（bwrap 已放行）")
+			}
 		} else {
 			add("apparmor", "fail", "apparmor 限制非特权 userns 且缺少 /etc/apparmor.d/bwrap，bwrap 会报 setting up uid map: Permission denied")
 		}
@@ -291,17 +297,16 @@ func runChecks(a *app) []check {
 		add("apparmor", "ok", "未限制非特权 userns")
 	}
 
-	if p, err := exec.LookPath("fuse-overlayfs"); err == nil {
-		// 用 Access(R_OK) 而不是 Stat：设备节点存在但打不开（权限/被 mask）
-		// 是最常见的形态，Stat 会说"有"，实际挂载立刻失败。
-		if err := unix.Access("/dev/fuse", unix.R_OK|unix.W_OK); err == nil {
-			add("fuse", "ok", "fuse-overlayfs 可用（"+p+"）")
-		} else {
-			add("fuse", "warn", "fuse-overlayfs 在，但 /dev/fuse 打不开；探测将降级到 strace")
-		}
-	} else {
-		add("fuse", "warn", "缺少 fuse-overlayfs：探测将降级到 strace，结果可能不完整（不影响运行分身）")
+	fusePath, fuseErr := exec.LookPath("fuse-overlayfs")
+	// 用 Access(R_OK) 而不是 Stat：设备节点存在但打不开（权限/被 mask）
+	// 是最常见的形态，Stat 会说"有"，实际挂载立刻失败。
+	devFuseOK := unix.Access("/dev/fuse", unix.R_OK|unix.W_OK) == nil
+	_, straceErr := exec.LookPath("strace")
+	status, detail := probeBackend(fuseErr == nil, devFuseOK, straceErr == nil)
+	if status == "ok" {
+		detail = "fuse-overlayfs 可用（" + fusePath + "）"
 	}
+	add("fuse", status, detail)
 
 	if p, err := exec.LookPath("dbus-daemon"); err == nil {
 		add("dbus", "ok", p)
@@ -520,3 +525,20 @@ func orDefault(s, def string) string {
 }
 
 var _ = context.Background
+
+// probeBackend 判定探测管线还能不能跑：有 fuse 走 overlay，没有则只能 strace 兜底。
+// 两者都没有时必须报 fail——此时 Probe 会直接报错，只报 warn 会让用户以为还能用。
+func probeBackend(fuseOK, devFuseOK, straceOK bool) (status, detail string) {
+	switch {
+	case fuseOK && devFuseOK:
+		return "ok", ""
+	case fuseOK && straceOK:
+		return "warn", "fuse-overlayfs 在，但 /dev/fuse 打不开；探测将降级到 strace（克隆起步也会降级）"
+	case fuseOK:
+		return "fail", "fuse-overlayfs 在，但 /dev/fuse 打不开，且缺少 strace：无法探测新应用（已有档案仍可建普通分身；克隆起步会降级）"
+	case straceOK:
+		return "warn", "缺少 fuse-overlayfs：探测将降级到 strace，结果可能不完整（普通分身仍可运行；克隆起步不可用）"
+	default:
+		return "fail", "缺少 fuse-overlayfs 与 strace：无法探测新应用（已有档案仍可建普通分身；安装 strace 最稳妥，fuse-overlayfs 还需 /dev/fuse 可读写）"
+	}
+}

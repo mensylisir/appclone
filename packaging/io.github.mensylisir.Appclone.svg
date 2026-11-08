@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
+  <title>App Clones</title>
+  <!-- 两张错位的应用卡片 + 前卡上的「＋」：一眼读出「再开一个」。 -->
+  <rect x="16" y="20" width="64" height="64" rx="15" fill="#99c1f1"/>
+  <rect x="48" y="44" width="64" height="64" rx="15" fill="#3584e4"/>
+  <rect x="72" y="77" width="26" height="7" rx="3.5" fill="#ffffff"/>
+  <rect x="81.5" y="67.5" width="7" height="26" rx="3.5" fill="#ffffff"/>
+</svg>
