@@ -1,4 +1,4 @@
-//go:build gtk_e2e
+//go:build linux && gtk_e2e
 
 package main
 
@@ -258,29 +258,40 @@ func TestGtkCloseSwitchDialog(t *testing.T) {
 				return true
 			}
 			row := adw.NewSwitchRow()
-			row.SetActive(true)
+			// 模拟用户把开关拨到「关」：revert 要把它拨回「开」才有可观察效果。
+			row.SetActive(false)
 			defer row.Unref()
 			ref := rowRef{row: row, gen: u.listGen}
 			if phase == 0 {
 				// 有实例在跑：错误提示框，默认且唯一响应是「知道了」。
 				u.confirmDisable(core.App{Key: "demo", Name: "Demo", RunningN: 1, InstanceN: 1}, ref)
+				if !u.pending["demo"] {
+					fail("确认框展示期间 pending 应为 true")
+					return false
+				}
 				d := take()
 				if d == nil {
 					fail("运行中提示框没有经过 dialogHook")
 					return false
 				}
+				// Close 也会发一次 response（默认 close-response），
+				// 处理器表首次分派即删除，因此不会二次进入产品逻辑。
 				defer d.Close()
 				if got := d.GetDefaultResponse(); got != "ok" {
 					fail("运行中提示框默认响应应为 ok，得到 %q", got)
 					return false
 				}
-				if d.HasResponse("trash") {
-					fail("运行中提示框不应提供删除响应")
+				if d.HasResponse("trash") || d.HasResponse("cancel") {
+					fail("运行中提示框不应提供删除/取消响应")
 					return false
 				}
 				u.cb.dialogFn(*d, "ok")
 				if u.pending["demo"] {
 					fail("响应后 pending 应被清掉")
+					return false
+				}
+				if !row.GetActive() {
+					fail("响应后开关必须被拨回「开」")
 					return false
 				}
 				phase = 1
@@ -303,6 +314,14 @@ func TestGtkCloseSwitchDialog(t *testing.T) {
 					return false
 				}
 				u.cb.dialogFn(*d, "cancel")
+				if u.pending["demo"] {
+					fail("取消后 pending 应被清掉")
+					return false
+				}
+				if !row.GetActive() {
+					fail("取消后开关必须被拨回「开」")
+					return false
+				}
 				phase = 2
 				return true
 			}

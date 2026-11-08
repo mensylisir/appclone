@@ -68,6 +68,51 @@ jobs:
             GOOS=linux GOARCH="$arch" go build -trimpath -o /tmp/appclone-gui-"$arch" ./cmd/appclone-gui
           done
 
+  packages:
+    # 打包配置也会腐坏：每次 push 都真出一遍 amd64 三格式包，而不是等到打 tag
+    # 才发现 nfpm 字段/依赖/落点坏了。arm64 包由 release 的矩阵覆盖。
+    name: 安装包构建（deb/rpm/Arch，amd64）
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: 安装 nfpm（固定版本 + 校验和）
+        run: |
+          curl -fsSL -o /tmp/nfpm.tar.gz \
+            https://github.com/goreleaser/nfpm/releases/download/v2.41.0/nfpm_2.41.0_Linux_x86_64.tar.gz
+          echo "2fec509cc508fd7688b03f1426747725e93e024ff3c94a7f02022a50ddaa6c04  /tmp/nfpm.tar.gz" | sha256sum -c -
+          sudo tar -xzf /tmp/nfpm.tar.gz -C /usr/local/bin nfpm
+      - name: 构建 amd64 二进制并出包
+        env:
+          CGO_ENABLED: "0"
+        run: |
+          mkdir -p dist/stage dist/pkg
+          GOOS=linux GOARCH=amd64 go build -trimpath -ldflags "-s -w -X main.version=0.0.0" -o dist/stage/appclone ./cmd/appclone
+          GOOS=linux GOARCH=amd64 go build -trimpath -ldflags "-s -w -X main.version=0.0.0" -o dist/stage/appclone-gui ./cmd/appclone-gui
+          for f in dist/stage/appclone dist/stage/appclone-gui; do
+            file "$f" | grep -q "x86-64" || { echo "::error::$f 不是 amd64"; file "$f"; exit 1; }
+          done
+          for fmt in deb rpm archlinux; do
+            GOARCH=amd64 VERSION=0.0.0 nfpm pkg --config packaging/nfpm.yaml --packager "$fmt" --target dist/pkg/
+          done
+          ls -l dist/pkg
+          ar p dist/pkg/appclone_0.0.0_amd64.deb control.tar.gz | tar -xzO ./control > /tmp/control
+          grep -qx 'Architecture: amd64' /tmp/control
+          grep -q '^Depends: .*bubblewrap' /tmp/control
+          grep -q '^Depends: .*desktop-file-utils' /tmp/control
+          grep -q '^Depends: .*libglib2.0-bin' /tmp/control
+          grep -q '^Recommends: .*fuse-overlayfs' /tmp/control
+          grep -q '^Recommends: .*strace' /tmp/control
+          ar p dist/pkg/appclone_0.0.0_amd64.deb data.tar.gz | tar -tzf - > /tmp/data
+          for p in ./usr/bin/appclone ./usr/bin/appclone-gui \
+                   ./usr/share/applications/io.github.mensylisir.Appclone.desktop \
+                   ./usr/share/icons/hicolor/scalable/apps/io.github.mensylisir.Appclone.svg; do
+            grep -qx "$p" /tmp/data || { echo "::error::deb 缺少 $p"; exit 1; }
+          done
+
   html:
     name: GUI 设计稿交互回归（62 项）
     runs-on: ubuntu-24.04

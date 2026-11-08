@@ -99,17 +99,17 @@ func (e *Env) beginAudit(in Instance, p Profile) (*AuditSession, *AuditLayers, e
 		return nil, nil, err
 	}
 	return &AuditSession{
-			e: e, in: in, p: p, work: work,
-			upper:  filepath.Join(work, "upper"),
-			start:  start,
-			stop:   unmount,
-			pubs:   pubs,
-			shared: e.existingSharedWrites(p),
-			base:   e.Base,
-		}, &AuditLayers{
-			Merged:      filepath.Join(work, "merged"),
-			PublicBinds: pubs,
-		}, nil
+		e: e, in: in, p: p, work: work,
+		upper:  filepath.Join(work, "upper"),
+		start:  start,
+		stop:   unmount,
+		pubs:   pubs,
+		shared: e.existingSharedWrites(p),
+		base:   e.Base,
+	}, &AuditLayers{
+		Merged:      filepath.Join(work, "merged"),
+		PublicBinds: pubs,
+	}, nil
 }
 
 // existingSharedWrites 是本次审计真正可能生效的 shared_writes：

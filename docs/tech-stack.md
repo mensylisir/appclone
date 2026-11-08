@@ -447,9 +447,10 @@ activated / response / idle，地址恒定、注册一次后不再重新赋值�
   - **COPR / PPA / 进发行版官方仓库**：需要账号与长期维护责任。原文档写的"外包给社区"是空头承诺，
     社区不会凭空出现维护者——v1 由 CI 自己出包，不挂这条链路；用户量起来后再谈。
 - **CI**：GitHub Actions——PR 触发 `gofmt`/`go vet`/`staticcheck`/`go test`，以及两个二进制 × 两个架构的交叉编译
-  （无需装 GTK）；**tag 触发 nfpm 出包**并上传 Releases（矩阵同「架构命名」段：`{deb,rpm} × {amd64,arm64}`
+  （无需装 GTK）；每次 push 还用 nfpm 真出 amd64 三格式包并检查 deb 的 control/data 清单，
+  让打包配置在打 tag 之前就暴露腐坏；**tag 触发 nfpm 出包**并上传 Releases（矩阵同「架构命名」段：`{deb,rpm} × {amd64,arm64}`
   共 4 套 + `archlinux × amd64` 1 套 = 5 个包，`.tar.gz` 另出 amd64/arm64 两个）。
-  **发版前先复用 `ci.yml` 的全部 job**（`workflow_call`：Go/HTML/GTK/GTK-arm）——tag 可以打在
+  **发版前先复用 `ci.yml` 的全部 job**（`workflow_call`：Go/packages/HTML/GTK/GTK-arm）——tag 可以打在
   任意提交上，发版流程自己重跑一遍 Go 不够，HTML/GTK 回归也必须绿；tag 只接受 `vX.Y.Z`
   （nfpm 会把预发布号在 Arch `.PKGINFO` 里写成正式版）。
   GUI 冒烟要装 GTK4 运行库（`xvfb-run` + `broadway` 可选），跑**两个 job**：

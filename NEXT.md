@@ -493,6 +493,33 @@ GTK 闸门补结构断言：无实例时 `GetVisibleChildName()=="all"`、创建
   `工作号` 并落盘；删除先点取消、300ms 后实例仍在，再确认删除后实例目录清空（进回收站）。
   闸门 16 → **17 条**；另加 `TestGtkCloseSwitchDialog`（运行中提示框 + 删除全部确认框），
   合计 **18 条**。
+- **CI 增加安装包构建 job**：每次 push 用固定版本 nfpm 真出 amd64 的 deb/rpm/Arch 三包，
+  校验 stage 二进制架构、deb `Architecture`/`Depends`/`Recommends` 与 data 里的二进制/桌面入口/图标；
+  release 复用 ci.yml 后同样受这道闸门保护，打包配置不再只在打 tag 时才被验证。
+- **第三次只读复审后的收口**（2 P2 + 若干 P3，2026-11-08）：
+  ① **P2：开关对话框用例没有真正验证回弹**——原用例 `row.SetActive(true)` 让 `revert` 的
+     `SetActive(true)` 成为无操作，且只在响应后断言 `pending`。现改为模拟用户拨到「关」
+     （`SetActive(false)`），响应前断言 `pending` 为 true，响应后断言 `pending` 清空**且**
+     `row.GetActive()` 已回弹为 true；并断言运行中提示框没有 `cancel`/`trash` 响应。
+  ② **P2：CI 的 deb 断言太松**——`grep -E "^(Architecture|Depends|Recommends):"` 只要有一行就能过，
+     data 清单是"三者有其一"。改为逐字段/逐路径精确断言（`grep -qx 'Architecture: amd64'`、
+     `Depends` 必须含 bubblewrap/desktop-file-utils/libglib2.0-bin、`Recommends` 必须含
+     fuse-overlayfs/strace、四个落点逐个 `grep -qx`），并对 stage 的**每个**二进制单独做架构断言
+     （`ci.yml` 与 `release.yml` 都从 `dist/stage/*` 通配改为逐文件循环）。
+     已用固定版本 nfpm 本地重出 deb 并逐条执行这些 grep（全部命中，含 `./usr/...` 前缀），
+     不是只改 YAML。
+  ③ P3：测试构建标签统一为 `linux && gtk_e2e`；`defer d.Close()` 会补发 close-response 的注释写明
+     （处理器表首次分派即删除，不会二次进入产品逻辑）；STATUS 中「16/16 / 约 30s」的旧快照改为
+     **18/18 / 约 50s**，`workflow_call` 的 job 枚举补 `packages`；对话框用例的删除结果表述改为
+     「实例从列表消失」（回收站由 core 的 `gio trash` 路径负责，本用例不直接断言回收站内容）。
+  **记录不修**：不用 `gobject.SignalEmitByName` 走真实信号——purego 的 variadic 直接把 Go 值当
+   C varargs 传，GValue 编排错误时会静默调用错误处理器；`u.cb.dialogFn` 与 `ConnectResponse`
+  绑定的是同一个产品处理函数，信号接线本身由其余 GTK 用例的真实 `button-clicked`/notify 覆盖；
+  `dialogHook` 也不加构建标签——它只是一个恒为 nil 的函数变量，隐藏它需要复制一份 `Choose` 调用点，
+  收益不抵复杂度（生产二进制里没有赋值方）。
+  证据：`gofmt -l .` 空、`go vet ./...` 与 `go vet -tags gtk_e2e` 干净、`go test -count=1 ./...` 全绿、
+  `staticcheck ./...` 零输出、`node design/guitest.js` **62/62**、`design/guitest-gtk.sh` **18/18 PASS**
+  （退出码 0）；本地 nfpm 出包后 CI 的每条 deb 断言均实跑通过。
 
 **第三十八轮：GUI 分身生命周期解耦（ADR-028）**（2026-11-08）。用户拍板：**分离运行 + 停止按钮**。
 - GUI 点「启动」不再在自己的进程里跑 `core.Run`，而是以自身二进制 fork 一个会话首进程（runner，
@@ -536,8 +563,8 @@ GUI 二进制 runner 模式启动 sleep 分身 → `appclone stop` **0.2s** 返�
 用户主动停止后抑制多余的「已退出」toast；文档修正 `run.log` 安全表述与 §6.1 详情页布局；
 ESRCH 快速返回不持锁删 `run.pid`（防止误删新 run 记录）的注释固化；GUI runner 注释改为
 "GTK 初始化前分流，但 puregotk init 仍 dlopen libgtk"；补 `TestDetachedTargetEnv`。
-**记录不修**：停止确认对话框的响应路径仍未自动化（与删除/重命名/关闭开关同一已知缺口，
-需要可编程对话框响应）；`cappedWriter` 保留头部 + toast 读尾部的组合在"应用先灌满 1 MiB
+**记录不修**：停止确认对话框的响应路径仍未自动化（第四十一轮已用 `dialogHook` 覆盖删除/重命名/
+关闭开关三处，停止确认框仍未接；见第三十八轮）；`cappedWriter` 保留头部 + toast 读尾部的组合在"应用先灌满 1 MiB
 再失败"时只能给 best-effort 原因（已在注释与 STATUS 写明）。
 
 **第三十七轮：GTK 闸门补四态 + GUI 文案入 i18n（ADR-027 退场）**（2026-11-08）。
@@ -611,7 +638,7 @@ dbus-daemon 加 `Pdeathsig: SIGTERM`（GUI 被信号打死时私有总线跟着�
 **已知策略**：`display_name` 的默认值「分身 N」是用户数据，不随界面语言翻译（ADR-025）；
 英文界面首次创建仍显示「分身 1」，这是有意选择，若要中性默认名需单独定案。
 **未覆盖**：删除/重命名/关闭开关对话框的
-响应路径（需要可编程对话框响应）、真实指针/键盘注入，以及 **Esc 是否会被
+响应路径（第四十一轮已由 `dialogHook` 覆盖）、真实指针/键盘注入，以及 **Esc 是否会被
 `AdwNavigationView` 的 pop-on-escape 抢在窗口级 key controller 之前**（对抗复审指出：
 闸门从不发 Esc；创建态有 `SetCanPop(false)` 兜底，但普通页的「Esc=取消」语义仍需
 一条真实按键用例才能钉住）。
@@ -664,7 +691,7 @@ dbus-daemon 加 `Pdeathsig: SIGTERM`（GUI 被信号打死时私有总线跟着�
   覆盖**页面生命周期与三屏四态**（列表/确认/创建/详情/返回 + 首屏落点、空态映射、
   探测中取消/失败/可重试错误态、快速重推竞态、降级与致命横幅、en 文案，2026-11-08 起），但**指针与键盘事件注入仍不可行**
   （本会话 XTEST 被禁，xdotool 指针/键盘无效），所以删除/重命名/关闭开关对话框的响应路径
-  还不能脚本化。broadway 的结论保留在下方，供后续参考。
+  当时还不能脚本化（第四十一轮以 `dialogHook` 补上）。broadway 的结论保留在下方，供后续参考。
   `gtk4-broadwayd` 在 `NavigationView` push 后会以其自身断言
   （`gdk/broadway/broadway-output.c:458 append_node_ops: !reused_node->consumed`）**自崩**，
   `/tmp/.X11-unix` 下无 Xvfb，嵌套 `mutter --headless` 能起 Xwayland 但合成器重定向使
@@ -679,7 +706,7 @@ dbus-daemon 加 `Pdeathsig: SIGTERM`（GUI 被信号打死时私有总线跟着�
   可行路线：装 Xvfb（或换一台能跑 Xvfb 的机器）、在 GUI 内做 `APPCLONE_GUI_SHOT` 出口，
   或把三屏的纯逻辑状态机从 GTK 里抽出来做无显示测试。不需要输入的 GTK 生命周期已由
   `design/navspike`（导航页 Unref 时机）与 `design/guitest-gtk.sh`（列表 → 确认 → 创建 →
-  详情 → 返回 + 三屏四态/横幅/en 文案）覆盖；**未覆盖部分**（删除/重命名/关闭开关对话框、
+  详情 → 返回 + 三屏四态/横幅/en 文案）覆盖；**未覆盖部分**（第四十一轮前的删除/重命名/关闭开关对话框；
   真实指针/键盘注入）仍不能声称已验证。
 - 复现命令（broadway 冒烟，假 HOME）：`gtk4-broadwayd -p 8095 :5` +
   `GDK_BACKEND=broadway BROADWAY_DISPLAY=:5 HOME=<fake> AC_BASE=<fake>/xdg/appclone ./appclone-gui`，
