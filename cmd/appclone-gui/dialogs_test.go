@@ -194,3 +194,154 @@ func TestGtkDialogResponses(t *testing.T) {
 		t.Fatal(runErr)
 	}
 }
+
+// TestGtkCloseSwitchDialog 覆盖列表开关的两种确认框：有实例在跑时只允许
+// 「知道了」并把开关拨回去；否则询问是否删除全部分身，默认「取消」。
+func TestGtkCloseSwitchDialog(t *testing.T) {
+	env, appsDir := gtkTestEnv(t, "closedlg")
+	if err := os.WriteFile(filepath.Join(appsDir, "demo.desktop"),
+		[]byte("[Desktop Entry]\nType=Application\nName=Demo\nExec=/usr/bin/true\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	profile := core.Profile{
+		App: "demo", Version: core.ProfileVersion, Exec: "/usr/bin/true",
+		Paths: []string{"~/.config/Demo"}, ProbeMethod: "overlay",
+		Ignored: core.DefaultIgnored(), Env: map[string]string{},
+	}
+	if _, err := env.CreateInstance(context.Background(), "demo", profile, "main"); err != nil {
+		t.Fatal(err)
+	}
+
+	dialogs := make(chan *adw.AlertDialog, 4)
+	oldHook := dialogHook
+	dialogHook = func(d *adw.AlertDialog) { dialogs <- d }
+	defer func() { dialogHook = oldHook }()
+
+	app := adw.NewApplication("io.github.mensylisir.Appclone.GtkCloseDlg",
+		gio.GApplicationNonUniqueValue)
+	defer app.Unref()
+	u := &ui{app: app, env: env, lang: "zh_CN"}
+
+	var runErr error
+	fail := func(format string, a ...any) {
+		if runErr == nil {
+			runErr = fmt.Errorf(format, a...)
+		}
+		app.Quit()
+	}
+	take := func() *adw.AlertDialog {
+		select {
+		case d := <-dialogs:
+			return d
+		default:
+			return nil
+		}
+	}
+
+	phase := 0
+	actcb := func(_ gio.Application) {
+		if u.win != nil {
+			return
+		}
+		u.buildWindow()
+		deadline := time.Now().Add(30 * time.Second)
+		var tick glib.SourceFunc
+		tick = func(uintptr) bool {
+			if runErr != nil {
+				return false
+			}
+			if time.Now().After(deadline) {
+				fail("关闭开关对话框回归超时（phase=%d）", phase)
+				return false
+			}
+			if !u.loaded {
+				return true
+			}
+			row := adw.NewSwitchRow()
+			row.SetActive(true)
+			defer row.Unref()
+			ref := rowRef{row: row, gen: u.listGen}
+			if phase == 0 {
+				// 有实例在跑：错误提示框，默认且唯一响应是「知道了」。
+				u.confirmDisable(core.App{Key: "demo", Name: "Demo", RunningN: 1, InstanceN: 1}, ref)
+				d := take()
+				if d == nil {
+					fail("运行中提示框没有经过 dialogHook")
+					return false
+				}
+				defer d.Close()
+				if got := d.GetDefaultResponse(); got != "ok" {
+					fail("运行中提示框默认响应应为 ok，得到 %q", got)
+					return false
+				}
+				if d.HasResponse("trash") {
+					fail("运行中提示框不应提供删除响应")
+					return false
+				}
+				u.cb.dialogFn(*d, "ok")
+				if u.pending["demo"] {
+					fail("响应后 pending 应被清掉")
+					return false
+				}
+				phase = 1
+				return true
+			}
+			if phase == 1 {
+				u.confirmDisable(core.App{Key: "demo", Name: "Demo", InstanceN: 1}, ref)
+				d := take()
+				if d == nil {
+					fail("删除全部对话框没有经过 dialogHook")
+					return false
+				}
+				defer d.Close()
+				if got := d.GetDefaultResponse(); got != "cancel" {
+					fail("删除全部默认响应应为 cancel，得到 %q", got)
+					return false
+				}
+				if got := d.GetResponseAppearance("trash"); got != adw.ResponseDestructiveValue {
+					fail("trash 响应必须是 destructive，得到 %v", got)
+					return false
+				}
+				u.cb.dialogFn(*d, "cancel")
+				phase = 2
+				return true
+			}
+			if phase == 2 {
+				list, _ := env.ListInstances("demo")
+				if len(list) != 1 {
+					fail("取消关闭开关后实例不应消失，现有 %d 个", len(list))
+					return false
+				}
+				// 确认删除：开关背后的全部分身进回收站。
+				u.confirmDisable(core.App{Key: "demo", Name: "Demo", InstanceN: 1}, ref)
+				d := take()
+				if d == nil {
+					fail("第二次关闭开关没有经过 dialogHook")
+					return false
+				}
+				defer d.Close()
+				u.cb.dialogFn(*d, "trash")
+				phase = 3
+				return true
+			}
+			if list, err := env.ListInstances("demo"); err != nil {
+				fail("列出实例失败：%v", err)
+				return false
+			} else if len(list) == 0 {
+				app.Quit()
+				return false
+			}
+			return true
+		}
+		glib.TimeoutAdd(50, &tick, 0)
+	}
+	app.ConnectActivate(&actcb)
+	u.hold(&actcb)
+
+	if code := app.Run(1, os.Args[:1]); code != 0 {
+		t.Fatalf("GTK 主循环退出码 %d", code)
+	}
+	if runErr != nil {
+		t.Fatal(runErr)
+	}
+}

@@ -491,7 +491,8 @@ GTK 闸门补结构断言：无实例时 `GetVisibleChildName()=="all"`、创建
   对话框交给 `dialogHook`（生产恒为 nil），测试据此断言重命名/删除的默认响应是「取消」、
   删除响应是 destructive，并走**同一个** `u.cb.dialogFn` 触发产品回调：重命名经 Entry 改名为
   `工作号` 并落盘；删除先点取消、300ms 后实例仍在，再确认删除后实例目录清空（进回收站）。
-  闸门 16 → **17 条**。
+  闸门 16 → **17 条**；另加 `TestGtkCloseSwitchDialog`（运行中提示框 + 删除全部确认框），
+  合计 **18 条**。
 
 **第三十八轮：GUI 分身生命周期解耦（ADR-028）**（2026-11-08）。用户拍板：**分离运行 + 停止按钮**。
 - GUI 点「启动」不再在自己的进程里跑 `core.Run`，而是以自身二进制 fork 一个会话首进程（runner，
@@ -643,9 +644,9 @@ dbus-daemon 加 `Pdeathsig: SIGTERM`（GUI 被信号打死时私有总线跟着�
 4. `cmd/appclone-gui`（puregotk + libadwaita 三屏，控件映射见 `tech-stack.md` §4.5）。
    **v1 三屏已落地并通过两轮实现审查修复**（2026-11-08，见第二十八～三十轮；STATUS = `implemented`）。剩余：
    ① ~~**GTK 侧回归闸门**~~ **已落地（2026-11-08，第三十七轮补齐三屏四态 + 横幅/致命态）**：
-      `design/guitest-gtk.sh` + `cmd/appclone-gui/screens_test.go`（2026-11-08 第四十轮起；第四十一轮加对话框响应后 17 条）。
-      剩余：关闭开关对话框与真实指针/键盘注入（删除/重命名已由 `TestGtkDialogResponses`
-      通过 `dialogHook` 覆盖）；
+      `design/guitest-gtk.sh` + `cmd/appclone-gui/screens_test.go`（2026-11-08 第四十轮起；第四十一轮加对话框响应后 18 条）。
+      剩余：真实指针/键盘事件注入（删除/重命名/关闭开关三类对话框响应已由
+      `TestGtkDialogResponses`、`TestGtkCloseSwitchDialog` 通过 `dialogHook` 覆盖）；
    ② ~~GUI 与 CLI 的 setup 编排去重~~ **已完成**（2026-11-08，`core.FinalizeProbe`，见第三十三轮）；
    ③ ~~GUI 文案进 i18n 目录~~ **已完成（2026-11-08，第三十七轮）**：三屏静态文案全部按
       `ui.*` 入 `core/i18n`（zh_CN + en），`newUI` 用 `i18n.Lang()`；`i18n_test.go` 钉住

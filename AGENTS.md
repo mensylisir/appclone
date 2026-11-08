@@ -121,7 +121,7 @@ CGO_ENABLED=0 go build ./...                   # 全仓零 cgo（puregotk 不需
 # GUI 交互回归（项数以脚本内 EXPECTED 为准，当前 62 项；退出码 0 才算过；脚本自动发现 chromium 与 puppeteer-core）
 node design/guitest.js
 # 找不到依赖时：npm i puppeteer-core，或用 PUPPETEER_CORE=/path、CHROMIUM=/path 指定
-# GTK 侧回归（真实 GTK，需 DISPLAY/WAYLAND + 宿主 bwrap；假 HOME，17 条约 6 秒）
+# GTK 侧回归（真实 GTK，需 DISPLAY/WAYLAND + 宿主 bwrap；假 HOME，18 条约 6 秒）
 design/guitest-gtk.sh                          # --keep 保留临时目录与假 HOME 便于排查
 # 隔离冒烟（假 HOME，不污染真实主目录）：
 TESTROOT=$(mktemp -d); export AC_BASE="$TESTROOT/xdg/appclone" XDG_DATA_HOME="$TESTROOT/xdg"

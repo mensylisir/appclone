@@ -66,7 +66,7 @@ for name in TestGtkScreensLifecycle TestGtkLandsOnClonesView TestGtkEmptyStateMa
             TestGtkRapidRepush TestGtkFatalBanner TestGtkEnglishStrings \
             TestGtkDetailShowsStopWhenRunning TestGtkForkTogglePersists \
             TestGtkForkDisabledWhenDegraded TestGtkAppIconFallback \
-            TestGtkDialogResponses \
+            TestGtkDialogResponses TestGtkCloseSwitchDialog \
             TestDetachedRunnerSpawn \
             TestDetachLogHelpers TestDetachedTargetEnv; do
   if ! grep -q -- "--- PASS: $name" "$LOG"; then
