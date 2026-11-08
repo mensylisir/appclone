@@ -39,10 +39,20 @@ type ui struct {
 	toast  *adw.ToastOverlay
 	header *adw.HeaderBar
 	search *gtk.SearchEntry
-	page   *adw.PreferencesPage
-	// emptyPage 是首屏空态。它不能塞进 AdwPreferencesGroup——Group 只接受
-	// AdwPreferencesRow，StatusPage 放进去会被裁成半截图标（截图上只剩一个
-	// 灰色半圆）。所以它挂在搜索栏与列表页之间，由 renderList 显隐。
+	// 两个视图：分身（已开启）与所有应用。用户之前反馈两组挤在一个长列表
+	// 里——开关都在下半部分，已开启的应用要滚过一遍才看得到。现在用
+	// AdwViewSwitcher 放在标题栏，视图之间平级切换，各自独立滚动。
+	stack    *adw.ViewStack
+	switcher *adw.ViewSwitcher
+	// onPageObj 是「分身」视图的 ViewStackPage，用来更新标题栏上的数量角标。
+	onPageObj *adw.ViewStackPage
+	onBox     *gtk.Box
+	offBox    *gtk.Box
+	onPage    *adw.PreferencesPage
+	offPage   *adw.PreferencesPage
+	// emptyPage 是「分身」视图的空态。它不能塞进 AdwPreferencesGroup——
+	// Group 只接受 AdwPreferencesRow，StatusPage 放进去会被裁成半截图标
+	// （截图上只剩一个灰色半圆）。它直接挂在 onBox 里，随实例数显隐。
 	emptyPage *adw.StatusPage
 
 	// 环境自检（§4.5）：bwrap 缺失 = 致命（整页只读），缺 fuse = 降级
@@ -56,8 +66,13 @@ type ui struct {
 	softDismissed bool
 	envChecked    bool
 
-	apps      []core.App
-	groups    []*adw.PreferencesGroup
+	apps   []core.App
+	groups []*adw.PreferencesGroup
+	// onGroups/offGroups 记录这一轮渲染的组分别挂在哪个视图页，重建时按页
+	// Remove（PreferencesPage.Remove 只认自己页上的组）；groups 仍按
+	// 分身→所有应用的顺序保存全部组，供回归断言索引。
+	onGroups  []*adw.PreferencesGroup
+	offGroups []*adw.PreferencesGroup
 	query     string
 	expanded  bool
 	reloadNo  int  // 全量扫描代数：只由 reload 推进
@@ -191,8 +206,15 @@ func (u *ui) buildWindow() {
 
 	u.nav = adw.NewNavigationView()
 
-	u.page = adw.NewPreferencesPage()
-	u.page.SetTitle("应用分身")
+	// 两个平级视图：分身 / 所有应用。各自一个 PreferencesPage（自己滚动），
+	// 组之间不再互相挤占滚动位置。
+	u.stack = adw.NewViewStack()
+	u.onBox = gtk.NewBox(gtk.OrientationVerticalValue, 0)
+	u.offBox = gtk.NewBox(gtk.OrientationVerticalValue, 0)
+	u.onPage = adw.NewPreferencesPage()
+	u.onPage.SetVexpand(true)
+	u.offPage = adw.NewPreferencesPage()
+	u.offPage.SetVexpand(true)
 
 	u.header = adw.NewHeaderBar()
 	u.search = gtk.NewSearchEntry()
@@ -236,9 +258,7 @@ func (u *ui) buildWindow() {
 	}
 	u.softBanner.ConnectButtonClicked(&u.softDismissFn)
 
-	// 搜索条固定在标题栏下方（与稿子的位置一致），列表在它下面独立滚动；
-	// 塞进 HeaderBar 的 title widget 会让窗口顶部只剩一个输入框，应用名
-	// 与分组标题都显得没着落。
+	// 「所有应用」视图：搜索固定在顶部，列表在下面独立滚动。
 	searchBox := gtk.NewBox(gtk.OrientationHorizontalValue, 0)
 	searchBox.SetMarginStart(12)
 	searchBox.SetMarginEnd(12)
@@ -246,24 +266,58 @@ func (u *ui) buildWindow() {
 	searchBox.SetMarginBottom(6)
 	u.search.SetHexpand(true)
 	searchBox.Append(&u.search.Widget)
+	u.offBox.Append(&searchBox.Widget)
+	u.offBox.Append(&u.offPage.Widget)
 
-	// 空态挂在搜索栏和列表页之间：它取代「已开启分身」这一组，但搜索与
-	// 「所有应用」照常可见（§4.5 空态约束）。
+	// 「分身」视图：空态与已开启列表。空态只取代这一视图的列表，不取代
+	// 「所有应用」——后者是首启用户唯一能操作的入口。
 	u.emptyPage = adw.NewStatusPage()
+	u.emptyPage.SetVexpand(true)
+	u.emptyPage.SetHexpand(true)
 	u.emptyPage.SetIconName("edit-copy-symbolic")
 	u.emptyPage.SetTitle("还没有分身")
-	u.emptyPage.SetDescription("在下方「所有应用」里找到要分身的应用，点亮它的开关——appclone 会先跟踪它的数据写入位置，确认后创建分身。")
-	u.emptyPage.SetVisible(false)
+	u.emptyPage.SetDescription("在「所有应用」里找到要分身的应用，点亮它的开关——appclone 会先跟踪它的数据写入位置，确认后创建分身。")
+	pick := gtk.NewButtonWithLabel("选择应用")
+	pick.AddCssClass("suggested-action")
+	pick.SetHalign(gtk.AlignCenterValue)
+	pickcb := func(gtk.Button) { u.stack.SetVisibleChildName("all") }
+	pick.ConnectClicked(&pickcb)
+	u.hold(&pickcb)
+	u.emptyPage.SetChild(&pick.Widget)
+	u.onBox.Append(&u.emptyPage.Widget)
+	// 首轮 renderList 之前先别让空的 PreferencesPage 占位。
+	u.onPage.SetVisible(false)
+	u.onBox.Append(&u.onPage.Widget)
+
+	// 图标让两个视图在标题栏里一眼可分；badge 在「分身」页上显示数量，
+	// 用户停在「所有应用」时也知道已经有几个分身。
+	if p := u.stack.AddTitledWithIcon(&u.onBox.Widget, "on", "分身", "edit-copy-symbolic"); p != nil {
+		u.onPageObj = p
+		p.Unref()
+	}
+	if p := u.stack.AddTitledWithIcon(&u.offBox.Widget, "all", "所有应用", "view-app-grid-symbolic"); p != nil {
+		p.Unref()
+	}
+	// 默认落在「所有应用」：首次启动唯一能做的动作是点亮开关；空态里还有
+	// 「选择应用」按钮，两个视图互通。
+	u.stack.SetVisibleChildName("all")
+	// 首轮扫描落地前先别画：已有分身的用户会先看到一闪而过的「所有应用」，
+	// 再被切到「分身」——落点按状态决定，就该一次画对。扫描回来后恢复显示。
+	u.stack.SetVisible(false)
+
+	u.switcher = adw.NewViewSwitcher()
+	u.switcher.SetStack(u.stack)
+	u.switcher.SetPolicy(adw.ViewSwitcherPolicyWideValue)
+	// 首轮扫描落地前禁用：内容区此时是空的（视图栈还没显示），切视图没有
+	// 意义；而且落点还没决定，允许用户先选再被切走是糟糕的体验。
+	u.switcher.SetSensitive(false)
+	u.header.SetTitleWidget(&u.switcher.Widget)
 
 	rootBox := gtk.NewBox(gtk.OrientationVerticalValue, 0)
 	rootBox.Append(&u.fatalBanner.Widget)
 	rootBox.Append(&u.softBanner.Widget)
-	rootBox.Append(&searchBox.Widget)
-	rootBox.Append(&u.emptyPage.Widget)
-	// PreferencesPage 自带滚动容器，必须在纵向 box 里显式 vexpand，
-	// 否则会被搜索栏与空态挤成一条。
-	u.page.SetVexpand(true)
-	rootBox.Append(&u.page.Widget)
+	u.stack.SetVexpand(true)
+	rootBox.Append(&u.stack.Widget)
 	tv.SetContent(&rootBox.Widget)
 	rootPage := adw.NewNavigationPage(&tv.Widget, "应用分身")
 	rootPage.SetTag("root")
@@ -336,13 +390,6 @@ func (u *ui) buildWindow() {
 	u.hold(&closecb)
 
 	u.win.Present()
-	// 一开窗就高亮搜索框会让人以为必须先输入；等窗口映射完成后把焦点交给
-	// 列表页（可聚焦的滚动容器），用户点搜索框或按 Tab 时再进去。
-	u.goIdle(func(uintptr) bool {
-		u.page.Widget.SetFocusable(true)
-		u.page.Widget.GrabFocus()
-		return false
-	})
 	u.reload()
 	u.checkEnv()
 	// 运行状态轮询（§4.7）：1 秒一拍，详情页每拍刷、列表每两拍刷——
@@ -498,9 +545,27 @@ func (u *ui) reload() {
 			if gen != u.reloadNo {
 				return false // 已有更新的一轮，丢弃旧结果
 			}
+			first := !u.loaded
 			u.apps = apps
+			if first {
+				// 首屏落地视图按状态选：已经有分身的人多半是来启动/管理它们的；
+				// 一个都没有时留在「所有应用」，因为点亮开关是唯一能做的事。
+				// 只决定首屏一次——之后的 reload 是操作结果，不该把用户弹走。
+				for _, a := range apps {
+					if a.InstanceN > 0 {
+						u.stack.SetVisibleChildName("on")
+						break
+					}
+				}
+			}
 			u.loaded = true
 			u.renderList()
+			if first {
+				// 一开窗就让搜索框抢到焦点会让人以为必须先输入；首轮落地后把
+				// 焦点交给当前视图的滚动页（不是 ViewStack——它没有滚动控制器，
+				// 方向键/PageDown 滚不动列表）。
+				u.focusCurrentView()
+			}
 			return false
 		})
 	}()
@@ -568,14 +633,18 @@ func sameList(a, b []core.App) bool {
 	return true
 }
 
-// renderList 重建两组。分组键是"有没有实例"，不是"有没有档案"：
+// renderList 重建两个视图的组。分组键是"有没有实例"，不是"有没有档案"：
 // 关掉开关后应用必须回到「所有应用」，否则组名与行内状态自相矛盾。
 func (u *ui) renderList() {
 	// 先摘掉旧行，再关旧 scope：scope.close 会 Unref 本轮创建的 C 对象，
 	// 而父容器此时的引用还兜着它们——先 Remove 再 Unref 的顺序最不容易出错。
-	for _, g := range u.groups {
-		u.page.Remove(g)
+	for _, g := range u.onGroups {
+		u.onPage.Remove(g)
 	}
+	for _, g := range u.offGroups {
+		u.offPage.Remove(g)
+	}
+	u.onGroups, u.offGroups = nil, nil
 	u.groups = nil
 	if u.listScope != nil {
 		u.listScope.close()
@@ -604,10 +673,15 @@ func (u *ui) renderList() {
 		}
 	}
 
-	// 空态只取代「已开启分身」这一组：搜索与「所有应用」照常渲染。
-	// 整页藏掉会让首启用户看不到任何开关（引导语指向不存在的区域）。
-	u.emptyPage.SetVisible(len(on) == 0)
-	if len(on) > 0 {
+	// 空态只取代「分身」视图的列表，不影响「所有应用」——后者是首启用户
+	// 唯一能操作的入口，空态里的「选择应用」按钮也指向它。
+	empty := len(on) == 0
+	u.emptyPage.SetVisible(empty)
+	u.onPage.SetVisible(!empty)
+	if u.onPageObj != nil {
+		u.onPageObj.SetBadgeNumber(uint32(len(on)))
+	}
+	if !empty {
 		g := adw.NewPreferencesGroup()
 		sc.own(&g.Widget)
 		g.SetTitle("已开启分身")
@@ -615,13 +689,33 @@ func (u *ui) renderList() {
 		for _, a := range on {
 			g.Add(&u.newAppRow(a, true, sc).Widget)
 		}
-		u.page.Add(g)
+		u.onPage.Add(g)
+		u.onGroups = append(u.onGroups, g)
 		u.groups = append(u.groups, g)
+
+		// 分身视图底部的「添加应用分身」：不切回另一个视图也能继续加，
+		// 与空态的「选择应用」是同一个动作的两种入口。
+		ag := adw.NewPreferencesGroup()
+		sc.own(&ag.Widget)
+		add := adw.NewActionRow()
+		sc.own(&add.Widget)
+		add.SetTitle("添加应用分身")
+		add.SetSubtitle("从「所有应用」里再选一个应用")
+		ic := u.symbolicIcon("list-add-symbolic")
+		sc.own(&ic.Widget)
+		add.AddPrefix(&ic.Widget)
+		add.SetActivatable(true)
+		sc.row(add, func() { u.stack.SetVisibleChildName("all") })
+		ag.Add(&add.Widget)
+		u.onPage.Add(ag)
+		u.onGroups = append(u.onGroups, ag)
+		u.groups = append(u.groups, ag)
 	}
 
 	g := adw.NewPreferencesGroup()
 	sc.own(&g.Widget)
-	g.SetTitle("所有应用")
+	// 组名不再重复标题栏上的「所有应用」：视图名已经说了这是全部应用，
+	// 再写一遍只是噪声。留一句规则说明就够。
 	g.SetDescription("点亮开关，为应用建立独立的数据空间；公共目录仍然共享。")
 	pool := off
 	var extra *adw.ActionRow
@@ -654,8 +748,27 @@ func (u *ui) renderList() {
 	} else if extra != nil {
 		g.Add(&extra.Widget)
 	}
-	u.page.Add(g)
+	u.offPage.Add(g)
+	u.offGroups = append(u.offGroups, g)
 	u.groups = append(u.groups, g)
+
+	// 首轮结果已落地、落点也已决定：这时才显示视图栈，避免"先看到所有应用
+	// 再跳分身"的闪变；切换器同时解禁（扫描期间它不可点，防止落点覆盖
+	// 用户刚做的选择）。放在 renderList 里而不是 reload 的回调里，是为了
+	// 结果被更新的一轮丢弃时也不会永久空白。
+	u.stack.SetVisible(true)
+	u.switcher.SetSensitive(true)
+}
+
+// focusCurrentView 把初始焦点交给当前视图的滚动页。
+// 不放在 ViewStack 上：它不是滚动容器，方向键/PageDown 滚不动列表。
+func (u *ui) focusCurrentView() {
+	page := u.onPage
+	if u.stack.GetVisibleChildName() == "all" {
+		page = u.offPage
+	}
+	page.Widget.SetFocusable(true)
+	page.Widget.GrabFocus()
 }
 
 func (u *ui) moreRow(title string, sc *renderScope) *adw.ActionRow {
@@ -778,8 +891,9 @@ func (u *ui) beginEnable(a core.App, ref rowRef) {
 			return
 		}
 		u.reload()
-		// §6.1：确认后落到刚建出来的详情页，而不是回列表——用户此刻要看的是
-		// 那个实例。open（复用已有档案）同样建出了一个新实例，一并落到详情页。
+		// 创建完落到详情页；返回时停在「分身」视图——刚建出的实例在那里，
+		// 也避免用户回到「所有应用」却发现刚拨的开关"消失"了。
+		u.stack.SetVisibleChildName("on")
 		u.pushDetail(a.Key)
 	}) {
 		u.pending[a.Key] = false

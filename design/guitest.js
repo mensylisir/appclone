@@ -53,6 +53,9 @@ const pp = loadPuppeteer();
     catch(e){ fail++; console.log('❌ ' + name + ' → 异常: ' + e.message.split('\n')[0]); }
   };
   const click = sel => page.evaluate(s => document.querySelector(s).click(), sel);
+  /* 屏1 是两个平级视图（标题栏的 AdwViewSwitcher）：断言前先走到目标视图，
+     不要靠程序化点击去点一个用户此刻根本看不见的开关 */
+  const showView = v => click(`.vs-btn[data-view="${v}"]`);
   const ev = (fn, ...args) => page.evaluate(fn, ...args);
   // 探测是异步的（1.2s），断言前必须等状态落地，不能用固定 sleep 猜
   const waitFor = async (fn, timeout = 4000) => {
@@ -83,8 +86,18 @@ const pp = loadPuppeteer();
     return ev(() => !document.querySelector('#scr1').offsetParent && !!document.querySelector('#scr2').offsetParent); });
   await t('返回按钮回屏1', async () => { await click('#btnBack');
     return ev(() => !!document.querySelector('#scr1').offsetParent && !document.querySelector('#scr2').offsetParent); });
-  await t('行点击进详情(微信)', async () => { await click('[data-app="wechat"]');
-    return ev(() => !!document.querySelector('#scr2').offsetParent && document.querySelector('#hbTitle').textContent === '微信'); });
+  /* 「分身」是第一落点（演示数据里有实例）：标题栏是视图切换器，不是标题文字 */
+  await t('行点击进详情(微信)', async () => {
+    const landed = await ev(() => !!document.querySelector('#viewSwitcher')?.offsetParent
+      && !!document.querySelector('#viewClones')?.offsetParent
+      && document.querySelector('.vs-btn[data-view="clones"]').getAttribute('aria-selected') === 'true'
+      /* 角标在当前页也显示（libadwaita 1.10 实测），数字 = 已开启的应用数 */
+      && !!document.querySelector('#vsBadge')?.offsetParent
+      && document.querySelector('#vsBadge').textContent === '2');
+    await click('[data-app="wechat"]');
+    return (landed && await ev(() => !!document.querySelector('#scr2').offsetParent
+      && document.querySelector('#hbTitle').textContent === '微信'))
+      || '首页没有落在「分身」视图，或行点击没进详情'; });
   /* 用户可见文案里不能出现内部 id（work）与引擎名（bwrap）：id 是目录名，用户只认显示名。
      只断言"toast 出现"会漏掉这类泄漏，必须读文本 */
   await t('启动按钮 → Toast 且只出现显示名（不泄漏 id / bwrap）', async () => { await click('[data-launch="0"]');
@@ -237,6 +250,7 @@ const pp = loadPuppeteer();
   // —— 屏1 搜索（397 个应用的入场券）——
   await t('搜索过滤「微」→ 未匹配的从所有应用组消失', async () => {
     await click('#btnBack');
+    await showView('all');                 // 搜索框只属于「所有应用」视图
     await setSearch('微');
     return ev(() => {
       const unc = document.querySelector('#unconfBox').textContent;
@@ -250,14 +264,19 @@ const pp = loadPuppeteer();
 
   await t('深色主题切换', async () => { await click('#btnTheme');
     return ev(() => document.documentElement.classList.contains('dark')); });
-  /* 空态只取代「已开启分身」这一组，**不能取代整页**：
-     整页藏掉 = 首启用户看不到任何开关，引导语把他指向一个不存在的区域（产品首启死路） */
-  await t('空态演示开 → 空态显示，但搜索与「所有应用」仍在', async () => {
+  /* 空态只取代「分身」视图的列表，**另一个视图必须可达**：
+     空态里的「选择应用」与标题栏的视图切换器是两条路——都断了就是产品首启死路 */
+  await t('空态演示 → 空态显示，且「选择应用」通向可见的应用列表', async () => {
     await click('#btnTheme'); await click('#btnEmpty');
-    return ev(() => !!document.querySelector('#emptyState').offsetParent
+    const emptyOk = await ev(() => !!document.querySelector('#emptyState').offsetParent
       && !document.querySelector('#grpSupported').offsetParent
+      && !!document.querySelector('#btnPickApps')?.offsetParent);
+    if (!emptyOk) return '空态没有显示出来';
+    await click('#btnPickApps');
+    const listOk = await ev(() => !!document.querySelector('#viewAll').offsetParent
       && !!document.querySelector('#search')?.offsetParent          // 可见，不是"DOM 里有"
       && document.querySelectorAll('#unconfBox [data-sw]').length > 0);
+    return listOk || '「选择应用」没有把用户带到可见的应用列表（首启无路可走）';
   });
   await t('空态下点亮开关 → 能走进首次配置（首启有路）', async () => {
     /* 光"DOM 里有这个开关"不够：整块列表被 display:none 时它照样能被程序点中，
@@ -272,22 +291,33 @@ const pp = loadPuppeteer();
     return ok || '空态下点开关没反应';
   });
   await t('空态演示还原', async () => { await click('#btnEmpty');
-    return ev(() => document.querySelector('#emptyState').style.display === 'none'
-      && !!document.querySelector('#grpSupported').offsetParent); });
+    const restored = await ev(() => document.querySelector('#emptyState').style.display === 'none'
+      && !!document.querySelector('#grpSupported').offsetParent
+      && document.querySelector('.vs-btn[data-view="clones"]').getAttribute('aria-selected') === 'true');
+    if (!restored) return '空态没有还原，或还原后不在「分身」视图';
+    /* 「添加应用分身」是「分身」视图底部的第二个入口：点了必须真的到「所有应用」 */
+    await click('#rowPickApps');
+    return await ev(() => !!document.querySelector('#viewAll').offsetParent
+      && !!document.querySelector('#search')?.offsetParent) || '「添加应用分身」没有切到所有应用'; });
 
   // —— 横幅两种语义：致命不可自行解除，降级可关但不影响功能 ——
-  await t('致命横幅 → 开关被拦截，且没有"知道了"按钮', async () => { await click('#btnBanner');
+  await t('致命横幅 → 开关被拦截，且没有"知道了"按钮', async () => { await showView('all'); await click('#btnBanner');
     const blocked = await ev(() => document.body.classList.contains('blocked')
       && document.querySelector('#banner').classList.contains('show')
       && !document.querySelector('#banner button'));
     await click('[data-sw="firefox"]');
     const stillOff = await ev(() => !document.querySelector('[data-sw="firefox"]').checked
       && !document.querySelector('#overlay').classList.contains('open'));
+    /* 致命横幅冻结的是"要 bwrap 才能成事"的操作，不是导航：切换视图必须仍然可用，
+       否则标题栏上就是一个可见但点不动的控件（GTK 侧同样不碰 AdwViewSwitcher） */
+    await click('.vs-btn[data-view="clones"]');
+    const canSwitch = await ev(() => !!document.querySelector('#viewClones').offsetParent);
+    await showView('all');
     /* 屏3 tab 也在工具栏里（被放行），但致命状态下它不能开出一个"按钮点不动"的探测框 */
     await click('[data-scr="3"]');
     const noGhost = await ev(() => !document.querySelector('#overlay').classList.contains('open')
       && !!document.querySelector('#scr1').offsetParent);
-    return blocked && stillOff && noGhost; });
+    return (blocked && stillOff && canSwitch && noGhost) || '致命态下开关没被拦、视图切不动或开出了探测框'; });
   /* 致命状态不能连"状态演示"一起冻住：环境恢复后界面若回不来，就是同一个死锁。
      不依赖上一条的结果——先按当前状态保证横幅是开着的，再关它 */
   await t('致命横幅（环境恢复）→ 横幅收起、开关重新响应、取消后开关回弹', async () => {
@@ -433,7 +463,7 @@ const pp = loadPuppeteer();
     await click('#alertOk');
     return opened && await ev(() => document.querySelector('[data-sw="telegram"]').checked); });
   /* 有档案没实例 → 「开启分身」：复用档案、跳过探测（标题说「首次配置」会让用户白等一分钟） */
-  await t('开关开(qq) → 标题「开启分身」且不重跑探测', async () => { await click('[data-sw="qq"]');
+  await t('开关开(qq) → 标题「开启分身」且不重跑探测', async () => { await showView('all'); await click('[data-sw="qq"]');
     return ev(() => { const d = document.querySelector('#dlgTitle').textContent;
       return document.querySelector('#overlay').classList.contains('open')
         && d.includes('开启分身') && !d.includes('首次配置')
@@ -459,6 +489,8 @@ const pp = loadPuppeteer();
 
   // —— 重命名（只改 display_name，id 不可变；32 rune 上限）——
   await t('qq 重开（复用档案）→ 详情重命名', async () => {
+    await click('#btnBack');               // 回到屏1
+    await showView('all');                 // qq 已无实例，开关在「所有应用」视图里
     await click('[data-sw="qq"]');
     await confirmAndWait();
     const onDetail = await ev(() => document.querySelector('#hbTitle').textContent === 'QQ'

@@ -16,6 +16,7 @@ package main
 // 直调的是按钮 clicked 绑定的同一个 submit 处理函数。这是直调回调，不是
 // 合成点击，不需要指针事件。
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -43,7 +44,16 @@ func (noFuseMounter) Mount(string, string, string, string) (func() error, error)
 	return nil, errors.New("gtk e2e：不做挂载")
 }
 
-func TestGtkScreensLifecycle(t *testing.T) {
+// gtkTestEnv 建一套隔离的假 HOME / XDG / AC_BASE，返回 Env 和只属于本次
+// 测试的 .desktop 目录。
+//
+// 假 HOME 是硬要求：回归不允许碰真实主目录（CLAUDE.md 冒烟规则）。AC_HOME
+// 必须一起钉住：PathResolver 用 AC_HOME 作为可见 Home，用 $HOME 作为
+// RealHome；只钉 AC_HOME 会让 bwrap 的受限目录仍指向真实主目录。
+//
+// 根目录优先取脚本给的 $APPCLONE_GTK_ROOT（放在 $WORK 下，--keep 时保留
+// 失败现场）；直接 go test 时退回 t.TempDir（测试结束自动清理）。
+func gtkTestEnv(t *testing.T, name string) (*core.Env, string) {
 	if os.Getenv("APPCLONE_GTK_TEST") != "1" {
 		t.Skip("GTK 回归需要显式开关：design/guitest-gtk.sh")
 	}
@@ -51,18 +61,14 @@ func TestGtkScreensLifecycle(t *testing.T) {
 		t.Skip("没有可用的显示（DISPLAY / WAYLAND_DISPLAY）")
 	}
 
-	// 假 HOME：回归不允许碰真实主目录（CLAUDE.md 冒烟规则）。
-	// AC_HOME 必须一起钉住：PathResolver 用 AC_HOME 作为可见 Home，用
-	// $HOME 作为 RealHome；只钉 AC_HOME 会让 bwrap 的受限目录仍指向真实
-	// 主目录，两个都钉死才谈得上隔离。
-	//
-	// 根目录优先取脚本给的 $APPCLONE_GTK_ROOT（放在 $WORK 下，--keep 时
-	// 保留失败现场）；直接 go test 时退回 t.TempDir（测试结束自动清理）。
 	root := os.Getenv("APPCLONE_GTK_ROOT")
 	if root == "" {
 		root = t.TempDir()
-	} else if err := os.MkdirAll(root, 0o700); err != nil {
-		t.Fatal(err)
+	} else {
+		root = filepath.Join(root, name)
+		if err := os.MkdirAll(root, 0o700); err != nil {
+			t.Fatal(err)
+		}
 	}
 	home := filepath.Join(root, "home")
 	envs := map[string]string{
@@ -94,6 +100,12 @@ func TestGtkScreensLifecycle(t *testing.T) {
 	}
 	env.AppDirList = []string{appsDir}
 	env.Mounter = noFuseMounter{}
+	return env, appsDir
+}
+
+func TestGtkScreensLifecycle(t *testing.T) {
+	env, appsDir := gtkTestEnv(t, "lifecycle")
+
 	// 假应用：CreateInstance 会先 LoadApp 确认应用存在（GUI 与 CLI 同一条校验）。
 	for name, body := range map[string]string{
 		"demo.desktop":  "[Desktop Entry]\nType=Application\nName=Demo\nExec=/usr/bin/true\n",
@@ -153,11 +165,25 @@ func TestGtkScreensLifecycle(t *testing.T) {
 				if !u.loaded {
 					return true
 				}
+				// 视图栈必须真的画出来：GtkWidget:visible 是局部属性，祖先隐藏时
+				// 仍为 true——只断 GetVisible 抓不到"首轮落地后忘记恢复显示"的
+				// 永久空白（把 renderList 末尾的 SetVisible(true) 删掉，断言要变红）。
+				if !u.stack.GetVisible() {
+					fail("首轮扫描落地后视图栈仍不可见")
+					return false
+				}
+				if !u.stack.GetMapped() {
+					return true // 等窗口映射完再判定；一直不映射会由总超时判红
+				}
+				if !u.switcher.GetSensitive() {
+					fail("首轮落地后视图切换器仍被禁用")
+					return false
+				}
 				// 空态不是 PreferencesGroup（Group 只收 AdwPreferencesRow，
-				// StatusPage 塞进去会被裁成半截图标），它挂在列表页上方；
-				// 空态可见时列表页只剩「所有应用」一组。
+				// StatusPage 塞进去会被裁成半截图标），它挂在「分身」视图里。
+				// 空态时列表只剩「所有应用」一组。
 				if len(u.groups) != 1 {
-					fail("空态下列表页应只有「所有应用」1 组，得到 %d 组", len(u.groups))
+					fail("空态下列表应只有「所有应用」1 组，得到 %d 组", len(u.groups))
 					return false
 				}
 				if u.emptyPage == nil || !u.emptyPage.GetVisible() {
@@ -169,6 +195,12 @@ func TestGtkScreensLifecycle(t *testing.T) {
 					return false
 				} else {
 					p.Unref()
+				}
+				// 一个分身都没有时首屏落在「所有应用」：点亮开关是唯一能做的事。
+				// 空态在「分身」视图里，用户点切换器或空态里的「选择应用」过去。
+				if got := u.stack.GetVisibleChildName(); got != "all" {
+					fail("没有分身时首屏应落在「所有应用」，实际视图 %q", got)
+					return false
 				}
 				// 搜索过滤必须有牙：query 生效后 Demo 在、Alpha 不在。直接删掉
 				// renderList 里的过滤条件会让这条断言变红。
@@ -295,6 +327,12 @@ func TestGtkScreensLifecycle(t *testing.T) {
 					fail("返回列表后又冒出了配置页（补发 notify 去重失效）")
 					return false
 				}
+				// 创建完切回「分身」：返回时刚建出的实例就在眼前，
+				// 而不是回到「所有应用」找那个已经不在列表里的开关。
+				if got := u.stack.GetVisibleChildName(); got != "on" {
+					fail("创建后应切回「分身」视图，实际 %q", got)
+					return false
+				}
 				step++
 				app.Quit()
 				return false
@@ -318,6 +356,196 @@ func TestGtkScreensLifecycle(t *testing.T) {
 	}
 	if !activated || step != 5 {
 		t.Fatalf("GTK 回归没有跑完：activated=%t step=%d", activated, step)
+	}
+}
+
+// TestGtkLandsOnClonesView：已有实例时首屏必须直接落在「分身」。
+//
+// 单独成测的原因：生命周期用例的首屏没有实例，只证明了"无实例 → 所有应用"；
+// 而 buildWindow 的默认值本来就是 all——删掉 reload 里的落点逻辑它照样绿。
+// 只有预置实例再起窗口，才真正压住"已有实例 → on"这一支。
+func TestGtkLandsOnClonesView(t *testing.T) {
+	env, appsDir := gtkTestEnv(t, "landing")
+	if err := os.WriteFile(filepath.Join(appsDir, "demo.desktop"),
+		[]byte("[Desktop Entry]\nType=Application\nName=Demo\nExec=/usr/bin/true\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// 预置档案与实例：这条用例只验落点，不跑探测。
+	profile := core.Profile{
+		App: "demo", Version: core.ProfileVersion, Exec: "/usr/bin/true",
+		Paths: []string{"~/.config/Demo"}, ProbeMethod: "overlay",
+		Ignored: core.DefaultIgnored(), Env: map[string]string{},
+	}
+	if _, err := env.CreateInstance(context.Background(), "demo", profile, "main"); err != nil {
+		t.Fatal(err)
+	}
+
+	app := adw.NewApplication("io.github.mensylisir.Appclone.GtkLanding",
+		gio.GApplicationNonUniqueValue)
+	defer app.Unref()
+
+	u := &ui{app: app, env: env, lang: "zh_CN"}
+	var runErr error
+	activated := false
+	fail := func(format string, a ...any) {
+		if runErr == nil {
+			runErr = fmt.Errorf(format, a...)
+		}
+		app.Quit()
+	}
+	// 落点只决定一次：首轮落地后切到「所有应用」，再触发一轮 reload，
+	// 视图必须留在用户选的地方（把 reload 里的 first 守卫删掉，这条会红）。
+	reloadedAt := time.Time{}
+	actcb := func(_ gio.Application) {
+		if u.win != nil {
+			return
+		}
+		activated = true
+		u.buildWindow()
+		deadline := time.Now().Add(20 * time.Second)
+		var tick glib.SourceFunc
+		tick = func(uintptr) bool {
+			if time.Now().After(deadline) {
+				fail("等首轮扫描超时")
+				return false
+			}
+			if !u.loaded {
+				return true
+			}
+			if !u.stack.GetMapped() {
+				return true // 等窗口映射；一直不映射由总超时判红
+			}
+			if reloadedAt.IsZero() {
+				if got := u.stack.GetVisibleChildName(); got != "on" {
+					fail("已有实例时首屏应落在「分身」，实际 %q", got)
+					return false
+				}
+				if !u.onPage.GetVisible() {
+					fail("有实例时「分身」视图的列表页不可见")
+					return false
+				}
+				if u.emptyPage.GetVisible() {
+					fail("有实例时不该显示空态")
+					return false
+				}
+				u.stack.SetVisibleChildName("all")
+				reloadedAt = time.Now()
+				u.reload()
+				return true
+			}
+			// 给第二轮扫描留出落地与观察窗口（本地只有几个 .desktop）。
+			if time.Since(reloadedAt) < 1500*time.Millisecond {
+				return true
+			}
+			if got := u.stack.GetVisibleChildName(); got != "all" {
+				fail("首轮之后用户切走的视图被 reload 弹回 %q（落点必须只决定一次）", got)
+				return false
+			}
+			app.Quit()
+			return false
+		}
+		glib.TimeoutAdd(50, &tick, 0)
+	}
+	app.ConnectActivate(&actcb)
+	u.hold(&actcb)
+
+	if code := app.Run(1, os.Args[:1]); code != 0 {
+		t.Fatalf("GTK 主循环退出码 %d", code)
+	}
+	if runErr != nil {
+		t.Fatal(runErr)
+	}
+	if !activated {
+		t.Fatal("activate 没有执行（GApplication 把调用转发给了别的实例？）")
+	}
+}
+
+// TestGtkEmptyStateMapped：切到「分身」视图后，空态必须真的被映射（用户看得到）。
+//
+// 只断言 GetVisible/GetParent 是假绿：visible 是局部属性，祖先隐藏时仍为真；
+// parent 也只是"有爹"。这里切到 on 页，等一帧后断言 GetMapped，并且父容器
+// 必须就是 onBox——把 StatusPage 错挂到 offBox 或让 onPage 同时可见都会红。
+func TestGtkEmptyStateMapped(t *testing.T) {
+	env, _ := gtkTestEnv(t, "empty")
+
+	app := adw.NewApplication("io.github.mensylisir.Appclone.GtkEmpty",
+		gio.GApplicationNonUniqueValue)
+	defer app.Unref()
+
+	u := &ui{app: app, env: env, lang: "zh_CN"}
+	var runErr error
+	activated := false
+	fail := func(format string, a ...any) {
+		if runErr == nil {
+			runErr = fmt.Errorf(format, a...)
+		}
+		app.Quit()
+	}
+	switched := false
+	actcb := func(_ gio.Application) {
+		if u.win != nil {
+			return
+		}
+		activated = true
+		u.buildWindow()
+		deadline := time.Now().Add(20 * time.Second)
+		var tick glib.SourceFunc
+		tick = func(uintptr) bool {
+			if time.Now().After(deadline) {
+				fail("等首轮扫描/映射超时")
+				return false
+			}
+			if !u.loaded || !u.stack.GetMapped() {
+				return true
+			}
+			if !switched {
+				if got := u.stack.GetVisibleChildName(); got != "all" {
+					fail("没有分身时首屏应落在「所有应用」，实际 %q", got)
+					return false
+				}
+				if !u.switcher.GetSensitive() {
+					fail("首轮落地后视图切换器仍被禁用")
+					return false
+				}
+				u.stack.SetVisibleChildName("on")
+				switched = true
+				return true
+			}
+			// 切页后等一帧，让映射状态更新。
+			if !u.emptyPage.GetMapped() {
+				return true
+			}
+			if p := u.emptyPage.GetParent(); p == nil {
+				fail("空态页没有父容器")
+				return false
+			} else {
+				same := p.GoPointer() == u.onBox.Widget.GoPointer()
+				p.Unref()
+				if !same {
+					fail("空态页挂在了「分身」视图之外")
+					return false
+				}
+			}
+			if u.onPage.GetVisible() {
+				fail("空态时「分身」视图的列表页不该可见")
+				return false
+			}
+			app.Quit()
+			return false
+		}
+		glib.TimeoutAdd(50, &tick, 0)
+	}
+	app.ConnectActivate(&actcb)
+	u.hold(&actcb)
+
+	if code := app.Run(1, os.Args[:1]); code != 0 {
+		t.Fatalf("GTK 主循环退出码 %d", code)
+	}
+	if runErr != nil {
+		t.Fatal(runErr)
+	}
+	if !activated {
+		t.Fatal("activate 没有执行（GApplication 把调用转发给了别的实例？）")
 	}
 }
 

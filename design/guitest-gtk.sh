@@ -52,7 +52,7 @@ CGO_ENABLED=0 go build -o "$WORK/appclone" ./cmd/appclone
 LOG="$WORK/gtk-test.log"
 set +e
 CGO_ENABLED=0 PATH="$WORK:$PATH" APPCLONE_GTK_TEST=1 \
-  go test -tags gtk_e2e -count=1 -timeout 180s -v -run 'TestGtkScreens' ./cmd/appclone-gui \
+  go test -tags gtk_e2e -count=1 -timeout 180s -v -run 'TestGtk' ./cmd/appclone-gui \
   2>&1 | tee "$LOG"
 rc=${PIPESTATUS[0]}
 set -e
@@ -60,8 +60,10 @@ if [ "$rc" -ne 0 ]; then
   exit "$rc"
 fi
 # `-run` 匹配不到任何测试时 `go test` 仍返回 0（输出只剩 "[no test files]"）：
-# 测试被改名/移走会静默假绿，所以必须真的看到那条 PASS。
-if ! grep -q -- '--- PASS: TestGtkScreensLifecycle' "$LOG"; then
-  echo "guitest-gtk: 没有看到 TestGtkScreensLifecycle 的 PASS（测试被移走/改名/跳过？）" >&2
-  exit 5
-fi
+# 测试被改名/移走会静默假绿，所以必须真的看到每一条 PASS。
+for name in TestGtkScreensLifecycle TestGtkLandsOnClonesView TestGtkEmptyStateMapped; do
+  if ! grep -q -- "--- PASS: $name" "$LOG"; then
+    echo "guitest-gtk: 没有看到 $name 的 PASS（测试被移走/改名/跳过？）" >&2
+    exit 5
+  fi
+done

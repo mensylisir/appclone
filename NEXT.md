@@ -254,6 +254,45 @@ RealHome 仍指真实主目录，bwrap 的受限目录会跟着指错）；`AppD
 TOCTOU——删除循环期间用户若启动实例，可能出现部分执行（结果会如实报 deleted/running 计数）；
 busy 事务没有超时，`gio trash` 或等锁卡死时关窗会被一直拒绝。留待后续评估，不在本轮改动。
 
+**第三十六轮：列表拆成两个平级视图（用户反馈"上面一个滚动条、下面一个滚动条"）**（2026-11-08）。
+用户指出「已开启」与「所有应用」上下叠在一页、一条滚动跨界很别扭。改法是原生的
+`AdwViewStack` + 标题栏 `AdwViewSwitcher`（宽策略，图标+文字）：
+- 两页各一个 `AdwPreferencesPage`，**各自滚动**；`on` 页 = 已开启分身 + 底部「添加应用分身」
+  （`list-add-symbolic`，切到 `all`），`all` 页 = 搜索条 + 全部应用。
+- **首屏落点按状态**：已有实例 → `on`（多数人是来启动/管理的），一个都没有 → `all`
+  （点亮开关是唯一能做的事）。只决定首屏一次；创建成功后切回 `on`，返回时刚建出的实例就在眼前。
+- **角标**：`ViewStackPage.SetBadgeNumber` 给「分身」页挂数量。首版判断"只在非当前页
+  显示"是**误读截图**（角标与 copy 图标重叠、低分辨率下看成了图标的一部分）——用放大
+  截图复核 + 对抗性复审的 PyGObject 实测确认：**当前页也画**角标，选中页与未选中页都显示。
+  HTML 基线与文档已按真实语义改口（不再按当前视图隐藏）。
+- **空态搬家**：「分身」页的列表位置换 `AdwStatusPage`（`vexpand` 居中，语义从"取代一组"变成
+  "取代这一视图的列表"），里面是 suggested-action「选择应用」切到 `all`；`all` 页与切换器
+  **始终可达**——首启死路这条不变式没变，只是路变成了两条。
+- 去掉 `all` 页组的重复标题（视图名已经说了"所有应用"），组说明保留。
+交互基线同步：`design/appclone-gui.html` 加标题栏 `AdwViewSwitcher`（内联 SVG 图标 + 角标）、
+`#viewClones`/`#viewAll` 两个 pane、`showView()`、空态「选择应用」与「添加应用分身」，
+组件映射卡与状态行一并改写。`design/guitest.js` **58 项不变**：新增 `showView()` 帮手，
+空态两条改为"空态显示 + 「选择应用」通向可见的应用列表"与"还原后回「分身」"，
+首屏落点断言折进「行点击进详情」；搜索/横幅测试先切到 `all`，横幅用例并断言
+**致命态下视图切换仍可用**（这是 `AdwViewSwitcher` 与 bwrap 状态无关的语义；事件层
+若把它一起短路，标题栏上就是一个可见但点不动的控件）。
+- 首屏扫描落地前不绘制视图栈（`SetVisible(false)`），且 **switcher 同时禁用**（扫描期间
+  内容区是空的，允许用户先选再被落点覆盖是糟糕体验）；恢复显示与解禁都放在 `renderList`
+  末尾，即使某轮结果被更新的一轮丢弃也不会永久空白。首轮落地后把焦点交给当前视图的
+  `PreferencesPage`（不是 ViewStack——它没有滚动控制器，方向键/PageDown 滚不动列表）。
+- 对抗复审收口的其他两条：`TestGtkEmptyStateMapped`（切到 on 后断言空态 `GetMapped`、
+  父容器就是 `onBox`、`onPage` 不可见——只断 `GetVisible`/`GetParent` 是假绿）；
+  `TestGtkLandsOnClonesView` 增加"首轮之后切走 → 再 reload → 视图不弹回"的观察窗口
+  （删掉 `first` 守卫会红）。
+GTK 闸门补结构断言：无实例时 `GetVisibleChildName()=="all"`、创建后 `=="on"`；
+另加 `TestGtkLandsOnClonesView`（预置实例 → 首屏必须 `on`，且列表可见、空态不显示）与
+`TestGtkEmptyStateMapped`；三条都做过变异验证（不恢复显示 / 落点每次执行 / 空态挂错页，
+分别立即变红）。`guitest-gtk.sh` 的 `-run` 与 PASS 检查覆盖三条用例（匹配不到就退出 5）。
+证据：`gofmt -l .` 空、`go vet ./...` 干净、`go vet -tags gtk_e2e` 干净、
+`go test -count=1 ./...` 全绿、`CGO_ENABLED=0 go build ./...` 通过、`node design/guitest.js` **58/58**、
+`design/guitest-gtk.sh` **3/3 PASS**；`DISPLAY=:0` 真机截图核对了「分身」（含运行实例、角标）
+与「所有应用」两屏。
+
 ## 下一步
 
 路线图第 1 项（`core` 探测原语）**被本机环境挡住**：`fuse-overlayfs 1.18` 与 `fusermount3 3.18.3` 已装（用户确认），
@@ -325,6 +364,12 @@ busy 事务没有超时，`gio trash` 或等锁卡死时关窗会被一直拒绝
   复审提出、本轮未改（改它会动 `run` 的生命周期契约，必须单独定案）。
 
 ## 最近完成
+
+- 2026-11-08 **第三十六轮：列表拆成两个平级视图（分身 / 所有应用）**：`AdwViewStack` + 标题栏
+  `AdwViewSwitcher`，两页各自滚动；首屏按有无实例落点、创建后切回「分身」；「分身」页数量角标
+  （1.10 实测当前页也显示）；空态只取代「分身」视图的列表，「选择应用」与切换器都通向
+  「所有应用」。交互基线（HTML 稿 + 58 项回归）与 GTK 闸门（新增落点断言）同步。
+  证据见上文第三十六轮。
 
 - 2026-11-07 **第二十五轮：真机探测链路验证通过（L1 + 审计写入侧转 `verified`）**：
   - 本机出现 `/dev/fuse`，`design/probe-smoke.sh /tmp/appclone` **非 root** 一次跑通 9 步、退出码 0：
