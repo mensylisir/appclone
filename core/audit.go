@@ -98,7 +98,10 @@ func (e *Env) beginAudit(in Instance, p Profile) (*AuditSession, *AuditLayers, e
 		os.RemoveAll(work)
 		return nil, nil, err
 	}
-	return &AuditSession{
+	// 拆成两个变量再返回：gofmt 1.26 与 1.27 对「return 多个复合字面量」
+	// 的缩进规则不同，写成一条 return 会让 CI（1.26.0）与本地（1.27）
+	// 互相判为未格式化。赋值语句的格式在两个版本一致。
+	sess := &AuditSession{
 		e: e, in: in, p: p, work: work,
 		upper:  filepath.Join(work, "upper"),
 		start:  start,
@@ -106,10 +109,12 @@ func (e *Env) beginAudit(in Instance, p Profile) (*AuditSession, *AuditLayers, e
 		pubs:   pubs,
 		shared: e.existingSharedWrites(p),
 		base:   e.Base,
-	}, &AuditLayers{
+	}
+	layers := &AuditLayers{
 		Merged:      filepath.Join(work, "merged"),
 		PublicBinds: pubs,
-	}, nil
+	}
+	return sess, layers, nil
 }
 
 // existingSharedWrites 是本次审计真正可能生效的 shared_writes：
