@@ -365,7 +365,15 @@ func (v *setupView) start() {
 		v.showProfileRejected(err)
 		return
 	}
-	if b, ok, err := v.u.env.BundledProfile(v.appKey); err == nil && ok {
+	if b, ok, berr := v.u.env.BundledProfile(v.appKey); berr != nil {
+		// 内置模板是编译进二进制的常量，读不出来说明构建坏了：重探也好不了，
+		// 所以不给「重试」，只把原因说清楚。描述不复用 i18n 的"请重新探测
+		// 生成"——这里恰恰是重探解决不了的场景（复审 P3）。
+		v.retry = nil
+		v.showErrorTitle("内置模板读不出来", berr)
+		v.errPage.SetDescription("这份模板随程序一起发布，读不出来说明安装包损坏或不完整。请重新安装 appclone——重跑探测只会读到同一份模板。")
+		return
+	} else if ok {
 		v.bundled = b
 		v.hasBundled = true
 	}
@@ -491,67 +499,26 @@ func (v *setupView) release() {
 	v.u.app.Release()
 }
 
-// applyProbeResult 把探测结果落成确认页：路径来自探测，非路径字段来自
-// 既有档案（优先）或内置模板；零写入 + 纯模板预填时按 manual 记来源。
+// applyProbeResult 把探测结果落成确认页。落案规则（模板预填、来源标注、
+// 零写入门槛、非路径字段合并）全在 core.FinalizeProbe——CLI 的 `add` 用同一份，
+// 两个视图不会对同一探测结果落出两份语义不同的档案（§6.1）。
 func (v *setupView) applyProbeResult(res core.ProbeResult) {
-	v.profile = res.Profile
-	v.cands = res.Candidates
-	v.mergeBundledPrefill()
-	v.applyBaseFields(res)
-
-	// 判定口径与 CLI 一致：看**会进档案的路径数**，不是候选数。只有缓存/
-	// 共享/凭证写入时，确认页会显示「没有可隔离的路径」且确认按钮永远禁用
-	// ——那是死路，不是确认（§6.1 ③-d）。
-	sel := make([]core.Candidate, len(v.cands))
-	copy(sel, v.cands)
-	derived := v.u.env.Resolver.ProfileFromCandidates(v.appKey, v.profile.ProbeMethod, sel)
-	if len(derived.Paths) == 0 {
+	p, cands, prefilled, err := v.u.env.FinalizeProbe(v.appKey, res, core.ProbeFinalize{
+		Bundled:     v.bundled,
+		HasBundled:  v.hasBundled,
+		Existing:    v.existing,
+		HasExisting: v.hasExisting,
+	})
+	if err != nil {
+		// 目前唯一可能的失败是"零写入"（只有缓存/共享/凭证被写过）：重探是
+		// 唯一有意义的动作，不能退化成一份什么都不隔离的空档案（§6.3）。
 		v.retry = v.probe
-		v.showError(core.NewProbeNoWrites(v.appKey, len(v.cands)))
+		v.showError(err)
 		return
 	}
+	v.profile, v.cands, v.prefilled = p, cands, prefilled
 	v.setState("confirm")
 	v.renderConfirm()
-}
-
-// applyBaseFields 把"探测不产生的字段"从既有档案或内置模板补进结果。
-//
-// 优先级：既有档案 > 内置模板 > 零值。既有档案是用户上次确认过的行为配置；
-// 模板是维护者校对过的起点；探测只负责路径与证据来源。合并规则在 core 里
-// （MergeNonPathFields），CLI 的 --rediscover 用同一份，两个视图不会分叉。
-func (v *setupView) applyBaseFields(res core.ProbeResult) {
-	// 证据来源如实：本次 overlay 一条路径都没跟踪到、确认页里的路径全靠
-	// 模板预填时，这份档案不是本机探测结果，不能标成 overlay（§6.1 文案红线）。
-	if v.prefilled > 0 && len(res.Profile.Paths) == 0 {
-		v.profile.ProbeMethod = "manual"
-	}
-	var base core.Profile
-	has := false
-	switch {
-	case v.hasExisting:
-		base, has = v.existing, true
-	case v.hasBundled:
-		base, has = v.bundled, true
-	}
-	if has {
-		v.profile = core.MergeNonPathFields(v.profile, base)
-	}
-	if v.profile.Env == nil {
-		v.profile.Env = map[string]string{}
-	}
-}
-
-// mergeBundledPrefill 把内置模板里的路径补进候选集。分类与"哪些类别不进
-// 候选"的规则在 core（PrefillCandidates），CLI 的 `add` 用同一份实现。
-func (v *setupView) mergeBundledPrefill() {
-	// 重试会重新合并，计数必须从零开始（否则会累加成假数字）。
-	v.prefilled = 0
-	if !v.hasBundled {
-		return
-	}
-	extra := v.u.env.Resolver.PrefillCandidates(v.bundled, v.cands)
-	v.cands = append(v.cands, extra...)
-	v.prefilled = len(extra)
 }
 
 // showDegraded 起降级横幅（看不到 fuse-overlayfs 时走 strace）。

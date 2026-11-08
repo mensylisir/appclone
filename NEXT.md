@@ -163,6 +163,30 @@ P3：① 导航页每次 push 泄漏整页（构造器 ref_sink、popped 后从�
 全绿、`CGO_ENABLED=0 go build ./...` 通过、`node design/guitest.js` 58/58 退出码 0。
 GUI 交互仍受本轮环境限制（见"被挡住的"），上述生命周期结论以代码纪律 + navspike 为准，不冒充像素验证。
 
+**第三十三轮：GUI/CLI 探测落案编排去重**（2026-11-08）。此前"模板预填 → 来源标注
+（manual/overlay）→ 零写入判定 → 非路径字段合并"在 CLI `add` 与 GUI `applyProbeResult`
+各有一份实现——规则本身（`PrefillCandidates` / `MergeNonPathFieldsWith`）只在 core，
+但**顺序与判据**（用哪个路径数判零写入、什么时候改标 manual、既有档案与模板谁优先）
+两边靠人工同步，是最后一个会分叉的入口（STATUS 原「未落地 ②」）。
+新增 `core.FinalizeProbe` 把这四步收成一个函数，CLI 与 GUI 只传各自的基线
+（`Bundled` / `Existing`）与拿回 `(profile, candidates, prefilled)`；GUI 的
+`mergeBundledPrefill` / `applyBaseFields` 两个方法与 CLI 的那段内联逻辑一并删除。
+顺带把 GUI 的坏模板从"静默忽略"改成显式失败态（内置模板是编译期常量，读不出来
+说明构建坏了，不给「重试」）。
+证据：新增 `core/finalize_test.go` 5 条（零写入拒绝且 `observed` 含预填候选、纯模板预填标 manual、
+本机探测不被预填改来源、既有档案 > 模板、无既有档案时模板作基线）；`gofmt -l .` 空、`go vet ./...` 干净、
+`go test -count=1 ./...` 全绿、`go test -race ./core ./cmd/appclone` 全绿、
+`CGO_ENABLED=0 go build ./...` 通过、`node design/guitest.js` 58/58、
+`design/probe-smoke.sh /tmp/appclone-cli-b622999` 退出码 0（重构后的 `add` 真机跑通
+探测 → 档案 → 实例 → 审计 → verify → 回收站）。
+只读复审：**APPROVED**（0 P0–P2，4 条 P3）。已修 3 条：① 零写入用例补上"`observed` 含预填候选"
+（这是本轮最易回归的语义，原用例无预填会假通过）；② 「内置模板读不出来」改用专用描述
+（不再复用"请重新探测生成"——那正是该状态解决不了的动作）；③ `FinalizeProbe` 注释写明
+"`res.Profile` 必须由同一 `res.Candidates` 派生、零写入时返回值不可用"的不变量；
+STATUS 里的函数名 `MergeNonPathFields` 顺手改准为 `MergeNonPathFieldsWith`。
+未改的 P3：`append(cands, extra...)` 的理论别名问题——真实 `MergeUpper` 产物 `cap==len`，
+无调用方持有同底层数组的长 slice，改动（`slices.Concat`）只会增加噪音。
+
 ## 下一步
 
 路线图第 1 项（`core` 探测原语）**被本机环境挡住**：`fuse-overlayfs 1.18` 与 `fusermount3 3.18.3` 已装（用户确认），
@@ -189,8 +213,7 @@ GUI 交互仍受本轮环境限制（见"被挡住的"），上述生命周期�
 4. `cmd/appclone-gui`（puregotk + libadwaita 三屏，控件映射见 `tech-stack.md` §4.5）。
    **v1 三屏已落地并通过两轮实现审查修复**（2026-11-08，见第二十八～三十轮；STATUS = `implemented`）。剩余：
    ① **GTK 侧回归闸门**（broadway 不稳，考虑 Xvfb/嵌套 mutter 或纯逻辑抽测）；
-   ② GUI 与 CLI 的 setup 编排去重（内置模板→探测→零写入→校验→保存 logic 目前两份；
-      合并规则已收进 `core.MergeNonPathFields`，剩下的只是编排骨架）；
+   ② ~~GUI 与 CLI 的 setup 编排去重~~ **已完成**（2026-11-08，`core.FinalizeProbe`，见第三十三轮）；
    ③ GUI 文案进 i18n 目录（ADR-027 的退出条件），之后 `u.lang` 才能跟随 `i18n.Lang()`。
 
 ## 被挡住的

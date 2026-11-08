@@ -131,46 +131,19 @@ func newAddCmd(a *app) *cobra.Command {
 				if perr != nil {
 					return perr
 				}
-				p = res.Profile
-				cands := res.Candidates
-				prefilled := 0
-				if hasBundled {
-					extra := a.env.Resolver.PrefillCandidates(bundled, cands)
-					cands = append(cands, extra...)
-					prefilled = len(extra)
+				// 预填、来源标注、零写入门槛、非路径字段合并只有 core 一份实现
+				// （FinalizeProbe）：GUI 确认页走同一个函数，否则同一个应用会被
+				// 两端落出两份档案（§6.1）。
+				fin, _, _, ferr := a.env.FinalizeProbe(appKey, res, core.ProbeFinalize{
+					Bundled:     bundled,
+					HasBundled:  hasBundled,
+					Existing:    old,
+					HasExisting: hasOld,
+				})
+				if ferr != nil {
+					return ferr
 				}
-				method := p.ProbeMethod
-				if prefilled > 0 && len(p.Paths) == 0 {
-					// 本次一条路径都没跟踪到、结果全靠模板预填：来源如实标
-					// manual，不能冒充本机探测（§6.1 文案红线）。
-					method = "manual"
-				}
-				// 判定口径与 GUI 一致：看**会进档案的路径数**，不是候选数。
-				// 只有缓存/共享/凭证写入时，任何入口都不该生成空档案（§6.3）。
-				derived := a.env.Resolver.ProfileFromCandidates(appKey, method, cands)
-				if len(derived.Paths) == 0 {
-					return core.NewProbeNoWrites(appKey, len(cands))
-				}
-				if prefilled > 0 {
-					p.Paths = derived.Paths
-					p.SharedWrites = derived.SharedWrites
-					p.ProbeMethod = method
-				}
-				// 重新配置/重新探测只重定**路径**：既有档案的 env、extra_binds、
-				// isolate_*、cwd、audit、ignored、未知字段是用户的显式配置，
-				// 探测产物里没有它们（§5.5）。没有既有档案时模板是次一级基线。
-				// GUI 走同一条规则（core.MergeNonPathFieldsWith），否则同一个
-				// 应用会落出两份语义不同的档案。
-				base := core.Profile{}
-				hasBase := false
-				if hasOld {
-					base, hasBase = old, true
-				} else if hasBundled {
-					base, hasBase = bundled, true
-				}
-				if hasBase {
-					p = core.MergeNonPathFieldsWith(a.env.Resolver, p, base)
-				}
+				p = fin
 			} else if hasOld {
 				p = old
 			} else if p, err = a.env.LoadProfile(appKey); err != nil {
