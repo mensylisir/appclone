@@ -222,9 +222,11 @@ RealHome 仍指真实主目录，bwrap 的受限目录会跟着指错）；`AppD
 没有这条就 exit 5；同轮把 step 2 的"又冒出配置页"改成按页面指针立即判红，不再靠 45 秒超时。
 两条闸门完整性修复也做了反证：把 `screens_test.go` 移走后脚本 exit 5（不再 `[no test files]` 假绿）；
 用只有 go/CLI 的最小 PATH 运行时脚本 exit 4 并直说缺 bwrap（不再 45 秒超时）。
-**仍未覆盖**：探测四态、删除/重命名/关闭开关对话框、横幅与错误态文案、fuse 致命态回退、
+**当时仍未覆盖**：探测四态、删除/重命名/关闭开关对话框、横幅与错误态文案、fuse 致命态回退、
 指针与键盘事件注入——这些需要输入注入或可编程对话框响应，留给后续；ADR-027 的 i18n 退出条件
 因此在 `docs/tech-stack.md` 里明确为"闸门走遍三屏四态之后"，`u.lang` 暂不改回 `i18n.Lang()`。
+**第三十七轮已收口其中四项**（探测中/失败态、降级横幅与「了解」、fuse 致命态、三屏文案入 i18n），
+只剩删除/重命名对话框与指针/键盘注入未自动化。
 证据：`design/guitest-gtk.sh` 最终树连续 2 次 PASS（1.40s / 1.45s；含 `go vet`/`go vet -tags gtk_e2e`/`gofmt` 干净、
 `go test -count=1 ./...` 全绿且 GUI 包默认不编译、`CGO_ENABLED=0 go build ./...`、
 `node design/guitest.js` 58/58）。
@@ -293,6 +295,82 @@ GTK 闸门补结构断言：无实例时 `GetVisibleChildName()=="all"`、创建
 `design/guitest-gtk.sh` **3/3 PASS**；`DISPLAY=:0` 真机截图核对了「分身」（含运行实例、角标）
 与「所有应用」两屏。
 
+**第三十七轮：GTK 闸门补四态 + GUI 文案入 i18n（ADR-027 退场）**（2026-11-08）。
+闸门新增五条用例，凑齐三屏四态（列表/配置/详情 × probing/confirm/creating/error）：
+- `TestGtkSetupStates`：拨开关进入首次配置 → 同步落在 `probing`（确认按钮隐藏、取消按钮叫
+  「取消探测」）→ `finish(false)`（取消按钮绑的同一个函数）→ 页面 pop、无实例、无档案。
+  同一条用例还断言降级横幅：`noFuseMounter` 下横幅必须真的显示；发出真实
+  `button-clicked` 信号（走产品 `ConnectButtonClicked` 接线，不是直调回调）后消失，
+  且后续 `applyEnvBanners` 不能把它弹回来。
+- `TestGtkErrorState`：预置版本超前档案走独立窗口的 `open` 入口，等页面真的可见后断言
+  `error` 态（标题按原因「档案由更新版本生成」、描述非空、**不显示重试**、取消按钮叫
+  「取消」）。独立窗口避开 pop→push 同名 tag 的过渡态，不靠 sleep。
+- `TestGtkFatalBanner`：空 PATH 让 `CheckBwrap` 失败 → 致命横幅显示、降级横幅不显示、
+  搜索停用、应用开关停用。
+- `TestGtkRetryableError`（对抗复审补）：可重试错误态下「重试」必须可见、可点、文案是
+  「重试」，点它要走产品接线把重跑回调真的触发；取消后页面关闭。
+- `TestGtkRapidRepush`（对抗复审补，P1 回归）：push 配置页 → 可见后立刻取消 → **同一个
+  tick** 再 push 一次。`AdwNavigationView` 在 pop 过渡期间仍持有旧页 tag，原先写死的
+  `"setup"`/`"detail"` 会让第二次 `Push` 被静默拒绝（只在 stderr 留一条
+  `Adwaita-CRITICAL: Duplicate page tag`），用户看到开关拨了没反应。产品侧改为
+  `pushPage` 给每页发唯一 tag（`page-<seq>`）；把 tag 改回固定值并删掉 `strconv` 后
+  该用例在 20 秒超时红（已实测），证明它真的守着这个竞态。
+- 生命周期用例补 creating 断言：确认按钮发出真实 `clicked` 信号后必须立即进入 `creating`
+  （确认/取消按钮同时停用、`GetCanPop()` 为假），不再只看「实例最终落盘」。
+各条新断言都做过变异验证（失败态显示重试 / 致命态开关仍可点 / 固定 page tag /
+`newUI` 写死 zh_CN，分别立即变红）。
+三屏静态文案（约 150 条 `ui.*` 文案、160 处 `tr()` 调用）全部进 `core/i18n`（zh_CN + en），`newUI` 统一
+`i18n.Lang()`；新增 `core/i18n/i18n_test.go`：两语言键一一对应、占位符集合一致、
+en 表不得混入中文、`DetectLang` 顺序与简体边界、缺键返回键本身。另加
+`TestCoreKeysExist` 扫 `core/*.go` 里所有字面量 `err.*` / `probe.why.*` 键并在两张表里逐个核对，
+`TestViewLiteralKeysExist` 再扫 `cmd/appclone-gui` 与 `cmd/appclone` 的
+`ui.*`/`err.*`/`probe.why.*`——
+只比两张表发现不了「代码新加 key、表没跟上」导致界面直接显示原始键名。表一致性测试
+**顺手抓出两个真实缺陷**：`err.profile.exec_field_code` 与
+`err.profile.extra_bind_missing` 只有 en，中文界面会回落成英文（已补 zh）；缺键扫描又补上
+`err.env.ac_home_relative`、`err.internal.probe_spec`、`err.probe.mount_timeout`。
+切片参数的分隔符也改成跟语言走（zh「、」/ en「, 」），`ui.toast.separator` 单列
+（zh「；」/ en `"; "`），避免英文界面出现顿号。`TestGtkEnglishStrings` 用
+`LC_ALL=en_US.UTF-8` 走 `newUI`，断言窗口标题「App Clones」、空态「No clones yet」、
+降级横幅与行副标题都是英文、已抽检的控件文本里不残留 `ui.` 键名（把 `newUI` 写死
+`zh_CN` 会立即变红；全量键名遗漏由上面的源码扫描兜底）；另加一条单测钉住「渲染只扫
+模板一遍」：参数值里的 `{n}`/`$1` 必须原样保留，不能二次替换。
+证据：`gofmt -l .` 空、`go vet ./...` / `go vet -tags gtk_e2e` 干净、
+`go test -count=1 ./...` 全绿（含 i18n 表一致性）、`CGO_ENABLED=0 go build ./...` 通过、
+`node design/guitest.js` **58/58**、`design/guitest-gtk.sh` **9/9 PASS**（最终树连续 3 次
+4.13–4.21s；本轮闸门累计 11 次全绿）。**闸门偶发 `Test I/O incomplete` 的根因与修复**：取消探测后测试立即返回，
+测试进程会在 `terminateGroup` 的 3 秒 SIGTERM→SIGKILL 窗口里退出——goroutine 的 defer 没机会
+跑完，`dbus-daemon`/`strace`/`bwrap` 变成孤儿（`strace` 默认忽略 SIGTERM），其中继承的
+stderr 正是 `go test` 的输出管道，18 秒后升级成闸门失败。修复是让 `TestGtkSetupStates` 与
+`TestGtkRapidRepush` 在退出前等 `v.held == false`（探测 goroutine 真正返回并 release 之后
+才为假），cleanup 完成才结束测试；修复前残留进程实测存在了 17 分钟，修复后累计 11 次连跑零残留。
+**对抗复审 P1（存量缺陷，本轮收口）：取消/超时时在 overlay 还挂着的状态下
+`os.RemoveAll(work)`**。`probeRoundFailed` 原先在 `unmount` 之前清理工作目录；`merged`
+是 fuse 挂载点，`RemoveAll` 会先 `opendir` 再逐项 unlink，等于把整个 `$HOME` 视图遍历一遍，
+upper 里探测期写下的文件（可能是用户刚保存的内容）被删，最后才因 EBUSY 报错；同时
+dbus-daemon 还活着、进程会卡在遍历里不退。修复：`probeSession` 内统一 `teardown`
+（停会话进程 → 停私有 dbus → 卸载 → 处置目录）；卸载后先做污染检查，只有公共目录进了
+upper 或 upper 读不出来才 `quarantine`，并把恢复路径写进错误（取消用
+`err.probe.canceled_kept`，CLI 打一行、GUI 弹 toast；超时无现场用
+`err.probe.timeout_no_scene`）；只有第 0 轮 guard 在 exec 前失败才允许无条件删写层；
+`discard`/`quarantine` 都带 `mounted` 硬护栏。回归：`TestProbeSessionCancelUnmountsBeforeCleanup`（fake 挂载在
+`merged` 放哨兵文件，顺序错了哨兵先消失）。第二轮复审又收口三处：strace 降级没有写层现场，
+超时改用独立键 `err.probe.timeout_strace`（不复用带 `{quarantine}` 的 overlay 文案，否则
+界面会显示字面量）；空 upper 的取消不再留空 quarantine（读得出来且为空才删，读失败仍按
+「可能有内容」保留）；guard 失败在 `round > 0` 时改为保留现场（前几轮可能已写入用户文件，
+只有第 0 轮在 exec 前失败才允许删）。顺带收口：`startProbeBus` 失败路径补 `Wait`
+并改用 `cmd.Wait()` 关掉 `StdoutPipe`（原先每次探测漏一个 fd、失败时留僵尸），
+dbus-daemon 加 `Pdeathsig: SIGTERM`（GUI 被信号打死时私有总线跟着收），`setsidRunner`
+在 `Start` 前查 `ctx.Err()`（取消后不再把应用拉起几毫秒），`pushDetail` 只复用仍是可见页的
+详情页，`setupView.start/probe/submit` 增加 `done` 守卫（退场动画里的点击不再重跑事务）。
+**已知策略**：`display_name` 的默认值「分身 N」是用户数据，不随界面语言翻译（ADR-025）；
+英文界面首次创建仍显示「分身 1」，这是有意选择，若要中性默认名需单独定案。
+**未覆盖**：删除/重命名/关闭开关对话框的
+响应路径（需要可编程对话框响应）、真实指针/键盘注入，以及 **Esc 是否会被
+`AdwNavigationView` 的 pop-on-escape 抢在窗口级 key controller 之前**（对抗复审指出：
+闸门从不发 Esc；创建态有 `SetCanPop(false)` 兜底，但普通页的「Esc=取消」语义仍需
+一条真实按键用例才能钉住）。
+
 ## 下一步
 
 路线图第 1 项（`core` 探测原语）**被本机环境挡住**：`fuse-overlayfs 1.18` 与 `fusermount3 3.18.3` 已装（用户确认），
@@ -318,11 +396,14 @@ GTK 闸门补结构断言：无实例时 `GetVisibleChildName()=="all"`、创建
 3. ~~CLI MVP~~ **已完成**（`add/run/list/rm/doctor/repair-desktop/version`）
 4. `cmd/appclone-gui`（puregotk + libadwaita 三屏，控件映射见 `tech-stack.md` §4.5）。
    **v1 三屏已落地并通过两轮实现审查修复**（2026-11-08，见第二十八～三十轮；STATUS = `implemented`）。剩余：
-   ① ~~**GTK 侧回归闸门**~~ **已落地（部分覆盖，2026-11-08）**：`design/guitest-gtk.sh` +
-      `cmd/appclone-gui/screens_test.go`。剩余：探测四态 / 对话框 / 横幅的自动化（需要可编程
-      对话框响应或输入注入）；
+   ① ~~**GTK 侧回归闸门**~~ **已落地（2026-11-08，第三十七轮补齐三屏四态 + 横幅/致命态）**：
+      `design/guitest-gtk.sh` + `cmd/appclone-gui/screens_test.go`（9 条用例）。
+      剩余：删除/重命名/关闭开关对话框、探测中取消之外的输入注入（需要可编程对话框响应
+      或真实指针/键盘事件）；
    ② ~~GUI 与 CLI 的 setup 编排去重~~ **已完成**（2026-11-08，`core.FinalizeProbe`，见第三十三轮）；
-   ③ GUI 文案进 i18n 目录（ADR-027 的退出条件），之后 `u.lang` 才能跟随 `i18n.Lang()`。
+   ③ ~~GUI 文案进 i18n 目录~~ **已完成（2026-11-08，第三十七轮）**：三屏静态文案全部按
+      `ui.*` 入 `core/i18n`（zh_CN + en），`newUI` 用 `i18n.Lang()`；`i18n_test.go` 钉住
+      两语言键与占位符一致，`TestGtkEnglishStrings` 验证 en 界面真的拿英文文案。
 
 ## 被挡住的
 
@@ -333,8 +414,9 @@ GTK 闸门补结构断言：无实例时 `GetVisibleChildName()=="all"`、创建
   `strace` 在本次外层 strace 环境下报 `PTRACE_TRACEME: Operation not permitted`——需要单独确认真实
   触发条件（是否与嵌套 tracer / 沙箱有关），再把 `ParseStrace` 与真实日志对齐。
 - **GUI 侧的自动化闸门**：`guitest.js` 只覆盖 HTML 稿；GTK 实现现由 `design/guitest-gtk.sh`
-  覆盖**页面生命周期**（列表/确认/创建/详情/返回，2026-11-08 起），但**指针与键盘事件注入仍不可行**
-  （本会话 XTEST 被禁，xdotool 指针/键盘无效），所以探测四态、删除/重命名对话框、横幅交互
+  覆盖**页面生命周期与三屏四态**（列表/确认/创建/详情/返回 + 首屏落点、空态映射、
+  探测中取消/失败/可重试错误态、快速重推竞态、降级与致命横幅、en 文案，2026-11-08 起），但**指针与键盘事件注入仍不可行**
+  （本会话 XTEST 被禁，xdotool 指针/键盘无效），所以删除/重命名/关闭开关对话框的响应路径
   还不能脚本化。broadway 的结论保留在下方，供后续参考。
   `gtk4-broadwayd` 在 `NavigationView` push 后会以其自身断言
   （`gdk/broadway/broadway-output.c:458 append_node_ops: !reused_node->consumed`）**自崩**，
@@ -350,7 +432,8 @@ GTK 闸门补结构断言：无实例时 `GetVisibleChildName()=="all"`、创建
   可行路线：装 Xvfb（或换一台能跑 Xvfb 的机器）、在 GUI 内做 `APPCLONE_GUI_SHOT` 出口，
   或把三屏的纯逻辑状态机从 GTK 里抽出来做无显示测试。不需要输入的 GTK 生命周期已由
   `design/navspike`（导航页 Unref 时机）与 `design/guitest-gtk.sh`（列表 → 确认 → 创建 →
-  详情 → 返回）覆盖；**未覆盖部分**（探测四态、删除/重命名对话框、横幅）仍不能声称已验证。
+  详情 → 返回 + 三屏四态/横幅/en 文案）覆盖；**未覆盖部分**（删除/重命名/关闭开关对话框、
+  真实指针/键盘注入）仍不能声称已验证。
 - 复现命令（broadway 冒烟，假 HOME）：`gtk4-broadwayd -p 8095 :5` +
   `GDK_BACKEND=broadway BROADWAY_DISPLAY=:5 HOME=<fake> AC_BASE=<fake>/xdg/appclone ./appclone-gui`，
   浏览器打开 `http://127.0.0.1:8095/`（注意 `XDG_RUNTIME_DIR` 必须是 broadwayd 所在的那个，
@@ -364,6 +447,15 @@ GTK 闸门补结构断言：无实例时 `GetVisibleChildName()=="all"`、创建
   复审提出、本轮未改（改它会动 `run` 的生命周期契约，必须单独定案）。
 
 ## 最近完成
+
+- 2026-11-08 **第三十七轮：GTK 闸门补齐三屏四态 + GUI 文案入 i18n（ADR-027 退场）**：
+  新增 `TestGtkSetupStates`（probing 取消、降级横幅「了解」）、`TestGtkErrorState`（error 态无重试）、
+  `TestGtkRetryableError`（可重试错误态的「重试」接线）、`TestGtkRapidRepush`（pop 过渡中再次 push
+  的导航竞态，产品侧以唯一 page tag 修复）与 `TestGtkFatalBanner`（致命态横幅/搜索/开关联动），
+  连同生命周期与详情页用例凑齐列表/配置/详情 × probing/confirm/creating/error（9/9 PASS）；
+  约 150 条 `ui.*` 文案（160 处 `tr()` 调用）按 `core/i18n`（zh_CN + en），`newUI` 跟随
+  `i18n.Lang()`；表一致性 + core 键枚举测试抓出两个只有 en 的既有错误键与三个缺失键并补齐；
+  `TestGtkEnglishStrings` 验证 en 界面。证据见上文第三十七轮。
 
 - 2026-11-08 **第三十六轮：列表拆成两个平级视图（分身 / 所有应用）**：`AdwViewStack` + 标题栏
   `AdwViewSwitcher`，两页各自滚动；首屏按有无实例落点、创建后切回「分身」；「分身」页数量角标

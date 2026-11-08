@@ -175,6 +175,10 @@ type fakeMounter struct {
 	entries []string
 	failOn  string
 	mounted bool
+	// sentinel 在 merged（模拟的 $HOME 视图）里放一个文件。真实实现里它是
+	// 挂载点；如果代码在挂载状态下 RemoveAll(work)，这个文件会先被删掉——
+	// 用它来证明"先卸载、后处置目录"的顺序。
+	sentinel string
 }
 
 func (f *fakeMounter) Available() error {
@@ -195,6 +199,14 @@ func (f *fakeMounter) Mount(lower, upper, work, merged string) (func() error, er
 		}, nil
 	}
 	f.mounted = true
+	if f.sentinel != "" {
+		if err := os.MkdirAll(merged, 0o700); err != nil {
+			return nil, err
+		}
+		if err := os.WriteFile(filepath.Join(merged, f.sentinel), []byte("home"), 0o600); err != nil {
+			return nil, err
+		}
+	}
 	for _, rel := range f.entries {
 		p := filepath.Join(upper, filepath.FromSlash(rel))
 		if err := os.MkdirAll(filepath.Dir(p), 0o700); err != nil {
@@ -212,11 +224,16 @@ type fakeRunner struct {
 	err   error
 	argv  []string
 	calls int
+	// step 按第几次调用返回不同结果（多轮场景）；为 nil 时用 res/err。
+	step func(call int) (SessionResult, error)
 }
 
 func (f *fakeRunner) Run(_ context.Context, argv []string, _ io.Writer) (SessionResult, error) {
 	f.argv = argv
 	f.calls++
+	if f.step != nil {
+		return f.step(f.calls)
+	}
 	return f.res, f.err
 }
 
@@ -326,6 +343,156 @@ func TestProbeSessionKeepsWorkOnUmountFailure(t *testing.T) {
 	for _, d := range left {
 		os.RemoveAll(d)
 	}
+}
+
+// 取消/超时发生在 overlay 还挂着的时候：必须先停会话、卸载，再处置工作目录。
+//
+// 反例是 probeRoundFailed 直接在挂载状态下 os.RemoveAll(work)——真实环境里
+// RemoveAll 会穿过 merged 挂载点遍历整个 $HOME 视图，upper 里探测期写下的
+// 文件（可能是用户刚保存的内容）会被 unlink，而 EBUSY 只在最后才报。
+// 这里用 fakeMounter 在 merged 里放哨兵文件：它在挂载时被删掉，就说明
+// 清理顺序错了。同时断言现场被 quarantine 而不是删除（§3.2.1）。
+func TestProbeSessionCancelUnmountsBeforeCleanup(t *testing.T) {
+	e := probeEnv(t)
+	// 公共目录进 upper → 走 quarantine（只有这种情况会保留 merged）；
+	// 哨兵文件用来证明清理发生在卸载之后。
+	m := &fakeMounter{entries: []string{"Downloads/important.docx"}, sentinel: "user-file.txt"}
+	r := &fakeRunner{err: context.Canceled}
+	_, err := e.probeSession(context.Background(), "testapp",
+		ProbeOptions{Command: []string{"/nonexistent/zz-probe-test-app"}, Mounter: m, Runner: r}, m, r)
+	if !errors.Is(err, ErrCanceled) {
+		t.Fatalf("取消应返回 ErrCanceled，得到 %v", err)
+	}
+	if m.mounted {
+		t.Fatal("取消后挂载点必须卸载")
+	}
+	dirs, _ := filepath.Glob(filepath.Join(e.TmpRoot, "appclone-quarantine-*"))
+	found := false
+	for _, d := range dirs {
+		if _, statErr := os.Stat(filepath.Join(d, "merged", "user-file.txt")); statErr == nil {
+			found = true
+		}
+		os.RemoveAll(d)
+	}
+	if !found {
+		t.Fatal("取消后必须保留现场：merged 里的文件被提前删了（清理发生在卸载之前）")
+	}
+}
+
+// strace 降级路径没有可保留的写层现场：超时必须用自己的文案，不能复用
+// overlay 的 err.probe.timeout（那条带 {quarantine}，这里没有参数可填，
+// 会直接给用户显示字面量）。
+func TestProbeStraceTimeoutUsesOwnKey(t *testing.T) {
+	e := probeEnv(t)
+	r := &fakeRunner{err: context.DeadlineExceeded}
+	_, err := e.probeStrace(context.Background(), "testapp",
+		ProbeOptions{Command: []string{"/nonexistent/zz-probe-test-app"}, Runner: r}, r)
+	var ce *Error
+	if !errors.As(err, &ce) || ce.Key != "err.probe.timeout_strace" {
+		t.Fatalf("strace 超时应返回 err.probe.timeout_strace，得到 %v", err)
+	}
+}
+
+// 取消时写层为空：没有现场可保留，不能留一个空 quarantine 目录。
+func TestProbeSessionCancelEmptyUpperLeavesNoScene(t *testing.T) {
+	e := probeEnv(t)
+	m := &fakeMounter{}
+	r := &fakeRunner{err: context.Canceled}
+	_, err := e.probeSession(context.Background(), "testapp",
+		ProbeOptions{Command: []string{"/nonexistent/zz-probe-test-app"}, Mounter: m, Runner: r}, m, r)
+	if !errors.Is(err, ErrCanceled) {
+		t.Fatalf("取消应返回 ErrCanceled，得到 %v", err)
+	}
+	if dirs := quarantineDirs(t, e); len(dirs) != 0 {
+		t.Fatalf("空写层不该留下 quarantine：%v", dirs)
+	}
+}
+
+// 取消时 upper 里出现公共目录（bind 可能没生效）：必须保留现场，并把路径
+// 包进仍可 errors.Is(ErrCanceled) 的错误里（否则用户不知道文件去哪了）。
+func TestProbeSessionCancelContaminatedKeepsScene(t *testing.T) {
+	e := probeEnv(t)
+	m := &fakeMounter{entries: []string{"Downloads/important.docx"}}
+	r := &fakeRunner{err: context.Canceled}
+	_, err := e.probeSession(context.Background(), "testapp",
+		ProbeOptions{Command: []string{"/nonexistent/zz-probe-test-app"}, Mounter: m, Runner: r}, m, r)
+	if !errors.Is(err, ErrCanceled) {
+		t.Fatalf("取消必须仍能 errors.Is(ErrCanceled)，得到 %v", err)
+	}
+	var ce *Error
+	if !errors.As(err, &ce) || ce.Key != "err.probe.canceled_kept" {
+		t.Fatalf("污染取消应返回 err.probe.canceled_kept，得到 %v", err)
+	}
+	q, _ := ce.Args["quarantine"].(string)
+	if q == "" {
+		t.Fatal("错误里必须有恢复路径")
+	}
+	defer os.RemoveAll(q)
+	if _, statErr := os.Stat(filepath.Join(q, "upper", "Downloads", "important.docx")); statErr != nil {
+		t.Fatalf("quarantine 里应保留用户文件：%v", statErr)
+	}
+}
+
+// 多轮场景：第 2 轮 guard 失败时，第 1 轮可能已写入公共目录——必须保留现场，
+// 且错误文案要给出路径（不能再说"应用还没启动"）。
+func TestProbeSessionMultiRoundGuardKeepsScene(t *testing.T) {
+	e := probeEnv(t)
+	m := &fakeMounter{entries: []string{"Downloads/important.docx"}}
+	r := &fakeRunner{step: func(call int) (SessionResult, error) {
+		if call == 1 {
+			return SessionResult{}, nil
+		}
+		return SessionResult{ExitCode: probeGuardFailed}, nil
+	}}
+	_, err := e.probeSession(context.Background(), "testapp", ProbeOptions{
+		Command: []string{"/nonexistent/zz-probe-test-app"}, Mounter: m, Runner: r, Rounds: 2,
+	}, m, r)
+	var ce *Error
+	if !errors.As(err, &ce) || ce.Key != "err.probe.bind_verify_failed_kept" {
+		t.Fatalf("多轮 guard 失败应返回 kept 文案，得到 %v", err)
+	}
+	q, _ := ce.Args["quarantine"].(string)
+	if q == "" {
+		t.Fatal("错误里必须有恢复路径")
+	}
+	defer os.RemoveAll(q)
+	if _, statErr := os.Stat(filepath.Join(q, "upper", "Downloads", "important.docx")); statErr != nil {
+		t.Fatalf("quarantine 里应保留前几轮的写入：%v", statErr)
+	}
+}
+
+// 多轮场景的普通启动错误：写层里只有应用自身配置（无公共目录污染）时，
+// 与成功路径一样删掉写层——不能因为"轮次 > 0"就把纯配置写入也说成用户文件。
+func TestProbeSessionMultiRoundStartErrorDiscardsCleanUpper(t *testing.T) {
+	e := probeEnv(t)
+	m := &fakeMounter{entries: []string{".config/App/x"}}
+	r := &fakeRunner{step: func(call int) (SessionResult, error) {
+		if call == 1 {
+			return SessionResult{}, nil
+		}
+		return SessionResult{}, errEnv("err.probe.start_failed", map[string]any{"exec": "x"}, nil)
+	}}
+	_, err := e.probeSession(context.Background(), "testapp", ProbeOptions{
+		Command: []string{"/nonexistent/zz-probe-test-app"}, Mounter: m, Runner: r, Rounds: 2,
+	}, m, r)
+	if err == nil {
+		t.Fatal("第 2 轮起不来必须报错")
+	}
+	if dirs := quarantineDirs(t, e); len(dirs) != 0 {
+		t.Fatalf("无污染的多轮失败不该留 quarantine：%v", dirs)
+	}
+	if dirs, _ := filepath.Glob(filepath.Join(e.TmpRoot, "appclone-probe-*")); len(dirs) != 0 {
+		t.Fatalf("工作目录应被清掉：%v", dirs)
+	}
+}
+
+func quarantineDirs(t *testing.T, e *Env) []string {
+	t.Helper()
+	dirs, err := filepath.Glob(filepath.Join(e.TmpRoot, "appclone-quarantine-*"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return dirs
 }
 
 // 四道闸门：overlay 不可用时不许硬试。

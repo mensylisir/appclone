@@ -179,6 +179,20 @@ overlay 把整个 `$HOME` 罩住，**用户在探测会话里的每一次保存�
 **清理必须在收集与检查之后**：先收集 upper 里的写入集、再做"公共目录污染"检查（§3.2.1 的反向断言），
 最后才删 `probe/`。反过来（先删再查）这个断言永远为空——它检查的东西已经被自己删掉了。
 
+**取消/超时的清理顺序（2026-11-08 对抗复审发现并修复）**：`probeRoundFailed` 曾在
+`unmount` 之前直接 `os.RemoveAll(work)`。此时 `merged` 还挂着，`RemoveAll` 会先 `opendir` 挂载点、
+把整个 `$HOME` 视图逐项 unlink（upper 里的白化/写入随之被删），最后才因挂载点 EBUSY 报错。
+统一收尾顺序固定为 **停会话进程 → 停私有 dbus → 卸载 → 处置目录**。卸载后处置规则：
+取消/超时/后续轮次失败都先做一次污染检查——upper 为空直接丢弃；只有应用自身配置/缓存
+（无公共目录）时与成功路径一样删除；**公共目录出现在 upper 或根本读不出来时才 `quarantine`**
+（读不出来的东西不能顺手删），并把恢复路径写进错误文案（取消时用
+`err.probe.canceled_kept`，CLI 打一行、GUI 弹 toast）。只有"应用还没 exec"的第 0 轮 guard
+失败才允许无条件删写层；`round > 0` 的 guard 失败保留现场并报 `bind_verify_failed_kept`。
+strace 降级路径没有写层现场，超时用独立文案 `err.probe.timeout_strace`；overlay 超时若没有
+可保留现场用 `err.probe.timeout_no_scene`，不能复用带 `{quarantine}` 的文案。`discard` 里保留 `mounted` 硬护栏：挂载在就绝不 `RemoveAll`。
+对应回归：`core/probe_test.go` 的 `TestProbeSessionCancelUnmountsBeforeCleanup`（fake 挂载在
+`merged` 放哨兵文件，清理顺序错了哨兵会先消失）。
+
 Go 实现用 `os/exec` + `SysProcAttr{Setsid: true}` + `context`，**不依赖 shell 的 `trap`**
 （`EXIT` trap 里引用 `local` 变量会失效，这正是上一版参考实现踩过的坑）。
 

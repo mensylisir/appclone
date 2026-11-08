@@ -8,9 +8,14 @@ package i18n
 import (
 	"fmt"
 	"os"
-	"sort"
+	"regexp"
 	"strings"
 )
+
+// placeholderRE 匹配消息模板里的 {name}。渲染走一次扫过（ReplaceAllStringFunc），
+// 而不是按参数名逐个 ReplaceAll：后者会在错误详情本身含有 "{n}" 这类字面量时
+// 被第二次替换（{detail} 先于 {n} 处理的顺序问题）。
+var placeholderRE = regexp.MustCompile(`\{[A-Za-z0-9_]+\}`)
 
 // Lang 是当前界面语言。v1 只出 zh_CN 与 en 两套。
 func Lang() string {
@@ -47,8 +52,9 @@ func DetectLang(getenv func(string) string) string {
 	}
 }
 
-// T 渲染一条消息。缺键时返回键本身——宁可界面上出现 err.xxx.yyy 这种
-// 明显的占位符，也不要静默显示一句不相关的中文（那会让缺陷藏起来）。
+// T 渲染一条消息。查不到语言时回落英文；英文表也没有这个键时返回键本身——
+// 宁可界面上出现 err.xxx.yyy 这种明显的占位符，也不要静默显示一句不相关的
+// 文案（那会让缺陷藏起来）。
 func T(lang, key string, args map[string]any) string {
 	table, ok := messages[lang]
 	if !ok {
@@ -65,31 +71,35 @@ func T(lang, key string, args map[string]any) string {
 	if len(args) == 0 {
 		return tmpl
 	}
-	return render(tmpl, args)
+	return render(tmpl, args, lang)
 }
 
-// render 支持 {name} 占位符；切片参数渲染成 "a、b、c"。
-func render(tmpl string, args map[string]any) string {
-	keys := make([]string, 0, len(args))
-	for k := range args {
-		keys = append(keys, k)
+// render 支持 {name} 占位符；切片参数按语言渲染：中文用 "、"，其余用 ", "。
+func render(tmpl string, args map[string]any, lang string) string {
+	if len(args) == 0 {
+		return tmpl
 	}
-	sort.Strings(keys)
-	out := tmpl
-	for _, k := range keys {
-		out = strings.ReplaceAll(out, "{"+k+"}", formatArg(args[k]))
-	}
-	return out
+	return placeholderRE.ReplaceAllStringFunc(tmpl, func(m string) string {
+		key := m[1 : len(m)-1]
+		v, ok := args[key]
+		if !ok {
+			return m // 漏传的参数留在原地，界面上一眼能看出来
+		}
+		return formatArg(v, lang)
+	})
 }
 
-func formatArg(v any) string {
+func formatArg(v any, lang string) string {
 	switch x := v.(type) {
 	case nil:
 		return ""
 	case string:
 		return x
 	case []string:
-		return strings.Join(x, "、")
+		if lang == "zh_CN" {
+			return strings.Join(x, "、")
+		}
+		return strings.Join(x, ", ")
 	case int:
 		return fmt.Sprintf("%d", x)
 	case bool:

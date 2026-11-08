@@ -59,9 +59,17 @@ type detailData struct {
 
 func (u *ui) pushDetail(appKey string) {
 	// 详情页不叠详情页：重复点同一行的箭头只刷新，不往栈里塞第二页。
+	// 但只有在它**仍是可见页**时才复用：popped 之前 pointer 还在，页面却
+	// 已经在离场，往它上面 render 等于点击无反应（对抗复审 P3）。
 	if v := u.activeDetail; v != nil && v.appKey == appKey {
-		v.render()
-		return
+		if vis := u.nav.GetVisiblePage(); vis != nil {
+			same := vis.GoPointer() == v.page.GoPointer()
+			vis.Unref() // transfer full
+			if same {
+				v.render()
+				return
+			}
+		}
 	}
 	v := &detailView{u: u, appKey: appKey, running: map[string]bool{}}
 	v.fixed = &renderScope{c: u.cb}
@@ -80,7 +88,6 @@ func (u *ui) pushDetail(appKey string) {
 	tv.AddTopBar(&hb.Widget)
 	tv.SetContent(&v.content.Widget)
 	v.page = adw.NewNavigationPage(&tv.Widget, u.nameOf(appKey))
-	v.page.SetTag("detail")
 	u.activeDetail = v
 	u.pushPage(v.page, v.popped)
 	v.render()
@@ -216,12 +223,12 @@ func (v *detailView) buildBroken(msg string) {
 	// 只读行承载原因，信息一样完整。
 	g := adw.NewPreferencesGroup()
 	v.scope.own(&g.Widget)
-	g.SetTitle("档案读不出来")
+	g.SetTitle(v.u.tr("ui.detail.profile_broken.title", nil))
 	g.SetDescription(msg)
 	row := adw.NewActionRow()
 	v.scope.own(&row.Widget)
-	row.SetTitle("无法读取这份档案")
-	row.SetSubtitle("返回列表，用开关重新配置这个应用即可生成新档案")
+	row.SetTitle(v.u.tr("ui.detail.profile_broken.row", nil))
+	row.SetSubtitle(v.u.tr("ui.detail.profile_broken.hint", nil))
 	row.SetSubtitleLines(0)
 	v.prefix(row, "dialog-warning-symbolic")
 	row.SetSensitive(false)
@@ -238,9 +245,9 @@ func (v *detailView) prefix(row *adw.ActionRow, icon string) {
 }
 
 // instanceSummary 是详情页标题的第二行：实例数与运行中数量。
-func instanceSummary(insts []core.Instance, running map[string]bool) string {
+func (v *detailView) instanceSummary(insts []core.Instance, running map[string]bool) string {
 	if len(insts) == 0 {
-		return "还没有分身"
+		return v.u.tr("ui.detail.clones.none", nil)
 	}
 	n := 0
 	for _, in := range insts {
@@ -249,23 +256,23 @@ func instanceSummary(insts []core.Instance, running map[string]bool) string {
 		}
 	}
 	if n > 0 {
-		return fmt.Sprintf("%d 个分身 · %d 个运行中", len(insts), n)
+		return v.u.tr("ui.detail.clones.count_running", map[string]any{"n": len(insts), "running": n})
 	}
-	return fmt.Sprintf("%d 个分身", len(insts))
+	return v.u.tr("ui.detail.clones.count", map[string]any{"n": len(insts)})
 }
 
 func (v *detailView) build() {
 	v.reset()
 	p := v.profile
 	if v.title != nil {
-		v.title.SetSubtitle(instanceSummary(v.insts, v.running))
+		v.title.SetSubtitle(v.instanceSummary(v.insts, v.running))
 	}
 
 	// ---- 实例 ----
 	ig := adw.NewPreferencesGroup()
 	v.scope.own(&ig.Widget)
-	ig.SetTitle("分身实例")
-	ig.SetDescription("每个分身拥有独立的配置与数据；公共目录仍然共享。")
+	ig.SetTitle(v.u.tr("ui.detail.group.instances", nil))
+	ig.SetDescription(v.u.tr("ui.detail.group.instances.desc", nil))
 	for _, in := range v.insts {
 		running := v.running[in.ID]
 		row := adw.NewActionRow()
@@ -274,12 +281,16 @@ func (v *detailView) build() {
 		ic := v.u.symbolicIcon("edit-copy-symbolic")
 		v.scope.own(&ic.Widget)
 		row.AddPrefix(&ic.Widget)
-		sub := "已停止"
+		state := v.u.tr("ui.instance.stopped", nil)
 		if running {
-			sub = "运行中"
+			state = v.u.tr("ui.instance.running", nil)
 		}
+		sub := state
 		if in.LastUsedAt != nil {
-			sub += " · 上次使用 " + in.LastUsedAt.Local().Format("01-02 15:04")
+			sub = v.u.tr("ui.instance.last_used", map[string]any{
+				"state": state,
+				"time":  in.LastUsedAt.Local().Format("01-02 15:04"),
+			})
 		}
 		row.SetSubtitle(sub)
 
@@ -287,24 +298,24 @@ func (v *detailView) build() {
 		v.scope.own(&box.Widget)
 		box.SetValign(gtk.AlignCenterValue)
 
-		launch, launchC := v.u.iconButton("media-playback-start-symbolic", "启动")
+		launch, launchC := v.u.iconButton("media-playback-start-symbolic", v.u.tr("ui.instance.launch", nil))
 		v.scope.own(&launch.Widget)
 		v.scope.own(&launchC.Widget)
 		launch.AddCssClass("suggested-action")
 		launch.SetSensitive(!running)
-		launch.SetTooltipText("在这个分身的沙箱里启动应用")
+		launch.SetTooltipText(v.u.tr("ui.instance.launch.tooltip", nil))
 
-		rename, renameC := v.u.iconButton("document-edit-symbolic", "重命名")
+		rename, renameC := v.u.iconButton("document-edit-symbolic", v.u.tr("ui.instance.rename", nil))
 		v.scope.own(&rename.Widget)
 		v.scope.own(&renameC.Widget)
 		rename.SetSensitive(!running)
 
-		del, delC := v.u.iconButton("user-trash-symbolic", "删除")
+		del, delC := v.u.iconButton("user-trash-symbolic", v.u.tr("ui.instance.delete", nil))
 		v.scope.own(&del.Widget)
 		v.scope.own(&delC.Widget)
 		del.AddCssClass("destructive-action")
 		del.SetSensitive(!running)
-		del.SetTooltipText("移到回收站（可恢复）")
+		del.SetTooltipText(v.u.tr("ui.instance.delete.tooltip", nil))
 
 		inst := in
 		v.scope.button(launch, func() { v.launch(inst) })
@@ -320,14 +331,14 @@ func (v *detailView) build() {
 	if len(v.insts) == 0 {
 		row := adw.NewActionRow()
 		v.scope.own(&row.Widget)
-		row.SetTitle("还没有分身实例")
+		row.SetTitle(v.u.tr("ui.detail.instances.empty", nil))
 		row.SetSensitive(false)
 		ig.Add(&row.Widget)
 	}
 	add := adw.NewActionRow()
 	v.scope.own(&add.Widget)
-	add.SetTitle("新建分身")
-	add.SetSubtitle("沿用现有隔离设置，直接再建一个；设置失效时会先带你重新配置")
+	add.SetTitle(v.u.tr("ui.detail.new_clone", nil))
+	add.SetSubtitle(v.u.tr("ui.detail.new_clone.subtitle", nil))
 	addIc := v.u.symbolicIcon("list-add-symbolic")
 	v.scope.own(&addIc.Widget)
 	add.AddPrefix(&addIc.Widget)
@@ -350,13 +361,13 @@ func (v *detailView) build() {
 	// ---- 档案（只读）----
 	pg := adw.NewPreferencesGroup()
 	v.scope.own(&pg.Widget)
-	pg.SetTitle("隔离设置")
-	pg.SetDescription("只隔离下面列出的目录，其余文件与主实例共享。")
+	pg.SetTitle(v.u.tr("ui.detail.settings", nil))
+	pg.SetDescription(v.u.tr("ui.detail.settings.desc", nil))
 
 	paths := adw.NewActionRow()
 	v.scope.own(&paths.Widget)
-	paths.SetTitle("隔离路径")
-	paths.SetSubtitle(fmt.Sprintf("%d 个", len(p.Paths)))
+	paths.SetTitle(v.u.tr("ui.detail.paths", nil))
+	paths.SetSubtitle(v.u.tr("ui.detail.paths.count", map[string]any{"n": len(p.Paths)}))
 	v.prefix(paths, "folder-symbolic")
 	list := make([]string, 0, len(p.Paths))
 	for _, raw := range p.Paths {
@@ -381,13 +392,13 @@ func (v *detailView) build() {
 
 	conf := adw.NewActionRow()
 	v.scope.own(&conf.Widget)
-	conf.SetTitle("探测方式")
+	conf.SetTitle(v.u.tr("ui.detail.probe_method", nil))
 	if p.ProbeMethod == "strace" {
-		conf.SetSubtitle("strace 跟踪 · 覆盖率低（只记录实际跑到的路径，建议多操作一会儿后重跑一次）")
+		conf.SetSubtitle(v.u.tr("ui.detail.probe.strace", nil))
 	} else if p.ProbeMethod == "manual" || p.ProbeMethod == "bundled" {
-		conf.SetSubtitle("内置模板 · 由维护者校对过的路径，不包含本机差异")
+		conf.SetSubtitle(v.u.tr("ui.detail.probe.bundled", nil))
 	} else {
-		conf.SetSubtitle("overlay-diff 跟踪 · 覆盖本次会话实际发生的写入（没走到的功能分支查不到）")
+		conf.SetSubtitle(v.u.tr("ui.detail.probe.overlay", nil))
 	}
 	v.prefix(conf, "system-search-symbolic")
 	conf.SetSensitive(false)
@@ -396,14 +407,14 @@ func (v *detailView) build() {
 	if len(p.SharedWrites) > 0 {
 		sh := adw.NewActionRow()
 		v.scope.own(&sh.Widget)
-		sh.SetTitle("共享但可写")
+		sh.SetTitle(v.u.tr("ui.detail.shared", nil))
 		sl := []string{}
 		for _, raw := range p.SharedWrites {
 			if abs, err := v.u.env.Resolver.Expand(raw); err == nil {
 				sl = append(sl, v.u.allocText(abs))
 			}
 		}
-		sh.SetSubtitle(strings.Join(sl, " · ") + " — 不隔离，两个分身共用同一份状态")
+		sh.SetSubtitle(v.u.tr("ui.detail.shared.subtitle", map[string]any{"list": strings.Join(sl, " · ")}))
 		sh.SetSubtitleLines(0)
 		v.prefix(sh, "folder-publicshare-symbolic")
 		sh.SetSensitive(false)
@@ -412,20 +423,20 @@ func (v *detailView) build() {
 
 	single := adw.NewActionRow()
 	v.scope.own(&single.Widget)
-	single.SetTitle("单例处理")
+	single.SetTitle(v.u.tr("ui.detail.single", nil))
 	var parts []string
 	if len(p.LockFiles) > 0 {
-		parts = append(parts, "锁文件已替换")
+		parts = append(parts, v.u.tr("ui.detail.single.lock", nil))
 	}
 	if p.IsolateRuntime {
-		parts = append(parts, "私有 runtime 已启用")
+		parts = append(parts, v.u.tr("ui.detail.single.runtime_private", nil))
 	} else {
-		parts = append(parts, "runtime 共享")
+		parts = append(parts, v.u.tr("ui.detail.single.runtime_shared", nil))
 	}
 	if p.IsolateDBus {
-		parts = append(parts, "私有 DBus 总线已启用")
+		parts = append(parts, v.u.tr("ui.detail.single.dbus_private", nil))
 	} else {
-		parts = append(parts, "DBus 会话共享")
+		parts = append(parts, v.u.tr("ui.detail.single.dbus_shared", nil))
 	}
 	single.SetSubtitle(strings.Join(parts, " · "))
 	v.prefix(single, "system-lock-screen-symbolic")
@@ -434,11 +445,11 @@ func (v *detailView) build() {
 
 	audit := adw.NewActionRow()
 	v.scope.own(&audit.Widget)
-	audit.SetTitle("最近审计")
+	audit.SetTitle(v.u.tr("ui.detail.audit", nil))
 	if e, ok := v.latestAudit(); ok {
-		audit.SetSubtitle(auditText(e))
+		audit.SetSubtitle(v.auditText(e))
 	} else {
-		audit.SetSubtitle("没有审计证据 — 无法判定隔离是否有效（打开运行期审计后才有结论）")
+		audit.SetSubtitle(v.u.tr("ui.detail.audit.no_evidence", nil))
 	}
 	v.prefix(audit, "security-high-symbolic")
 	audit.SetSensitive(false)
@@ -446,7 +457,7 @@ func (v *detailView) build() {
 
 	rootRow := adw.NewActionRow()
 	v.scope.own(&rootRow.Widget)
-	rootRow.SetTitle("实例根目录")
+	rootRow.SetTitle(v.u.tr("ui.detail.root", nil))
 	if len(v.insts) > 0 {
 		rootRow.SetSubtitle(v.u.allocText(v.insts[0].Root))
 	} else {
@@ -464,8 +475,8 @@ func (v *detailView) build() {
 	v.scope.own(&rg.Widget)
 	redisc := adw.NewActionRow()
 	v.scope.own(&redisc.Widget)
-	redisc.SetTitle("重新探测")
-	redisc.SetSubtitle("应用更新后数据目录可能变了；重新跟踪一次，校正隔离路径")
+	redisc.SetTitle(v.u.tr("ui.detail.redisc", nil))
+	redisc.SetSubtitle(v.u.tr("ui.detail.redisc.subtitle", nil))
 	v.prefix(redisc, "view-refresh-symbolic")
 	redisc.SetActivatable(true)
 	v.scope.row(redisc, func() {
@@ -498,30 +509,30 @@ func (v *detailView) latestAudit() (auditEntry, bool) {
 // `unverified` 不是一种状态而是四种：没开审计 / 证据没写完 / 确实没观测到
 // 写入 / 证据读不出来。只显示"没有给出结论"会把"证据坏了"藏成"没结论"，
 // 用户据此会去重跑，而不是去修文件。
-func auditText(e auditEntry) string {
+func (v *detailView) auditText(e auditEntry) string {
 	var text string
 	switch e.conclusion {
 	case core.VerdictVerified:
-		text = "verified（上次审计的写入都在声明范围内）"
+		text = v.u.tr("ui.audit.verified", nil)
 	case core.VerdictLeak:
-		text = "leak-detected（上次审计发现越界写入）"
+		text = v.u.tr("ui.audit.leak", nil)
 	case core.VerdictUnverified:
 		switch e.reason {
 		case "audit_not_enabled":
-			text = "unverified（还没有做过运行期审计）"
+			text = v.u.tr("ui.audit.unverified.none", nil)
 		case "audit_incomplete":
-			text = "unverified（上次审计没有跑完，证据不完整）"
+			text = v.u.tr("ui.audit.unverified.incomplete", nil)
 		case "no_writes":
-			text = "unverified（上次审计没有观测到写入）"
+			text = v.u.tr("ui.audit.unverified.no_writes", nil)
 		case "audit_unreadable":
-			text = "unverified（审计摘要读不出来，证据可能已损坏）"
+			text = v.u.tr("ui.audit.unverified.corrupt", nil)
 		case "extract_failed":
-			text = "unverified（审计层的公共目录摘出没有生效，本次审计作废）"
+			text = v.u.tr("ui.audit.unverified.public_extract", nil)
 		default:
-			text = "unverified（上次审计没有给出结论）"
+			text = v.u.tr("ui.audit.unverified.unknown", nil)
 		}
 	default:
-		text = "已存结论"
+		text = v.u.tr("ui.audit.stored", nil)
 	}
 	if e.at != "" {
 		text += " · " + e.at
@@ -541,7 +552,7 @@ func (v *detailView) launch(in core.Instance) {
 			if err != nil {
 				v.u.toastMsg(v.u.tr(errorKey(err), errorArgs(err)))
 			} else {
-				v.u.toastMsg("「" + in.DisplayName + "」已退出")
+				v.u.toastMsg(v.u.tr("ui.toast.instance_exited", map[string]any{"name": in.DisplayName}))
 			}
 			if v.u.activeDetail == v {
 				v.render()
@@ -555,10 +566,10 @@ func (v *detailView) launch(in core.Instance) {
 func (v *detailView) rename(in core.Instance) {
 	entry := gtk.NewEntry()
 	entry.SetText(in.DisplayName)
-	d := adw.NewAlertDialog("重命名分身", "显示名只影响你看到的名称；id 与数据目录不变。")
+	d := adw.NewAlertDialog(v.u.tr("ui.dialog.rename.title", nil), v.u.tr("ui.dialog.rename.body", nil))
 	d.SetExtraChild(&entry.Widget)
-	d.AddResponse("cancel", "取消")
-	d.AddResponse("rename", "保存")
+	d.AddResponse("cancel", v.u.tr("ui.dialog.cancel", nil))
+	d.AddResponse("rename", v.u.tr("ui.dialog.save", nil))
 	d.SetDefaultResponse("cancel")
 	d.SetResponseAppearance("rename", adw.ResponseSuggestedValue)
 	v.u.cb.onDialog(d, func(resp string) {
@@ -586,7 +597,7 @@ func (v *detailView) rename(in core.Instance) {
 					v.u.toastMsg(v.u.tr(errorKey(err), errorArgs(err)))
 					return false
 				}
-				v.u.toastMsg("已重命名为「" + name + "」")
+				v.u.toastMsg(v.u.tr("ui.toast.renamed", map[string]any{"name": name}))
 				// 详情页可能已经被 pop 掉：此时只刷新列表，不往旧页面写。
 				if v.u.activeDetail == v {
 					v.render()
@@ -601,9 +612,9 @@ func (v *detailView) rename(in core.Instance) {
 
 func (v *detailView) remove(in core.Instance) {
 	// 删除一律走回收站；默认响应是「取消」——回车不能完成破坏性操作。
-	d := adw.NewAlertDialog("删除「"+in.DisplayName+"」？", "分身的全部数据会移到回收站，可从回收站恢复。")
-	d.AddResponse("cancel", "取消")
-	d.AddResponse("trash", "移到回收站")
+	d := adw.NewAlertDialog(v.u.tr("ui.dialog.delete.title", map[string]any{"name": in.DisplayName}), v.u.tr("ui.dialog.delete.body", nil))
+	d.AddResponse("cancel", v.u.tr("ui.dialog.cancel", nil))
+	d.AddResponse("trash", v.u.tr("ui.dialog.trash", nil))
 	d.SetDefaultResponse("cancel")
 	d.SetResponseAppearance("trash", adw.ResponseDestructiveValue)
 	v.u.cb.onDialog(d, func(resp string) {
@@ -631,7 +642,7 @@ func (v *detailView) remove(in core.Instance) {
 					v.u.reload()
 					return false
 				}
-				v.u.toastMsg("已把「" + in.DisplayName + "」移入回收站")
+				v.u.toastMsg(v.u.tr("ui.toast.trashed", map[string]any{"name": in.DisplayName}))
 				// 页面可能已经不在栈顶（用户返回了）：只在仍是当前详情页时才动它。
 				if v.u.activeDetail == v {
 					if len(v.insts) <= 1 {

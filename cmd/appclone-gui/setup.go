@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"errors"
-	"fmt"
 	"slices"
 	"strings"
 	"time"
@@ -122,15 +121,15 @@ func (v *setupView) title() string {
 	name := v.appName()
 	switch v.mode {
 	case "reconfig":
-		return "重新配置 · " + name
+		return v.u.tr("ui.setup.title.reconfig", map[string]any{"name": name})
 	case "open":
-		return "开启分身 · " + name
+		return v.u.tr("ui.setup.title.open", map[string]any{"name": name})
 	case "clone":
-		return "新建分身 · " + name
+		return v.u.tr("ui.setup.title.clone", map[string]any{"name": name})
 	case "rediscover":
-		return "重新探测 · " + name
+		return v.u.tr("ui.setup.title.rediscover", map[string]any{"name": name})
 	}
-	return "首次配置 · " + name
+	return v.u.tr("ui.setup.title.setup", map[string]any{"name": name})
 }
 
 func (v *setupView) build() {
@@ -163,14 +162,14 @@ func (v *setupView) build() {
 		v.fixed.own(&img.Widget)
 		probing.Append(&img.Widget)
 	}
-	ptitle := gtk.NewLabel("正在跟踪「" + v.appName() + "」的写入…")
+	ptitle := gtk.NewLabel(v.u.tr("ui.setup.probing.title", map[string]any{"name": v.appName()}))
 	ptitle.SetWrap(true)
 	ptitle.SetHalign(gtk.AlignCenterValue)
 	v.fixed.own(&ptitle.Widget)
-	v.countLabel = gtk.NewLabel("已发现 0 个写入条目")
+	v.countLabel = gtk.NewLabel(v.u.tr("ui.setup.probing.count", map[string]any{"n": 0}))
 	v.countLabel.AddCssClass("dim-label")
 	v.fixed.own(&v.countLabel.Widget)
-	phint := gtk.NewLabel("在应用里正常用一会儿——收发文件、改设置——然后关掉它。\n随时可以点左上角的「取消探测」。")
+	phint := gtk.NewLabel(v.u.tr("ui.setup.probing.hint", nil))
 	phint.SetWrap(true)
 	phint.SetJustify(gtk.JustifyCenterValue)
 	phint.SetHalign(gtk.AlignCenterValue)
@@ -185,7 +184,7 @@ func (v *setupView) build() {
 	// ---- error（AdwStatusPage：§4.5 要求失败是独立组件而不是两块裸标签）----
 	v.errPage = adw.NewStatusPage()
 	v.errPage.SetIconName("dialog-warning-symbolic")
-	v.errPage.SetTitle("操作没有完成")
+	v.errPage.SetTitle(v.u.tr("ui.setup.error.title", nil))
 	v.errPage.SetDescription("")
 	v.fixed.own(&v.errPage.Widget)
 	v.stack.AddNamed(&v.errPage.Widget, "error")
@@ -200,7 +199,7 @@ func (v *setupView) build() {
 	cspinner.SetHalign(gtk.AlignCenterValue)
 	v.createSpinner = cspinner
 	v.fixed.own(&cspinner.Widget)
-	clabel := gtk.NewLabel("正在创建分身…")
+	clabel := gtk.NewLabel(v.u.tr("ui.setup.creating", nil))
 	clabel.SetHalign(gtk.AlignCenterValue)
 	v.fixed.own(&clabel.Widget)
 	creating.Append(&cspinner.Widget)
@@ -209,7 +208,7 @@ func (v *setupView) build() {
 
 	// ---- confirm（内容在 renderConfirm 里重建）----
 	v.confirmPage = adw.NewPreferencesPage()
-	v.confirmPage.SetTitle("确认隔离范围")
+	v.confirmPage.SetTitle(v.u.tr("ui.setup.confirm.title", nil))
 	v.fixed.own(&v.confirmPage.Widget)
 	v.stack.AddNamed(&v.confirmPage.Widget, "confirm")
 
@@ -219,8 +218,8 @@ func (v *setupView) build() {
 
 	v.header = adw.NewHeaderBar()
 	v.fixed.own(&v.header.Widget)
-	v.cancelBtn = gtk.NewButtonWithLabel("取消")
-	v.confirmBtn = gtk.NewButtonWithLabel("创建分身")
+	v.cancelBtn = gtk.NewButtonWithLabel(v.u.tr("ui.setup.cancel", nil))
+	v.confirmBtn = gtk.NewButtonWithLabel(v.u.tr("ui.setup.confirm_button.setup", nil))
 	v.confirmBtn.AddCssClass("suggested-action")
 	v.fixed.own(&v.cancelBtn.Widget)
 	v.fixed.own(&v.confirmBtn.Widget)
@@ -244,7 +243,6 @@ func (v *setupView) build() {
 	// 导航页本身不进 scope：scope 在 popped 里立刻 close，而那一刻 pop 动画
 	// 可能还没走完。它的 sink 引用由 popped 末尾的 releasePage 延后一个 idle
 	// 释放，与详情页同一条规则（design/navspike 已验证；不释放则整页泄漏）。
-	v.page.SetTag("setup")
 	v.page.SetCanPop(true)
 }
 
@@ -260,11 +258,11 @@ func (v *setupView) appName() string {
 func (v *setupView) confirmLabel() string {
 	switch v.mode {
 	case "open":
-		return "开启分身"
+		return v.u.tr("ui.setup.confirm_button.open", nil)
 	case "rediscover":
-		return "保存档案"
+		return v.u.tr("ui.setup.confirm_button.rediscover", nil)
 	}
-	return "创建分身"
+	return v.u.tr("ui.setup.confirm_button.setup", nil)
 }
 
 func (v *setupView) setState(s string) {
@@ -277,7 +275,7 @@ func (v *setupView) setState(s string) {
 	v.cancelBtn.SetSensitive(s != "creating")
 	// 按钮文案按状态重置：§6.1 只有探测中叫「取消探测」，确认态与失败态都叫「取消」。
 	// 不重置的话，探测失败后按钮还挂着「取消探测」，用户不知道它已经不再是取消会话。
-	v.cancelBtn.SetLabel("取消")
+	v.cancelBtn.SetLabel(v.u.tr("ui.setup.cancel", nil))
 	// 只有探测中才转圈：切到确认/失败态后后台还在转的 spinner 会让人以为
 	// 还有操作没结束（它也确实代表不了任何事）。
 	if s == "probing" {
@@ -293,7 +291,7 @@ func (v *setupView) setState(s string) {
 	switch s {
 	case "probing":
 		v.confirmBtn.SetVisible(false)
-		v.cancelBtn.SetLabel("取消探测")
+		v.cancelBtn.SetLabel(v.u.tr("ui.setup.cancel_probing", nil))
 	case "error":
 		// 「重试」恒可用：失败态只有重试与取消两条出路，留一个点不动的按钮
 		// 用户只能关窗口（§6.1 ③-d）。没有重试路径的失败（档案版本超前 /
@@ -302,7 +300,7 @@ func (v *setupView) setState(s string) {
 			v.confirmBtn.SetVisible(false)
 			break
 		}
-		v.confirmBtn.SetLabel("重试")
+		v.confirmBtn.SetLabel(v.u.tr("ui.setup.retry", nil))
 	case "creating":
 		v.confirmBtn.SetLabel(v.creatingLabel())
 		v.confirmBtn.SetSensitive(false)
@@ -316,9 +314,9 @@ func (v *setupView) setState(s string) {
 // 自己等的是哪一件事。
 func (v *setupView) creatingLabel() string {
 	if v.mode == "rediscover" {
-		return "正在保存…"
+		return v.u.tr("ui.setup.saving", nil)
 	}
-	return "正在创建…"
+	return v.u.tr("ui.setup.creating_button", nil)
 }
 
 // updateConfirmGate 只数「应用自身数据」：全不勾、只勾缓存或单例时禁用。
@@ -345,6 +343,9 @@ func (v *setupView) updateConfirmGate() {
 // setup / reconfig / rediscover **必须探测**（§6.1 五个入口）：档案路径是本机
 // 相关的（原生/Flatpak、版本差异），内置模板只是预填来源，不定案。
 func (v *setupView) start() {
+	if v.done {
+		return
+	}
 	if v.mode == "open" || v.mode == "clone" {
 		p, err := v.u.env.LoadProfile(v.appKey)
 		switch {
@@ -386,8 +387,8 @@ func (v *setupView) start() {
 		// 所以不给「重试」，只把原因说清楚。描述不复用 i18n 的"请重新探测
 		// 生成"——这里恰恰是重探解决不了的场景（复审 P3）。
 		v.retry = nil
-		v.showErrorTitle("内置模板读不出来", berr)
-		v.errPage.SetDescription("这份模板随程序一起发布，读不出来说明安装包损坏或不完整。请重新安装 appclone——重跑探测只会读到同一份模板。")
+		v.showErrorTitle(v.u.tr("ui.setup.bundled_error.title", nil), berr)
+		v.errPage.SetDescription(v.u.tr("ui.setup.bundled_error.desc", nil))
 		return
 	} else if ok {
 		v.bundled = b
@@ -400,8 +401,14 @@ func (v *setupView) start() {
 // 会起 flatpak 子进程、OpenState 可能等锁 5 秒——任何一项放主线程，窗口
 // 都会在这几秒里画不出帧。
 func (v *setupView) probe() {
+	// pop 动画期间错误页上的「重试」仍可能被点到：页面已经 finish，再跑
+	// 一场探测会重新挂 overlay、起 dbus、甚至再拉起一次应用，而结果只会
+	// 被 done 检查丢掉。入口处挡掉（对抗复审 P3）。
+	if v.done {
+		return
+	}
 	v.setState("probing")
-	v.countLabel.SetText("已发现 0 个写入条目")
+	v.countLabel.SetText(v.u.tr("ui.setup.probing.count", map[string]any{"n": 0}))
 
 	ctx, cancel := context.WithCancel(context.Background())
 	v.cancel = cancel
@@ -419,6 +426,7 @@ func (v *setupView) probe() {
 					return false
 				}
 				if errors.Is(err, core.ErrCanceled) {
+					v.notifyCanceledScene(err)
 					v.finish(false)
 					return false
 				}
@@ -470,7 +478,7 @@ func (v *setupView) probe() {
 					if v.state != "probing" {
 						return false
 					}
-					v.countLabel.SetText(fmt.Sprintf("已发现 %d 个写入条目", pp.Entries))
+					v.countLabel.SetText(v.u.tr("ui.setup.probing.count", map[string]any{"n": pp.Entries}))
 					return false
 				})
 			},
@@ -482,6 +490,7 @@ func (v *setupView) probe() {
 			}
 			if perr != nil {
 				if errors.Is(perr, core.ErrCanceled) {
+					v.notifyCanceledScene(perr)
 					v.finish(false)
 					return false
 				}
@@ -540,7 +549,7 @@ func (v *setupView) applyProbeResult(res core.ProbeResult) {
 // showDegraded 起降级横幅（看不到 fuse-overlayfs 时走 strace）。
 // 文案不承诺完整：strace 只记录实际跑到的路径。
 func (v *setupView) showDegraded() {
-	v.banner.SetTitle("这台机器缺少 fuse-overlayfs，本次改用 strace 跟踪：只记录实际跑到的路径，覆盖不完整，建议多操作一会儿再确认。")
+	v.banner.SetTitle(v.u.tr("ui.setup.degraded.banner", nil))
 	v.banner.SetRevealed(true)
 }
 
@@ -556,9 +565,9 @@ func (v *setupView) showError(err error) {
 // （重定路径前要读既有档案）。
 func (v *setupView) showProfileRejected(err error) {
 	v.retry = nil
-	title := "档案读不出来"
+	title := v.u.tr("ui.setup.error.profile_unreadable", nil)
 	if errorKey(err) == "err.profile.version_ahead" {
-		title = "档案由更新版本生成"
+		title = v.u.tr("ui.setup.error.profile_version_ahead", nil)
 	}
 	v.showErrorTitle(title, err)
 }
@@ -574,15 +583,15 @@ func (v *setupView) showErrorTitle(title string, err error) {
 func (v *setupView) errorTitle(err error) string {
 	switch errorKey(err) {
 	case "err.probe.app_running":
-		return "应用还在运行"
+		return v.u.tr("ui.setup.error.app_running", nil)
 	case "err.env.bwrap_missing":
-		return "缺少 bubblewrap"
+		return v.u.tr("ui.setup.error.bwrap_missing", nil)
 	case "err.lock.timeout":
-		return "另一个 appclone 正在操作"
+		return v.u.tr("ui.setup.error.lock_timeout", nil)
 	case "err.probe.no_writes":
-		return "没有可隔离的写入"
+		return v.u.tr("ui.setup.error.no_writes", nil)
 	}
-	return "操作没有完成"
+	return v.u.tr("ui.setup.error.generic", nil)
 }
 
 func (v *setupView) describe(err error) string {
@@ -612,7 +621,7 @@ func (v *setupView) renderConfirm() {
 	}
 	// PreferencesPage 没有 clear()；重建一个内容页最省事，也避免旧行残留。
 	pg := adw.NewPreferencesPage()
-	pg.SetTitle("确认隔离范围")
+	pg.SetTitle(v.u.tr("ui.setup.confirm.title", nil))
 	v.scope.own(&pg.Widget)
 
 	// 换页 = 换一批行：旧行上登记的处理器与勾选状态都必须丢掉，
@@ -624,13 +633,13 @@ func (v *setupView) renderConfirm() {
 
 	own := adw.NewPreferencesGroup()
 	v.scope.own(&own.Widget)
-	own.SetTitle("应用自身数据")
-	desc := "appclone 跟踪到该应用写入了以下路径。勾选属于「应用自身数据」的目录——它们会被隔离，其余文件与主空间保持共享。"
+	own.SetTitle(v.u.tr("ui.setup.group.own", nil))
+	desc := v.u.tr("ui.setup.group.own.desc.probe", nil)
 	if v.mode == "open" || v.mode == "clone" {
-		desc = "这些目录会被隔离进分身，其余文件与主空间保持共享。"
+		desc = v.u.tr("ui.setup.group.own.desc.reuse", nil)
 	}
 	if v.prefilled > 0 {
-		desc += fmt.Sprintf("（其中 %d 条来自内置模板预填，请确认是否仍然适用）", v.prefilled)
+		desc += v.u.tr("ui.setup.group.own.prefilled", map[string]any{"n": v.prefilled})
 	}
 	own.SetDescription(desc)
 	for i := range v.cands {
@@ -646,7 +655,7 @@ func (v *setupView) renderConfirm() {
 		row.AddPrefix(&ic.Widget)
 		d := v.u.tr(c.Why, nil)
 		if c.Observed > 0 {
-			d = fmt.Sprintf("%s · 观测到 %d 个写入条目", d, c.Observed)
+			d = v.u.tr("ui.setup.row.observed", map[string]any{"why": d, "n": c.Observed})
 		}
 		row.SetSubtitle(d)
 		row.SetActive(c.Checked)
@@ -658,8 +667,8 @@ func (v *setupView) renderConfirm() {
 	if len(v.rows) == 0 {
 		row := adw.NewActionRow()
 		v.scope.own(&row.Widget)
-		row.SetTitle("没有可隔离的路径")
-		row.SetSubtitle("这次探测没有发现配置/数据目录，无法创建有意义的档案。")
+		row.SetTitle(v.u.tr("ui.setup.no_paths.title", nil))
+		row.SetSubtitle(v.u.tr("ui.setup.no_paths.subtitle", nil))
 		row.SetSensitive(false)
 		own.Add(&row.Widget)
 	}
@@ -671,12 +680,12 @@ func (v *setupView) renderConfirm() {
 		v.profile.IsolateRuntime || len(v.profile.Sockets) > 0 {
 		sg := adw.NewPreferencesGroup()
 		v.scope.own(&sg.Widget)
-		sg.SetTitle("单例处理")
+		sg.SetTitle(v.u.tr("ui.setup.group.singletons", nil))
 		if len(v.profile.LockFiles) > 0 {
 			lr := adw.NewSwitchRow()
 			v.scope.own(&lr.Widget)
-			lr.SetTitle("替换锁文件")
-			lr.SetSubtitle("让分身不再把「已在运行」的主实例当成自己，避免启动请求被转发后直接退出")
+			lr.SetTitle(v.u.tr("ui.setup.row.lock.title", nil))
+			lr.SetSubtitle(v.u.tr("ui.setup.row.lock.subtitle", nil))
 			lr.SetActive(true)
 			v.lockRow = lr
 			sg.Add(&lr.Widget)
@@ -684,16 +693,16 @@ func (v *setupView) renderConfirm() {
 		if v.profile.IsolateRuntime || len(v.profile.Sockets) > 0 {
 			rr := adw.NewSwitchRow()
 			v.scope.own(&rr.Widget)
-			rr.SetTitle("隔离私有 runtime 目录")
-			rr.SetSubtitle("Telegram 这类应用靠 XDG_RUNTIME_DIR 里的 socket 判断「已经在运行」；不隔离私有 runtime，分身会被主实例转发后直接退出")
+			rr.SetTitle(v.u.tr("ui.setup.row.runtime.title", nil))
+			rr.SetSubtitle(v.u.tr("ui.setup.row.runtime.subtitle", nil))
 			rr.SetActive(v.profile.IsolateRuntime)
 			v.runtimeRow = rr
 			sg.Add(&rr.Widget)
 		}
 		dr := adw.NewSwitchRow()
 		v.scope.own(&dr.Widget)
-		dr.SetTitle("隔离私有 DBus 会话总线")
-		dr.SetSubtitle("需要私有总线的应用才能双开；关闭则与主实例共用总线")
+		dr.SetTitle(v.u.tr("ui.setup.row.dbus.title", nil))
+		dr.SetSubtitle(v.u.tr("ui.setup.row.dbus.subtitle", nil))
 		dr.SetActive(v.profile.IsolateDBus)
 		v.dbusRow = dr
 		sg.Add(&dr.Widget)
@@ -703,11 +712,11 @@ func (v *setupView) renderConfirm() {
 	// 公共目录：只读，永远是"没乱来"的证据。
 	pub := adw.NewPreferencesGroup()
 	v.scope.own(&pub.Widget)
-	pub.SetTitle("公共目录（强制共享）")
-	pub.SetDescription("这些位置不进分身：两个分身看到的是同一份文件。")
+	pub.SetTitle(v.u.tr("ui.setup.group.public", nil))
+	pub.SetDescription(v.u.tr("ui.setup.group.public.desc", nil))
 	prow := adw.NewActionRow()
 	v.scope.own(&prow.Widget)
-	prow.SetTitle("始终共享")
+	prow.SetTitle(v.u.tr("ui.setup.row.public.title", nil))
 	dirs := []string{}
 	for _, p := range v.u.env.Resolver.PublicDirs() {
 		dirs = append(dirs, v.u.allocText(p))
@@ -725,11 +734,11 @@ func (v *setupView) renderConfirm() {
 	if len(derived.SharedWrites) > 0 {
 		sh := adw.NewPreferencesGroup()
 		v.scope.own(&sh.Widget)
-		sh.SetTitle("共享但可写（不隔离）")
-		sh.SetDescription("隔离它们会让输入法、书签等功能失效；代价是两个分身共用同一份状态。")
+		sh.SetTitle(v.u.tr("ui.setup.group.shared", nil))
+		sh.SetDescription(v.u.tr("ui.setup.group.shared.desc", nil))
 		srow := adw.NewActionRow()
 		v.scope.own(&srow.Widget)
-		srow.SetTitle("共享项")
+		srow.SetTitle(v.u.tr("ui.setup.row.shared.title", nil))
 		list := []string{}
 		for _, p := range derived.SharedWrites {
 			if abs, err := v.u.env.Resolver.Expand(p); err == nil {
@@ -798,6 +807,10 @@ func (v *setupView) buildProfile() core.Profile {
 }
 
 func (v *setupView) submit() {
+	if v.done {
+		// 页面已在退场（取消/返回）：confirmation 动画里的点击不能再建实例。
+		return
+	}
 	if v.state == "error" {
 		// 重试要重做**失败的那件事**：探测失败重探测、保存失败重保存、创建
 		// 失败重创建。一律回 start() 会为一次保存失败白跑整场探测（P3，复审发现）。
@@ -852,10 +865,10 @@ func (v *setupView) saveProfile(p core.Profile) {
 			if err != nil {
 				// 重试只重做保存（新探测一次只会得到同一份档案）。
 				v.retry = func() { v.saveProfile(p) }
-				v.showErrorTitle("保存失败", err)
+				v.showErrorTitle(v.u.tr("ui.setup.error.save_failed", nil), err)
 				return false
 			}
-			v.u.toastMsg("已保存「" + v.appName() + "」的隔离档案")
+			v.u.toastMsg(v.u.tr("ui.setup.toast.saved", map[string]any{"name": v.appName()}))
 			v.finish(true)
 			return false
 		})
@@ -889,14 +902,29 @@ func (v *setupView) createInstance(p core.Profile) {
 			}
 			if cerr != nil {
 				v.retry = func() { v.createInstance(p) }
-				v.showErrorTitle("创建失败", cerr)
+				v.showErrorTitle(v.u.tr("ui.setup.error.create_failed", nil), cerr)
 				return false
 			}
-			v.u.toastMsg("已创建「" + v.appName() + "」的分身")
+			v.u.toastMsg(v.u.tr("ui.setup.toast.created", map[string]any{"name": v.appName()}))
 			v.finish(true)
 			return false
 		})
 	}()
+}
+
+// notifyCanceledScene：取消探测时如果 core 保留了现场（公共目录可能被写进
+// upper），必须把路径告诉用户——否则文件被搬进 /var/tmp 却无处可寻。
+// 普通取消没有现场，什么都不提示。
+func (v *setupView) notifyCanceledScene(err error) {
+	var ce *core.Error
+	if !errors.As(err, &ce) || ce.Key != "err.probe.canceled_kept" {
+		return
+	}
+	args := ce.Args
+	if args == nil {
+		args = map[string]any{}
+	}
+	v.u.toastMsg(v.u.tr(ce.Key, args))
 }
 
 func (v *setupView) finish(success bool) {

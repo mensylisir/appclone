@@ -58,6 +58,10 @@ func (e *Env) startProbeBus(dir string) (addr string, stop func()) {
 	}
 	sock := filepath.Join(dir, "bus")
 	cmd := exec.Command(daemon, "--session", "--nofork", "--address=unix:path="+sock, "--print-address")
+	// GUI 崩溃或收到 SIGTERM 时没有机会跑 stop：让内核在父进程消失时把
+	// 私有总线也收掉。Pdeathsig 绑定创建它的线程，而 Go 从不销毁 OS 线程，
+	// 所以不会出现"进程还活着、线程没了"的误杀。
+	cmd.SysProcAttr = &syscall.SysProcAttr{Pdeathsig: syscall.SIGTERM}
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		return "", nil
@@ -67,12 +71,16 @@ func (e *Env) startProbeBus(dir string) (addr string, stop func()) {
 	}
 	line, err := readFirstLine(stdout)
 	if err != nil || line == "" {
+		// Kill 后必须 Wait：否则进程在 GUI 生命周期内留成僵尸。用 cmd.Wait
+		// 而不是 cmd.Process.Wait：前者会关掉 StdoutPipe 的父端读 fd，
+		// 后者每探测一次就泄漏一个 fd。
 		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
 		return "", nil
 	}
 	return line, func() {
 		_ = cmd.Process.Kill()
-		_, _ = cmd.Process.Wait()
+		_ = cmd.Wait()
 		_ = os.Remove(sock)
 	}
 }
@@ -106,6 +114,11 @@ type setsidRunner struct{}
 func (setsidRunner) Run(ctx context.Context, argv []string, stderr io.Writer) (SessionResult, error) {
 	if len(argv) == 0 {
 		return SessionResult{}, errInput("err.probe.no_command", nil)
+	}
+	if err := ctx.Err(); err != nil {
+		// 准备阶段（起 dbus、等锁）期间被取消：不要再把应用拉起来闪一下，
+		// 那既产生意外写入，也要多等一次 kill。
+		return SessionResult{}, err
 	}
 	start := time.Now()
 	cmd := exec.Command(argv[0], argv[1:]...)

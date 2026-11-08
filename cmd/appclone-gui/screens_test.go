@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -100,6 +101,12 @@ func gtkTestEnv(t *testing.T, name string) (*core.Env, string) {
 	}
 	env.AppDirList = []string{appsDir}
 	env.Mounter = noFuseMounter{}
+	// 探测写层根默认是 /var/tmp；钉到测试根下，取消探测留下的临时目录
+	// 也只落在 $WORK，而不是共享临时目录。
+	env.TmpRoot = filepath.Join(root, "tmp")
+	if err := os.MkdirAll(env.TmpRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
 	return env, appsDir
 }
 
@@ -250,7 +257,23 @@ func TestGtkScreensLifecycle(t *testing.T) {
 					}
 					submittedAt = time.Now()
 					firstSetup = v
-					v.submit()
+					// 发真实 clicked 信号：直接调 v.submit() 会在「忘把按钮
+					// 接到处理器」时仍然变绿（界面点了没反应）。
+					gobject.SignalEmitByName(&v.confirmBtn.Widget.Object, "clicked")
+					// creating 是事务态（§6.1 ③-c）：按钮全部停用、页面不可
+					// 返回。只在 steps 里路过而不断言，会让这些约束悄悄回归。
+					if v.state != "creating" {
+						fail("确认后没有进入 creating 态（state=%q）", v.state)
+						return false
+					}
+					if v.confirmBtn.GetSensitive() || v.cancelBtn.GetSensitive() {
+						fail("creating 期间确认/取消按钮仍可点")
+						return false
+					}
+					if v.page.GetCanPop() {
+						fail("creating 期间页面仍可返回（SetCanPop(false) 丢了？）")
+						return false
+					}
 					step++
 				}
 			case 2:
@@ -304,7 +327,8 @@ func TestGtkScreensLifecycle(t *testing.T) {
 					fail("详情页标题应为「Demo」，得到 %q", title)
 					return false
 				}
-				// 等详情页真的是可见页再返回；push 动画没结束就 Pop 会被忽略。
+				// 等详情页真的是可见页再返回：断言必须落在已映射的页上，
+				// 而不是一张还在 push 过渡里的页。
 				if !visibleIsPage(u, v.page) {
 					return true
 				}
@@ -528,6 +552,698 @@ func TestGtkEmptyStateMapped(t *testing.T) {
 			}
 			if u.onPage.GetVisible() {
 				fail("空态时「分身」视图的列表页不该可见")
+				return false
+			}
+			app.Quit()
+			return false
+		}
+		glib.TimeoutAdd(50, &tick, 0)
+	}
+	app.ConnectActivate(&actcb)
+	u.hold(&actcb)
+
+	if code := app.Run(1, os.Args[:1]); code != 0 {
+		t.Fatalf("GTK 主循环退出码 %d", code)
+	}
+	if runErr != nil {
+		t.Fatal(runErr)
+	}
+	if !activated {
+		t.Fatal("activate 没有执行（GApplication 把调用转发给了别的实例？）")
+	}
+}
+
+// TestGtkSetupStates 覆盖配置页的「探测中」态与列表页降级横幅的显现/「了解」消失。
+//
+// 为什么需要它：生命周期用例走的是 open 入口（不探测），只证明了 confirm →
+// creating 两态；探测中没有自动断言，而 ADR-027 的退场条件是「闸门走遍三屏四态」。
+// 这里用产品自己的入口构造：拨开关进入首次配置 → start() 同步把栈切到 probing；
+// 直接 finish(false)（取消按钮绑的就是它）→ 页面 pop 且不留实例/档案。
+//
+// 取消发生在 Probe 的会话真正写盘之前（页面一上屏就点「取消探测」）。后台
+// 探测可能已经跑了 LoadApp/锁/StaticHints 几步，断言的是它的结果没有提交：
+// 不落档案、不建实例。这正是本机没有 XTEST 注入时仍能走通的真实路径。
+func TestGtkSetupStates(t *testing.T) {
+	env, appsDir := gtkTestEnv(t, "states")
+	if err := os.WriteFile(filepath.Join(appsDir, "demo.desktop"),
+		[]byte("[Desktop Entry]\nType=Application\nName=Demo\nExec=/usr/bin/true\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	app := adw.NewApplication("io.github.mensylisir.Appclone.GtkStates",
+		gio.GApplicationNonUniqueValue)
+	defer app.Unref()
+
+	u := &ui{app: app, env: env, lang: "zh_CN"}
+	var runErr error
+	activated := false
+	fail := func(format string, a ...any) {
+		if runErr == nil {
+			runErr = fmt.Errorf(format, a...)
+		}
+		app.Quit()
+	}
+	step := 0
+	var v *setupView
+	probeClosed := false
+	bannerDismissed := false
+
+	actcb := func(_ gio.Application) {
+		if u.win != nil {
+			return
+		}
+		activated = true
+		u.buildWindow()
+		deadline := time.Now().Add(20 * time.Second)
+		var tick glib.SourceFunc
+		tick = func(uintptr) bool {
+			if time.Now().After(deadline) {
+				fail("配置页状态机没有在 20 秒内推进（停在第 %d 步）", step)
+				return false
+			}
+			switch step {
+			case 0:
+				if !u.loaded || !u.envChecked || !u.stack.GetMapped() {
+					return true
+				}
+				// noFuseMounter 让自检走降级分支：横幅必须真的挂出来，
+				// 而不是只置了内部标志。
+				if !u.softBanner.GetRevealed() {
+					fail("缺 fuse 时降级横幅没有显示")
+					return false
+				}
+				if !u.search.GetSensitive() {
+					fail("降级（非致命）时搜索不该被禁用")
+					return false
+				}
+				// 「了解」是用户处理降级提示的唯一动作。这里发真实的
+				// button-clicked 信号，走产品 ConnectButtonClicked 的接线——
+				// 直接调 softDismissFn 会在"忘连接信号"时仍然变绿。
+				gobject.SignalEmitByName(&u.softBanner.Widget.Object, "button-clicked")
+				bannerDismissed = u.softDismissed && !u.softBanner.GetRevealed()
+				if !bannerDismissed {
+					fail("点「了解」后降级横幅仍然显示（按钮信号没有接到处理器？）")
+					return false
+				}
+				u.applyEnvBanners()
+				if u.softBanner.GetRevealed() {
+					fail("降级横幅被后续刷新弹回来了（softDismissed 失效）")
+					return false
+				}
+				if !u.pushSetup("demo", "setup", func(bool) { probeClosed = true }) {
+					fail("首次配置页没有推出来")
+					return false
+				}
+				v = u.activeSetup
+				if v == nil {
+					fail("pushSetup 后 activeSetup 为空")
+					return false
+				}
+				// probing 是同步置上的：start() 在推页返回前就 setState("probing")。
+				if v.state != "probing" || v.stack.GetVisibleChildName() != "probing" {
+					fail("首次配置没有进入探测态（state=%q 可见页=%q）", v.state, v.stack.GetVisibleChildName())
+					return false
+				}
+				if v.confirmBtn.GetVisible() {
+					fail("探测中不该显示确认按钮")
+					return false
+				}
+				if v.cancelBtn.GetLabel() != "取消探测" {
+					fail("探测中取消按钮应叫「取消探测」，实际 %q", v.cancelBtn.GetLabel())
+					return false
+				}
+				step++
+			case 1:
+				// 等页面真的上屏再取消：按钮信号必须作用在已映射的页上。
+				// （早期版本把 20s 超时归因于"push 中 Pop 被忽略"，实测
+				// libadwaita 1.10 里 Pop 会同步生效；等待是为了断言的确定性。）
+				if !visibleIsPage(u, v.page) {
+					return true
+				}
+				// 发真实 clicked 信号，验证取消按钮的接线而不只是函数地址。
+				gobject.SignalEmitByName(&v.cancelBtn.Widget.Object, "clicked")
+				step++
+			case 2:
+				// v.held 只有在探测 goroutine 真正返回、release 之后才为假：
+				// 它的 defer 负责杀 dbus-daemon 与 strace 进程组。不等它，
+				// 测试进程会在 terminateGroup 的 3 秒窗口里退出，留下一组
+				// 孤儿进程（还会攥着 go test 的 stderr 管道，导致闸门偶发
+				// 「Test I/O incomplete」）。
+				if u.activeSetup != nil || !probeClosed || v.held {
+					return true // 等 pop 收尾与探测清理
+				}
+				insts, err := u.env.ListInstances("demo")
+				if err != nil || len(insts) != 0 {
+					fail("取消探测后不该留下实例（%d 个，%v）", len(insts), err)
+					return false
+				}
+				if _, err := u.env.LoadProfile("demo"); err == nil {
+					fail("取消探测后不该落档案")
+					return false
+				}
+				if u.fatalBanner.GetRevealed() {
+					fail("bwrap 可用时不该显示致命横幅")
+					return false
+				}
+				app.Quit()
+				return false
+			}
+			return true
+		}
+		glib.TimeoutAdd(50, &tick, 0)
+	}
+	app.ConnectActivate(&actcb)
+	u.hold(&actcb)
+
+	if code := app.Run(1, os.Args[:1]); code != 0 {
+		t.Fatalf("GTK 主循环退出码 %d", code)
+	}
+	if runErr != nil {
+		t.Fatal(runErr)
+	}
+	if !activated || step != 2 {
+		t.Fatalf("配置页状态用例没有跑完：activated=%t step=%d", activated, step)
+	}
+	if !bannerDismissed {
+		t.Fatal("降级横幅的「了解」路径没有执行")
+	}
+}
+
+// TestGtkErrorState 覆盖配置页的「失败」态：版本超前的档案在 open 入口
+// 被拒绝后，页面必须进入 error 态，且不可重试的失败不显示「重试」。
+//
+// 单独成测而不是接在 TestGtkSetupStates 后面：同一个导航视图里 pop 完
+// 立刻 push 同名 tag 的页会被 AdwNavigationView 拒绝（过渡态），靠 sleep
+// 等动画既慢又有负载下的时序窗口。独立窗口没有过渡态，push 后等
+// visibleIsPage 为真再断言，杜绝"断言在一个没上屏的页上"的假绿。
+func TestGtkErrorState(t *testing.T) {
+	env, appsDir := gtkTestEnv(t, "errorstate")
+	if err := os.WriteFile(filepath.Join(appsDir, "bad.desktop"),
+		[]byte("[Desktop Entry]\nType=Application\nName=Bad\nExec=/usr/bin/true\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// 版本超前：LoadProfile 必须拒绝，且这不是重试能解决的问题。
+	if err := env.SaveProfile(core.Profile{
+		App: "bad", Version: core.ProfileVersion + 1, Exec: "/usr/bin/true",
+		ProbeMethod: "overlay", Ignored: core.DefaultIgnored(), Env: map[string]string{},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	app := adw.NewApplication("io.github.mensylisir.Appclone.GtkError",
+		gio.GApplicationNonUniqueValue)
+	defer app.Unref()
+
+	u := &ui{app: app, env: env, lang: "zh_CN"}
+	var runErr error
+	activated := false
+	fail := func(format string, a ...any) {
+		if runErr == nil {
+			runErr = fmt.Errorf(format, a...)
+		}
+		app.Quit()
+	}
+	closed := false
+	closedOK := true // 取消必须回 onClose(false)，不能把一次取消报成成功
+	actcb := func(_ gio.Application) {
+		if u.win != nil {
+			return
+		}
+		activated = true
+		u.buildWindow()
+		deadline := time.Now().Add(20 * time.Second)
+		var v *setupView
+		var tick glib.SourceFunc
+		tick = func(uintptr) bool {
+			if time.Now().After(deadline) {
+				fail("失败态用例没有在 20 秒内推进")
+				return false
+			}
+			if v == nil {
+				if !u.loaded {
+					return true
+				}
+				if !u.pushSetup("bad", "open", func(ok bool) { closed = true; closedOK = ok }) {
+					fail("失败态用例的配置页没有推出来")
+					return false
+				}
+				v = u.activeSetup
+				if v == nil {
+					fail("推页后 activeSetup 为空")
+					return false
+				}
+				return true
+			}
+			if closed {
+				app.Quit()
+				return false
+			}
+			if !visibleIsPage(u, v.page) {
+				return true // 等 push 动画；一直不可见由总超时判红
+			}
+			if v.state != "error" || v.stack.GetVisibleChildName() != "error" {
+				fail("版本超前的档案没有进入失败态（state=%q）", v.state)
+				return false
+			}
+			if got := v.errPage.GetTitle(); got != "档案由更新版本生成" {
+				fail("失败态标题没有按原因分类，得到 %q", got)
+				return false
+			}
+			if v.errPage.GetDescription() == "" {
+				fail("失败态没有说明下一步（描述为空）")
+				return false
+			}
+			if v.retry != nil {
+				fail("版本超前是可重试路径之外的情况，retry 必须为 nil")
+				return false
+			}
+			if v.confirmBtn.GetVisible() {
+				fail("不可重试的失败态不该显示重试按钮")
+				return false
+			}
+			if v.cancelBtn.GetLabel() != "取消" {
+				fail("失败态取消按钮文案应为「取消」，实际 %q", v.cancelBtn.GetLabel())
+				return false
+			}
+			gobject.SignalEmitByName(&v.cancelBtn.Widget.Object, "clicked")
+			return true
+		}
+		glib.TimeoutAdd(50, &tick, 0)
+	}
+	app.ConnectActivate(&actcb)
+	u.hold(&actcb)
+
+	if code := app.Run(1, os.Args[:1]); code != 0 {
+		t.Fatalf("GTK 主循环退出码 %d", code)
+	}
+	if runErr != nil {
+		t.Fatal(runErr)
+	}
+	if !activated || !closed {
+		t.Fatalf("失败态用例没有跑完：activated=%t closed=%t", activated, closed)
+	}
+	if closedOK {
+		t.Fatal("取消失败态必须回 onClose(false)，实际报告成功")
+	}
+}
+
+// TestGtkRetryableError：可重试的失败态必须显示「重试」，点下去要重跑
+// 失败的那件事（§6.1 ③-d）。
+//
+// 真实探测失败不是随时能造的（要应用在跑/零写入/锁被占），所以这里直接
+// 构造失败态的两条不可见约束：retry != nil → 按钮可见可点；点击 → 调用
+// retry 而不是 submit 的确认分支。
+func TestGtkRetryableError(t *testing.T) {
+	env, appsDir := gtkTestEnv(t, "retryable")
+	if err := os.WriteFile(filepath.Join(appsDir, "demo.desktop"),
+		[]byte("[Desktop Entry]\nType=Application\nName=Demo\nExec=/usr/bin/true\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := env.SaveProfile(core.Profile{
+		App: "demo", Version: core.ProfileVersion, Exec: "/usr/bin/true",
+		Paths: []string{"~/.config/Demo"}, ProbeMethod: "overlay",
+		Ignored: core.DefaultIgnored(), Env: map[string]string{},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	app := adw.NewApplication("io.github.mensylisir.Appclone.GtkRetry",
+		gio.GApplicationNonUniqueValue)
+	defer app.Unref()
+
+	u := &ui{app: app, env: env, lang: "zh_CN"}
+	var runErr error
+	activated := false
+	fail := func(format string, a ...any) {
+		if runErr == nil {
+			runErr = fmt.Errorf(format, a...)
+		}
+		app.Quit()
+	}
+	retried := false
+	closed := false
+	step := 0
+	var v *setupView
+	actcb := func(_ gio.Application) {
+		if u.win != nil {
+			return
+		}
+		activated = true
+		u.buildWindow()
+		deadline := time.Now().Add(20 * time.Second)
+		var tick glib.SourceFunc
+		tick = func(uintptr) bool {
+			if time.Now().After(deadline) {
+				fail("可重试失败态用例没有在 20 秒内推进（停在第 %d 步）", step)
+				return false
+			}
+			switch step {
+			case 0:
+				if !u.loaded {
+					return true
+				}
+				// open 入口复用档案，直接进确认态，不跑探测。
+				u.pushSetup("demo", "open", func(bool) { closed = true })
+				v = u.activeSetup
+				if v == nil || v.state != "confirm" {
+					fail("open 入口没有进入确认态")
+					return false
+				}
+				step++
+			case 1:
+				if !visibleIsPage(u, v.page) {
+					return true
+				}
+				// 模拟探测失败后的失败态：retry 指向"失败的那件事"。
+				v.retry = func() { retried = true }
+				v.showErrorTitle(v.u.tr("ui.setup.error.generic", nil), errors.New("boom"))
+				if v.state != "error" {
+					fail("没有进入失败态：%q", v.state)
+					return false
+				}
+				if !v.confirmBtn.GetVisible() || !v.confirmBtn.GetSensitive() {
+					fail("可重试的失败态必须显示可点的「重试」")
+					return false
+				}
+				if got := v.confirmBtn.GetLabel(); got != "重试" {
+					fail("失败态按钮应叫「重试」，实际 %q", got)
+					return false
+				}
+				gobject.SignalEmitByName(&v.confirmBtn.Widget.Object, "clicked")
+				if !retried {
+					fail("点「重试」没有调用 retry（走错到确认分支了？）")
+					return false
+				}
+				gobject.SignalEmitByName(&v.cancelBtn.Widget.Object, "clicked")
+				step++
+			case 2:
+				if !closed {
+					return true
+				}
+				app.Quit()
+				return false
+			}
+			return true
+		}
+		glib.TimeoutAdd(50, &tick, 0)
+	}
+	app.ConnectActivate(&actcb)
+	u.hold(&actcb)
+
+	if code := app.Run(1, os.Args[:1]); code != 0 {
+		t.Fatalf("GTK 主循环退出码 %d", code)
+	}
+	if runErr != nil {
+		t.Fatal(runErr)
+	}
+	if !activated || !closed || !retried {
+		t.Fatalf("可重试失败态用例没有跑完：activated=%t closed=%t retried=%t", activated, closed, retried)
+	}
+}
+
+// TestGtkRapidRepush：取消配置页后立刻再拨一次开关，第二页必须真的上屏。
+//
+// 这是 P1（对抗性复审）：AdwNavigationView 在 pop 过渡期间仍持有旧页 tag，
+// 旧实现用固定 tag "setup"，紧接着 Push 同名页会被静默拒绝——activeSetup
+// 指向一个没上屏的页面，开关/详情从此点不开。现在 pushPage 给每页唯一
+// tag，这条用例必须能走通；把 tag 改回固定值会立即变红。
+func TestGtkRapidRepush(t *testing.T) {
+	env, appsDir := gtkTestEnv(t, "repush")
+	if err := os.WriteFile(filepath.Join(appsDir, "demo.desktop"),
+		[]byte("[Desktop Entry]\nType=Application\nName=Demo\nExec=/usr/bin/true\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	app := adw.NewApplication("io.github.mensylisir.Appclone.GtkRepush",
+		gio.GApplicationNonUniqueValue)
+	defer app.Unref()
+
+	u := &ui{app: app, env: env, lang: "zh_CN"}
+	var runErr error
+	activated := false
+	fail := func(format string, a ...any) {
+		if runErr == nil {
+			runErr = fmt.Errorf(format, a...)
+		}
+		app.Quit()
+	}
+	closed := 0
+	step := 0
+	var first, second *setupView
+	actcb := func(_ gio.Application) {
+		if u.win != nil {
+			return
+		}
+		activated = true
+		u.buildWindow()
+		deadline := time.Now().Add(20 * time.Second)
+		var tick glib.SourceFunc
+		tick = func(uintptr) bool {
+			if time.Now().After(deadline) {
+				fail("快速重推用例没有在 20 秒内推进（停在第 %d 步）", step)
+				return false
+			}
+			switch step {
+			case 0:
+				if !u.loaded {
+					return true
+				}
+				u.pushSetup("demo", "setup", func(bool) { closed++ })
+				first = u.activeSetup
+				if first == nil {
+					fail("第一页没有推出来")
+					return false
+				}
+				step++
+			case 1:
+				if !visibleIsPage(u, first.page) {
+					return true
+				}
+				// 取消的同一拍立刻再推一页：真实用户就是这样连点的。
+				gobject.SignalEmitByName(&first.cancelBtn.Widget.Object, "clicked")
+				if !u.pushSetup("demo", "setup", func(bool) { closed++ }) {
+					fail("取消后立刻重推被拒绝了")
+					return false
+				}
+				second = u.activeSetup
+				if second == nil {
+					fail("重推后 activeSetup 为空")
+					return false
+				}
+				step++
+			case 2:
+				// 第二页必须真的成为可见页；旧实现（固定 tag）在这里永远等不到。
+				if !visibleIsPage(u, second.page) {
+					return true
+				}
+				if second.state != "probing" {
+					fail("重推的页面状态不对：%q", second.state)
+					return false
+				}
+				gobject.SignalEmitByName(&second.cancelBtn.Widget.Object, "clicked")
+				step++
+			case 3:
+				// 同样要等两条探测 goroutine 都收完（held 为假）：否则测试
+				// 进程先退出，strace/dbus-daemon 会变成孤儿，并攥着 go test
+				// 的输出管道让闸门偶发 I/O incomplete。
+				if closed < 2 || first.held || second.held {
+					return true
+				}
+				app.Quit()
+				return false
+			}
+			return true
+		}
+		glib.TimeoutAdd(50, &tick, 0)
+	}
+	app.ConnectActivate(&actcb)
+	u.hold(&actcb)
+
+	if code := app.Run(1, os.Args[:1]); code != 0 {
+		t.Fatalf("GTK 主循环退出码 %d", code)
+	}
+	if runErr != nil {
+		t.Fatal(runErr)
+	}
+	if !activated || closed != 2 {
+		t.Fatalf("快速重推用例没有跑完：activated=%t closed=%d", activated, closed)
+	}
+}
+
+// TestGtkFatalBanner：bwrap 缺失是致命态——横幅、搜索与开关必须一起停用，
+// 不留下"看起来能操作"的控件。
+//
+// 用空 PATH 模拟：CheckBwrap 走 exec.LookPath。窗口构建前设置，进程内
+// 没有别的外部命令依赖，GTK 已由 puregotk 在 init 阶段加载完毕。
+func TestGtkFatalBanner(t *testing.T) {
+	env, appsDir := gtkTestEnv(t, "fatal")
+	if err := os.WriteFile(filepath.Join(appsDir, "demo.desktop"),
+		[]byte("[Desktop Entry]\nType=Application\nName=Demo\nExec=/usr/bin/true\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", "")
+
+	app := adw.NewApplication("io.github.mensylisir.Appclone.GtkFatal",
+		gio.GApplicationNonUniqueValue)
+	defer app.Unref()
+
+	u := &ui{app: app, env: env, lang: "zh_CN"}
+	var runErr error
+	activated := false
+	fail := func(format string, a ...any) {
+		if runErr == nil {
+			runErr = fmt.Errorf(format, a...)
+		}
+		app.Quit()
+	}
+	actcb := func(_ gio.Application) {
+		if u.win != nil {
+			return
+		}
+		activated = true
+		u.buildWindow()
+		deadline := time.Now().Add(20 * time.Second)
+		var tick glib.SourceFunc
+		tick = func(uintptr) bool {
+			if time.Now().After(deadline) {
+				fail("等环境自检超时")
+				return false
+			}
+			if !u.envChecked || !u.loaded {
+				return true
+			}
+			if !u.fatal {
+				fail("PATH 里没有 bwrap，自检却没有判成致命")
+				return false
+			}
+			if !u.fatalBanner.GetRevealed() {
+				fail("致命态横幅没有显示")
+				return false
+			}
+			if u.softBanner.GetRevealed() {
+				fail("致命态不该同时显示降级横幅")
+				return false
+			}
+			if u.search.GetSensitive() {
+				fail("致命态下搜索仍可操作")
+				return false
+			}
+			// 「所有应用」组的开关必须停用：致命态下点它只会报同一条错。
+			if len(u.groups) == 0 {
+				fail("致命态下应用列表没有渲染")
+				return false
+			}
+			row := findListRow(u.groups[0], "Demo")
+			if row == nil {
+				fail("致命态下找不到 Demo 行")
+				return false
+			}
+			sensitive := row.GetSensitive()
+			row.Unref()
+			if sensitive {
+				fail("致命态下应用开关仍可操作")
+				return false
+			}
+			app.Quit()
+			return false
+		}
+		glib.TimeoutAdd(50, &tick, 0)
+	}
+	app.ConnectActivate(&actcb)
+	u.hold(&actcb)
+
+	if code := app.Run(1, os.Args[:1]); code != 0 {
+		t.Fatalf("GTK 主循环退出码 %d", code)
+	}
+	if runErr != nil {
+		t.Fatal(runErr)
+	}
+	if !activated {
+		t.Fatal("activate 没有执行（GApplication 把调用转发给了别的实例？）")
+	}
+}
+
+// TestGtkEnglishStrings：语言跟随 i18n.Lang() 之后，en 界面必须真的拿到
+// 英文文案，而不是回落中文、更不能露出 ui.* 键名。
+//
+// 这是 ADR-027 退场的最后一道保险：消息表由 TestTablesMatch 保证键齐全，
+// 这里保证 GUI 真的按 lang 查表（漏改某个字面量、把 lang 写死成 zh_CN，
+// 都会让这条变红）。
+func TestGtkEnglishStrings(t *testing.T) {
+	env, appsDir := gtkTestEnv(t, "english")
+	if err := os.WriteFile(filepath.Join(appsDir, "demo.desktop"),
+		[]byte("[Desktop Entry]\nType=Application\nName=Demo\nExec=/usr/bin/true\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	app := adw.NewApplication("io.github.mensylisir.Appclone.GtkEnglish",
+		gio.GApplicationNonUniqueValue)
+	defer app.Unref()
+
+	// 走产品自己的构造入口：语言由 i18n.Lang() 按 LC_ALL 判定，避免
+	// 测试自己写 lang 而漏掉 main → newUI 的接线。
+	t.Setenv("LC_ALL", "en_US.UTF-8")
+	u := newUI(app, env)
+	if u.lang != "en" {
+		t.Fatalf("LC_ALL=en_US.UTF-8 时界面语言应为 en，得到 %q", u.lang)
+	}
+	var runErr error
+	activated := false
+	fail := func(format string, a ...any) {
+		if runErr == nil {
+			runErr = fmt.Errorf(format, a...)
+		}
+		app.Quit()
+	}
+	actcb := func(_ gio.Application) {
+		if u.win != nil {
+			return
+		}
+		activated = true
+		u.buildWindow()
+		deadline := time.Now().Add(20 * time.Second)
+		var tick glib.SourceFunc
+		tick = func(uintptr) bool {
+			if time.Now().After(deadline) {
+				fail("等首轮扫描超时")
+				return false
+			}
+			if !u.loaded {
+				return true
+			}
+			if got := u.win.GetTitle(); got != "App Clones" {
+				fail("en 界面窗口标题应为 \"App Clones\"，得到 %q", got)
+				return false
+			}
+			if got := u.emptyPage.GetTitle(); got != "No clones yet" {
+				fail("en 界面空态标题不对：%q", got)
+				return false
+			}
+			// 用字面量前缀而不是查表：查表比对会把"消息表本身写错"也放过。
+			if got := u.softBanner.GetTitle(); !strings.HasPrefix(got, "Probing will run in compatible mode") {
+				fail("en 界面降级横幅不是英文文案：%q", got)
+				return false
+			}
+			// 缺键的界面表现是原始键名（ui.xxx）——这里一并堵住。
+			for _, text := range []string{u.win.GetTitle(), u.emptyPage.GetTitle(), u.softBanner.GetTitle()} {
+				if strings.Contains(text, "ui.") {
+					fail("界面露出了消息键名：%q", text)
+					return false
+				}
+			}
+			if len(u.groups) == 0 {
+				fail("应用列表没有渲染")
+				return false
+			}
+			row := findListRow(u.groups[0], "Demo")
+			if row == nil {
+				fail("找不到 Demo 行")
+				return false
+			}
+			sub := stringProp(row, "subtitle")
+			row.Unref()
+			if sub != "No isolation profile yet" {
+				fail("en 界面应用副标题不对：%q", sub)
 				return false
 			}
 			app.Quit()

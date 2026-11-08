@@ -129,6 +129,15 @@ func newAddCmd(a *app) *cobra.Command {
 					Stderr:   cmd.ErrOrStderr(),
 				})
 				if perr != nil {
+					// 用户取消不是失败：有保留现场时让 main 打出路径（错误码
+					// 已是 CodeOK），否则静默返回 0（§11 sentinel）。
+					if errors.Is(perr, core.ErrCanceled) {
+						var ce *core.Error
+						if errors.As(perr, &ce) && ce.Key == "err.probe.canceled_kept" {
+							return perr
+						}
+						return nil
+					}
 					return perr
 				}
 				// 预填、来源标注、零写入门槛、非路径字段合并只有 core 一份实现

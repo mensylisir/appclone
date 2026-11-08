@@ -9,7 +9,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sort"
-	"strings"
 	"time"
 )
 
@@ -183,7 +182,9 @@ func (e *Env) probeStrace(ctx context.Context, app string, opt ProbeOptions, run
 				return ProbeResult{}, ErrCanceled
 			}
 			if errors.Is(runErr, context.DeadlineExceeded) {
-				return ProbeResult{}, newErr(CodeProbe, "err.probe.timeout", map[string]any{
+				// strace 路径没有 overlay 现场可保留（work 是普通临时目录）：
+				// 用单独一条不提"保留现场"、也没有 {quarantine} 的文案。
+				return ProbeResult{}, newErr(CodeProbe, "err.probe.timeout_strace", map[string]any{
 					"app": app, "round": round + 1, "rounds": rounds,
 				}, runErr)
 			}
@@ -209,16 +210,31 @@ func (e *Env) probeStrace(ctx context.Context, app string, opt ProbeOptions, run
 	return ProbeResult{Profile: p, Candidates: cands, Whiteouts: whiteouts, ExitCode: last.ExitCode}, nil
 }
 
-// probeRoundFailed 把"某一轮没跑起来"翻译成退出码。抽出来是因为它同时要
-// 卸载、清理/保留现场，塞在循环里会让主流程读不出顺序。
-func (e *Env) probeRoundFailed(app string, round, rounds int, runErr error, discard func()) (ProbeResult, error) {
-	discard()
+// probeRoundFailed 把"某一轮没跑起来"翻译成退出码。工作目录的处置（停止
+// 会话进程 → 卸载 → 删除/保留现场）由调用方用 teardown 完成：顺序错了会
+// 穿过 merged 挂载点删到 upper 里的内容（见 discard 的注释）。
+func (e *Env) probeRoundFailed(app string, round, rounds int, runErr error, quarantined string) (ProbeResult, error) {
 	if errors.Is(runErr, context.Canceled) {
+		// 多数取消没有现场（teardown 只在公共目录可能被写进 upper 时才保留）；
+		// 一旦保留了，必须把路径告诉用户，否则文件被搬走却无处可寻。
+		if quarantined != "" {
+			return ProbeResult{}, newErr(CodeOK, "err.probe.canceled_kept", map[string]any{
+				"quarantine": quarantined,
+			}, ErrCanceled)
+		}
 		return ProbeResult{}, ErrCanceled
 	}
 	if errors.Is(runErr, context.DeadlineExceeded) {
+		// 保留了现场就必须给出恢复路径，否则用户不知道该去哪里找探测期
+		// 写下的内容（§3.2.1）；写层为空时 teardown 会安全删掉，此时不能
+		// 再用"保留现场：{quarantine}"的文案（否则是悬空的冒号 + 假承诺）。
+		if quarantined == "" {
+			return ProbeResult{}, newErr(CodeProbe, "err.probe.timeout_no_scene", map[string]any{
+				"app": app, "round": round + 1, "rounds": rounds,
+			}, runErr)
+		}
 		return ProbeResult{}, newErr(CodeProbe, "err.probe.timeout", map[string]any{
-			"app": app, "round": round + 1, "rounds": rounds,
+			"app": app, "round": round + 1, "rounds": rounds, "quarantine": quarantined,
 		}, runErr)
 	}
 	return ProbeResult{}, newErr(CodeEnv, "err.probe.session", map[string]any{
@@ -257,14 +273,23 @@ func (e *Env) probeSession(ctx context.Context, app string, opt ProbeOptions, mo
 		return ProbeResult{}, err
 	}
 	// removed 标记"work 已经被处理过"，避免重复删/quarantine。
+	// isMounted 是硬护栏：merged 还挂着时 os.RemoveAll(work) 会**穿过挂载点**
+	// 遍历整个 $HOME 视图——upper 里探测期写下的文件会被 unlink 掉，而
+	// removeall 只在最后才因 EBUSY 失败。任何路径都不许在这里越线。
 	removed := false
+	isMounted := false
 	discard := func() {
-		if !removed {
+		if !removed && !isMounted {
 			removed = true
 			os.RemoveAll(work)
 		}
 	}
 	quarantine := func() (string, error) {
+		// 与 discard 对称的硬护栏：挂载还在时改名会把挂载点一起搬走，
+		// 退出时卸载目标就不对了。当前调用点都在卸载之后，这里防未来。
+		if isMounted {
+			return work, errEnv("err.probe.quarantine_mounted", map[string]any{"path": work}, nil)
+		}
 		q := filepath.Join(e.tmpRoot(), fmt.Sprintf("appclone-quarantine-%d-%s", e.UID,
 			time.Now().UTC().Format("20060102T150405")+"-"+randSuffix()))
 		if err := os.Rename(work, q); err != nil {
@@ -280,14 +305,20 @@ func (e *Env) probeSession(ctx context.Context, app string, opt ProbeOptions, mo
 	merged := filepath.Join(work, "merged")
 	unmount, err := mounter.Mount(e.Resolver.Home, upper, filepath.Join(work, "work"), merged)
 	if err != nil {
+		// 极窄的竞态：Mount 已返回错误（典型是超时），但挂载点刚好在不该在
+		// 的时刻生效了。这时删 work 会穿过 merged；宁可把目录留给下次
+		// sweepStaleProbes（它会先卸载、再判污染）。
+		if mounted(merged) {
+			return ProbeResult{}, err
+		}
 		discard()
 		return ProbeResult{}, err
 	}
 	// 卸载顺序与"先杀进程再卸载"（§3.2.3）：这里注册的 defer 是兜底，
 	// 正常路径在下面显式调用并检查错误。
-	mounted := true
+	isMounted = true
 	defer func() {
-		if mounted {
+		if isMounted {
 			_ = unmount()
 		}
 	}()
@@ -296,10 +327,45 @@ func (e *Env) probeSession(ctx context.Context, app string, opt ProbeOptions, mo
 	if stopBus != nil {
 		defer stopBus()
 	}
+	// teardown 是异常路径唯一允许的收尾顺序：停 dbus → 卸载 → 处置工作目录
+	// （§3.2.3「先杀进程再卸载」）。preserve 表示"应用可能已经跑过、不能
+	// 直接删"：卸载后先做一次污染检查——公共目录进了 upper 才 quarantine，
+	// 只有应用自身配置/缓存写入时和成功路径一样删掉（否则每次取消都在
+	// /var/tmp 攒一份用户不知道的垃圾）。读不出来时按"可能有内容"保留。
+	teardown := func(preserve bool) (string, error) {
+		if stopBus != nil {
+			stopBus()
+		}
+		if isMounted {
+			if uerr := unmount(); uerr != nil {
+				// 挂载点没卸掉：什么都不删，留给启动前的残留扫描。
+				return "", uerr
+			}
+			isMounted = false
+		}
+		if preserve {
+			ents, present, rerr := readUpperTree(upper)
+			switch {
+			case rerr != nil:
+				return quarantine()
+			case !present || len(ents) == 0:
+				discard()
+				return "", nil
+			case len(e.ProbeContaminated(ents, pubBinds)) > 0:
+				return quarantine()
+			default:
+				discard()
+				return "", nil
+			}
+		}
+		discard()
+		return "", nil
+	}
 	locks, lockCleanup, err := e.probeLockBinds(work, opt.LockFile)
 	if err != nil {
-		_ = unmount()
-		discard()
+		if _, terr := teardown(false); terr != nil {
+			return ProbeResult{}, terr
+		}
 		return ProbeResult{}, err
 	}
 	defer lockCleanup()
@@ -319,8 +385,9 @@ func (e *Env) probeSession(ctx context.Context, app string, opt ProbeOptions, mo
 	}
 	argv, err := ProbeBwrapArgs(spec)
 	if err != nil {
-		_ = unmount()
-		discard()
+		if _, terr := teardown(false); terr != nil {
+			return ProbeResult{}, terr
+		}
 		return ProbeResult{}, err
 	}
 
@@ -341,14 +408,32 @@ func (e *Env) probeSession(ctx context.Context, app string, opt ProbeOptions, mo
 		r, runErr := runner.Run(sctx, argv, opt.Stderr)
 		cancel()
 		if runErr != nil {
-			// 第一轮就取消/失败：没有可信证据，按原来的分派处理。
-			return e.probeRoundFailed(app, round, rounds, runErr, discard)
+			// 没有可信证据。第 0 轮 Start 失败时应用还没 exec、写层安全；
+			// 取消/超时与后续轮次的失败都可能已经有写入，必须先卸载再判断
+			// 是否保留，绝不直接删写层。
+			preserve := round > 0 || errors.Is(runErr, context.Canceled) ||
+				errors.Is(runErr, context.DeadlineExceeded)
+			q, terr := teardown(preserve)
+			if terr != nil {
+				return ProbeResult{}, terr
+			}
+			return e.probeRoundFailed(app, round, rounds, runErr, q)
 		}
 		if r.ExitCode == probeGuardFailed {
-			// 正向断言失败：公共目录仍在 overlay 里。应用还没跑，删写层安全。
-			discard()
+			// 正向断言失败：公共目录仍在 overlay 里。第 0 轮 guard 在 exec
+			// 应用之前就退出了，写层里没有用户内容；后续轮次共用同一个 upper，
+			// 前面轮次可能已经写进用户文件——那部分必须保留并告诉用户路径。
+			q, terr := teardown(round > 0)
+			if terr != nil {
+				return ProbeResult{}, terr
+			}
+			if q != "" {
+				return ProbeResult{}, errProbe("err.probe.bind_verify_failed_kept", map[string]any{
+					"path": publicTargets(pubBinds), "quarantine": q,
+				})
+			}
 			return ProbeResult{}, errProbe("err.probe.bind_verify_failed", map[string]any{
-				"path": strings.Join(publicTargets(pubBinds), "、"),
+				"path": publicTargets(pubBinds),
 			})
 		}
 		// 后续轮次沿用最后一轮的结果；前面轮次只要没报错就继续——
@@ -366,7 +451,7 @@ func (e *Env) probeSession(ctx context.Context, app string, opt ProbeOptions, mo
 		stopBus()
 	}
 	unmountErr := unmount()
-	mounted = false
+	isMounted = false
 	if unmountErr != nil {
 		// 挂载点还在：这时删工作目录会遍历用户家目录视图并制造 whiteout，
 		// 所以**不删**，留着并报环境错误。
@@ -375,7 +460,11 @@ func (e *Env) probeSession(ctx context.Context, app string, opt ProbeOptions, mo
 	// 收集：先读，再判，最后才谈删（§3.2.3 末条）。
 	entries, present, readErr := readUpperTree(upper)
 	if readErr != nil {
-		discard()
+		// 读不出来的东西不能顺手删：里面可能正是用户文件。与 teardown、
+		// 审计层保持同一口径——读失败就保留现场。
+		if _, qerr := quarantine(); qerr != nil {
+			return ProbeResult{}, qerr
+		}
 		return ProbeResult{}, readErr
 	}
 	if !present {
@@ -383,11 +472,21 @@ func (e *Env) probeSession(ctx context.Context, app string, opt ProbeOptions, mo
 		return ProbeResult{}, errEnv("err.probe.no_upper", map[string]any{"path": upper}, nil)
 	}
 	// 会话内的正向断言失败：公共目录仍落在 overlay 里（bind 没生效）。
-	// 这条比反向断言更早、也更硬——此时应用还没跑，所以可以安全删掉写层。
+	// 单轮时应用还没跑，删写层安全；多轮时前面轮次可能已写入用户文件，
+	// 必须保留现场（与循环内的同一判据保持对称）。
 	if res.ExitCode == probeGuardFailed {
+		if rounds > 1 {
+			q, qerr := quarantine()
+			if qerr != nil {
+				return ProbeResult{}, qerr
+			}
+			return ProbeResult{Quarantined: q}, errProbe("err.probe.bind_verify_failed_kept", map[string]any{
+				"path": publicTargets(pubBinds), "quarantine": q,
+			})
+		}
 		discard()
 		return ProbeResult{}, errProbe("err.probe.bind_verify_failed", map[string]any{
-			"path": strings.Join(publicTargets(pubBinds), "、"),
+			"path": publicTargets(pubBinds),
 		})
 	}
 	// 会话"跑起来了但立刻失败"（bwrap 建 namespace 失败、Exec 不存在）与
@@ -408,7 +507,7 @@ func (e *Env) probeSession(ctx context.Context, app string, opt ProbeOptions, mo
 			return ProbeResult{}, qerr
 		}
 		return ProbeResult{Quarantined: q}, errProbe("err.probe.contaminated", map[string]any{
-			"paths": strings.Join(contaminated, "、"), "quarantine": q,
+			"paths": contaminated, "quarantine": q,
 		})
 	}
 

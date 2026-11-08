@@ -164,8 +164,9 @@ puregotk 自称 experimental，所以**不允许"边写产品边试"**。第一�
 - ⑤ 在 `ubuntu:24.04`（GTK 4.14.5 / libadwaita 1.5.0）容器内 Xvfb 跑通同一程序、退出码 0，
   无 `init` 符号缺失 panic；**未覆盖三屏本身**——S0 验的是"绑定在 1.5 上可用"。
   三屏 v1 已落地（`cmd/appclone-gui/`，2026-11-08），在 1.5 上的控件子集未再加测；
-  GTK 侧回归闸门已建立但**只覆盖页面生命周期**（`design/guitest-gtk.sh`：列表 → 确认 →
-  创建 → 详情 → 返回），探测四态/对话框/横幅仍无自动化（见 `STATUS.md` 与 `NEXT.md` "被挡住的"）。
+  GTK 侧回归闸门已建立（`design/guitest-gtk.sh`：列表 → 确认 → 创建 → 详情 → 返回，
+  以及首屏落点、空态映射、探测中取消/失败/可重试错误态、快速重推竞态、降级/致命横幅、en 文案九条用例），
+  删除/重命名/关闭开关对话框与真实指针/键盘注入仍无自动化（见 `STATUS.md` 与 `NEXT.md` "被挡住的"）。
 
 ### 4.4 版本门槛与一条必须承认的边界
 
@@ -472,4 +473,4 @@ activated / response / idle，地址恒定、注册一次后不再重新赋值�
 | 024 | **397 个应用的列表策略**：`GtkSearchEntry`（名称 + desktop id 双字段过滤）+ 默认只渲染前 30 + 组尾「显示全部 N 个应用」；元数据并发解析并缓存到 `cache/apps.toml`（带源文件 `mtime+size` 校验）。**不做 `GtkListView` 虚拟化**——`AdwPreferencesGroup` 不是虚拟化列表，改造成本要用整个 boxed-list 观感去换，数量级到四位数再谈 | 已定 |
 | 025 | **i18n 走 `core/i18n` 的 Go 消息表**（zh_CN + en，`LANG` 前缀匹配，其他语言回落英文），**不用 gettext**（与零 cgo 单二进制一致，且 `.mo` 文件还要装到 `/usr/share/locale`，与"单二进制 + 包依赖"的分发形态不匹配）。界面字符串不得硬编码在 GUI 代码（**落地节奏见 ADR-027**）；用户数据（实例显示名、应用名）不翻译；`.desktop` 的 `Name[zh_CN]`/`Name[en]` 同源 | 已定 |
 | 026 | **私有 runtime / 私有 DBus 的生命周期**：`runtime/` 随实例复用（启动前清残留 socket）；`dbus-daemon --session --nofork --print-address` 由 `run` 起子进程（`--nofork` 必须带，否则父进程先退拿不到地址），与 bwrap 同生共死，结束后杀 daemon 删 socket；缺 `dbus-daemon` 时**降级为共享并明确告知**（"可能无法双开"），不静默 | 已定 |
-| 027 | **GUI 文案本地化分期**（ADR-025 的落地节奏，目标不变）：GUI v1 的界面文案以 zh_CN 单语交付，`u.lang` **固定 `zh_CN`**（不是 `"zh"`——消息表键是 `zh_CN`，查不到会静默回落英文，实测出现过中文界面里插英文 reason）。理由：GTK 侧此前没有自动回归闸门（`guitest.js` 只验 HTML 稿），把三屏 ~80 条文案一次性搬进消息表时，漏一个键就会在界面上直接显示成键名，而没有能自动走遍三屏四态的测试；英文译文也需要人工校对。**硬编码是临时状态、不是裁决**：退出条件 = GTK 回归闸门**走遍三屏四态**后，三屏文案按 `ui.*` 入表并补 en 译文，`u.lang` 改回 `i18n.Lang()`。现状（2026-11-08）：闸门只覆盖页面生命周期（列表→确认→创建→详情→返回，`design/guitest-gtk.sh`），探测四态/对话框/横幅尚不在其中，**退出条件未满足，`u.lang` 不得改回 `i18n.Lang()`**。在此之前**禁止中英混排**：动态文案（reason、core 错误）必须与静态文案同语言 | 已定（临时） |
+| 027 | **GUI 文案本地化分期**（ADR-025 的落地节奏）：v1 先以 zh_CN 单语交付、`u.lang` 固定 `zh_CN`，退出条件 = GTK 闸门**走遍三屏四态**后三屏文案按 `ui.*` 入表、补 en 译文，`u.lang` 改回 `i18n.Lang()`。**已于 2026-11-08 退场**：闸门新增 `TestGtkSetupStates`（probing 取消 / 降级横幅「了解」）、`TestGtkErrorState`（error 无重试）、`TestGtkRetryableError`（重试接线）、`TestGtkRapidRepush`（导航页唯一 tag，守着 pop 过渡中再次 push 的竞态）与 `TestGtkFatalBanner`（致命态横幅、搜索、开关联动），加上生命周期用例的 confirm→creating 与详情页（共 9 条），列表/配置/详情 × probing/confirm/creating/error 全覆盖；三屏约 150 条 `ui.*` 文案（160 处 `tr()` 调用）全部进 `core/i18n`（zh_CN + en），`newUI` 统一用 `i18n.Lang()`。保障手段：`core/i18n/i18n_test.go` 钉住两语言键一一对应、占位符一致、en 表无中文、切片参数分隔符随语言，并扫描 `core/*.go` 的字面量 `err.*` 键（落地时抓出 `err.profile.exec_field_code` / `err.profile.extra_bind_missing` 只有 en、中文界面会回落英文的真实缺陷，以及三个 core 缺失键），`TestGtkEnglishStrings` 在 `LC_ALL=en_US.UTF-8` 下断言 en 界面文案。**仍禁止中英混排**：动态文案（reason、core 错误）与静态文案继续共用同一张表 | 已定（2026-11-08 退场完成） |

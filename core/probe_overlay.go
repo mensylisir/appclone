@@ -117,8 +117,20 @@ func (fuseOverlayMounter) Mount(lower, upper, work, merged string) (func() error
 		}
 	}
 	_ = cmd.Process.Kill()
-	return nil, errEnv("err.probe.mount_failed", map[string]any{
-		"output": "超时（5 秒内没看到挂载点）：" + strings.TrimSpace(errBuf.String()),
+	// 等 fuse 进程真的退出，并补一次卸载：最后一次轮询与超时判定之间它可能
+	// 刚好把挂载挂上。不处理的话，调用方会在"以为没挂载"的情况下删工作目录，
+	// 穿过 merged 制造 whiteout。
+	select {
+	case <-waited:
+	case <-time.After(2 * time.Second):
+	}
+	if mounted(merged) {
+		_ = umount(merged)
+	}
+	// 超时是产品判定，不是 fuse 的输出：前缀进消息表，{output} 只放外部
+	// 命令自己的 stderr（可能是英文），不把中文塞进 en 界面。
+	return nil, errEnv("err.probe.mount_timeout", map[string]any{
+		"output": strings.TrimSpace(errBuf.String()),
 	}, nil)
 }
 

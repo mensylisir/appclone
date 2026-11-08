@@ -4,9 +4,9 @@ package main
 
 import (
 	"context"
-	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -102,6 +102,11 @@ type ui struct {
 	// 详情页要清指针并注销处理器。用页面指针而不是"猜当前是哪一页"，
 	// 是因为 pop 可能来自屏幕手势，而收尾必须对应到具体那一页。
 	pages map[uintptr]func()
+	// pageSeq 给每次 push 的页一个唯一 tag。AdwNavigationView 在 pop 过渡
+	// 期间仍持有旧页的 tag；紧接着 push 同名 tag 的新页会被拒绝（只打
+	// CRITICAL，页面不上屏而状态机照跑——用户表现为开关/详情点不开）。
+	// tag 没有别的用途（全仓没有按 tag 查找），唯一即可。
+	pageSeq int
 	// listScope 是列表页这一轮渲染登记的处理器；重建前整体注销。
 	listScope *renderScope
 	// listGen 是列表渲染代数。异步流程（探测失败回弹开关、关闭开关确认框）
@@ -154,6 +159,10 @@ func (u *ui) pushPage(page *adw.NavigationPage, cleanup func()) {
 	if cleanup != nil {
 		u.pages[page.GoPointer()] = cleanup
 	}
+	// 唯一 tag：pop 过渡期间旧页还没离开栈，同名 tag 会让 Push 被
+	// AdwNavigationView 静默拒绝（P1，对抗性复审）。
+	u.pageSeq++
+	page.SetTag("page-" + strconv.Itoa(u.pageSeq))
 	u.nav.Push(page)
 }
 
@@ -192,6 +201,13 @@ type toggleMark struct {
 	key string
 }
 
+// newUI 是 GUI 的唯一构造入口：语言在这里按 ADR-025 的规则定一次。
+// 集中在一个函数里，回归才能验证"界面语言确实跟随 LANG"，而不是构造
+// 语句散落在 main 里、只能靠读代码相信。
+func newUI(app *adw.Application, env *core.Env) *ui {
+	return &ui{app: app, env: env, lang: i18n.Lang()}
+}
+
 // buildWindow 只做一次：根页是列表，详情/探测页按需 push。
 func (u *ui) buildWindow() {
 	u.suppress = map[string]bool{}
@@ -201,7 +217,7 @@ func (u *ui) buildWindow() {
 	u.pages = map[uintptr]func(){}
 
 	u.win = adw.NewApplicationWindow(&u.app.Application)
-	u.win.SetTitle("应用分身")
+	u.win.SetTitle(u.tr("ui.window.title", nil))
 	u.win.SetDefaultSize(560, 760)
 
 	u.nav = adw.NewNavigationView()
@@ -218,7 +234,7 @@ func (u *ui) buildWindow() {
 
 	u.header = adw.NewHeaderBar()
 	u.search = gtk.NewSearchEntry()
-	u.search.SetPlaceholderText("搜索应用")
+	u.search.SetPlaceholderText(u.tr("ui.search.placeholder", nil))
 	u.searchFn = func(uintptr) bool {
 		u.searchTimer = 0
 		q := strings.ToLower(strings.TrimSpace(u.search.GetText()))
@@ -247,10 +263,10 @@ func (u *ui) buildWindow() {
 	// 降级态（探测仍可用，只是覆盖不完整）。两者互斥——bwrap 都没有时谈
 	// "fuse 降级"没有意义。致命横幅没有关闭按钮：环境没好，"知道了"不能
 	// 把状态解除。
-	u.fatalBanner = adw.NewBanner("分身功能不可用：未检测到 bubblewrap (bwrap)。装好它之前，下面的开关不会有反应。")
+	u.fatalBanner = adw.NewBanner(u.tr("ui.banner.fatal", nil))
 	u.fatalBanner.SetRevealed(false)
-	u.softBanner = adw.NewBanner("探测将在兼容模式下进行（未检测到 fuse-overlayfs），结果可能不完整。")
-	u.softBanner.SetButtonLabel("了解")
+	u.softBanner = adw.NewBanner(u.tr("ui.banner.degraded", nil))
+	u.softBanner.SetButtonLabel(u.tr("ui.banner.dismiss", nil))
 	u.softBanner.SetRevealed(false)
 	u.softDismissFn = func(adw.Banner) {
 		u.softDismissed = true
@@ -275,9 +291,9 @@ func (u *ui) buildWindow() {
 	u.emptyPage.SetVexpand(true)
 	u.emptyPage.SetHexpand(true)
 	u.emptyPage.SetIconName("edit-copy-symbolic")
-	u.emptyPage.SetTitle("还没有分身")
-	u.emptyPage.SetDescription("在「所有应用」里找到要分身的应用，点亮它的开关——appclone 会先跟踪它的数据写入位置，确认后创建分身。")
-	pick := gtk.NewButtonWithLabel("选择应用")
+	u.emptyPage.SetTitle(u.tr("ui.empty.title", nil))
+	u.emptyPage.SetDescription(u.tr("ui.empty.description", nil))
+	pick := gtk.NewButtonWithLabel(u.tr("ui.empty.pick", nil))
 	pick.AddCssClass("suggested-action")
 	pick.SetHalign(gtk.AlignCenterValue)
 	pickcb := func(gtk.Button) { u.stack.SetVisibleChildName("all") }
@@ -291,11 +307,11 @@ func (u *ui) buildWindow() {
 
 	// 图标让两个视图在标题栏里一眼可分；badge 在「分身」页上显示数量，
 	// 用户停在「所有应用」时也知道已经有几个分身。
-	if p := u.stack.AddTitledWithIcon(&u.onBox.Widget, "on", "分身", "edit-copy-symbolic"); p != nil {
+	if p := u.stack.AddTitledWithIcon(&u.onBox.Widget, "on", u.tr("ui.view.clones", nil), "edit-copy-symbolic"); p != nil {
 		u.onPageObj = p
 		p.Unref()
 	}
-	if p := u.stack.AddTitledWithIcon(&u.offBox.Widget, "all", "所有应用", "view-app-grid-symbolic"); p != nil {
+	if p := u.stack.AddTitledWithIcon(&u.offBox.Widget, "all", u.tr("ui.view.all", nil), "view-app-grid-symbolic"); p != nil {
 		p.Unref()
 	}
 	// 默认落在「所有应用」：首次启动唯一能做的动作是点亮开关；空态里还有
@@ -319,7 +335,7 @@ func (u *ui) buildWindow() {
 	u.stack.SetVexpand(true)
 	rootBox.Append(&u.stack.Widget)
 	tv.SetContent(&rootBox.Widget)
-	rootPage := adw.NewNavigationPage(&tv.Widget, "应用分身")
+	rootPage := adw.NewNavigationPage(&tv.Widget, u.tr("ui.window.title", nil))
 	rootPage.SetTag("root")
 	u.nav.Push(rootPage)
 
@@ -370,12 +386,12 @@ func (u *ui) buildWindow() {
 	closecb := func(_ gtk.Window) bool {
 		// 删除事务同样不能在半路被关窗带走（数据目录删一半比多等一秒糟）。
 		if u.busy > 0 {
-			u.toastMsg("正在处理删除，请稍候…")
+			u.toastMsg(u.tr("ui.toast.deleting", nil))
 			return true
 		}
 		if v := u.activeSetup; v != nil {
 			if v.state == "creating" {
-				u.toastMsg("正在完成操作，请稍候…")
+				u.toastMsg(u.tr("ui.toast.finishing", nil))
 				return true
 			}
 			v.done = true
@@ -522,17 +538,17 @@ func (u *ui) appSub(a core.App, on bool) string {
 	if !on {
 		switch {
 		case !a.HasProfile:
-			return "尚未生成隔离档案"
+			return u.tr("ui.app.subtitle.no_profile", nil)
 		case !a.Creatable:
-			return "未开启 · 档案已失效，点开关重新配置"
+			return u.tr("ui.app.subtitle.stale", nil)
 		default:
-			return "未开启 · 已有隔离档案"
+			return u.tr("ui.app.subtitle.has_profile", nil)
 		}
 	}
 	if a.RunningN > 0 {
-		return fmt.Sprintf("%d 个分身 · %d 个运行中", a.InstanceN, a.RunningN)
+		return u.tr("ui.app.subtitle.running", map[string]any{"n": a.InstanceN, "running": a.RunningN})
 	}
-	return fmt.Sprintf("%d 个分身", a.InstanceN)
+	return u.tr("ui.app.subtitle.count", map[string]any{"n": a.InstanceN})
 }
 
 // reload 重新扫描应用与实例。扫描放到后台，结果回主线程再碰控件。
@@ -684,8 +700,8 @@ func (u *ui) renderList() {
 	if !empty {
 		g := adw.NewPreferencesGroup()
 		sc.own(&g.Widget)
-		g.SetTitle("已开启分身")
-		g.SetDescription("这些应用已经拥有独立的数据空间。")
+		g.SetTitle(u.tr("ui.group.clones.title", nil))
+		g.SetDescription(u.tr("ui.group.clones.desc", nil))
 		for _, a := range on {
 			g.Add(&u.newAppRow(a, true, sc).Widget)
 		}
@@ -699,8 +715,8 @@ func (u *ui) renderList() {
 		sc.own(&ag.Widget)
 		add := adw.NewActionRow()
 		sc.own(&add.Widget)
-		add.SetTitle("添加应用分身")
-		add.SetSubtitle("从「所有应用」里再选一个应用")
+		add.SetTitle(u.tr("ui.row.add_clone.title", nil))
+		add.SetSubtitle(u.tr("ui.row.add_clone.subtitle", nil))
 		ic := u.symbolicIcon("list-add-symbolic")
 		sc.own(&ic.Widget)
 		add.AddPrefix(&ic.Widget)
@@ -716,18 +732,18 @@ func (u *ui) renderList() {
 	sc.own(&g.Widget)
 	// 组名不再重复标题栏上的「所有应用」：视图名已经说了这是全部应用，
 	// 再写一遍只是噪声。留一句规则说明就够。
-	g.SetDescription("点亮开关，为应用建立独立的数据空间；公共目录仍然共享。")
+	g.SetDescription(u.tr("ui.group.all.desc", nil))
 	pool := off
 	var extra *adw.ActionRow
 	if u.query == "" && !u.expanded && len(off) > listLimit {
 		pool = off[:listLimit]
-		extra = u.moreRow(fmt.Sprintf("显示全部 %d 个应用", len(off)), sc)
+		extra = u.moreRow(u.tr("ui.row.show_all", map[string]any{"n": len(off)}), sc)
 	} else if u.query != "" && len(off) > searchLimit {
 		pool = off[:searchLimit]
 		// 搜索溢出说明是纯文本，不是可点的「显示全部」：搜索分支不读
 		// expanded，做成可点行就是一个点不动的死点击（设计稿也是纯文本）。
 		row := adw.NewActionRow()
-		row.SetTitle(fmt.Sprintf("已显示前 %d 个匹配（共 %d 个），再输几个字缩小范围", searchLimit, len(off)))
+		row.SetTitle(u.tr("ui.row.search_limit", map[string]any{"shown": searchLimit, "total": len(off)}))
 		row.SetSensitive(false)
 		sc.own(&row.Widget)
 		extra = row
@@ -739,9 +755,9 @@ func (u *ui) renderList() {
 		row := adw.NewActionRow()
 		sc.own(&row.Widget)
 		if u.query != "" {
-			row.SetTitle("没有匹配「" + u.search.GetText() + "」的应用")
+			row.SetTitle(u.tr("ui.row.no_match", map[string]any{"query": u.search.GetText()}))
 		} else {
-			row.SetTitle("全部应用都已开启分身")
+			row.SetTitle(u.tr("ui.row.all_clones", nil))
 		}
 		row.SetSensitive(false)
 		g.Add(&row.Widget)
@@ -817,7 +833,7 @@ func (u *ui) newAppRow(a core.App, on bool, sc *renderScope) *adw.SwitchRow {
 		btn := gtk.NewButtonFromIconName("go-next-symbolic")
 		sc.own(&btn.Widget)
 		btn.AddCssClass("flat")
-		btn.SetTooltipText("打开详情")
+		btn.SetTooltipText(u.tr("ui.tooltip.open_detail", nil))
 		sc.button(btn, func() { u.pushDetail(a.Key) })
 		row.AddSuffix(&btn.Widget)
 	}
@@ -904,8 +920,8 @@ func (u *ui) beginEnable(a core.App, ref rowRef) {
 func (u *ui) confirmDisable(a core.App, ref rowRef) {
 	u.pending[a.Key] = true
 	if a.RunningN > 0 {
-		d := adw.NewAlertDialog("还有分身正在运行", "请先在应用里退出正在运行的分身，再关闭开关。")
-		d.AddResponse("ok", "知道了")
+		d := adw.NewAlertDialog(u.tr("ui.dialog.running.title", nil), u.tr("ui.dialog.running.body", nil))
+		d.AddResponse("ok", u.tr("ui.dialog.ok", nil))
 		d.SetDefaultResponse("ok")
 		u.cb.onDialog(d, func(_ string) {
 			u.pending[a.Key] = false
@@ -914,9 +930,9 @@ func (u *ui) confirmDisable(a core.App, ref rowRef) {
 		d.Choose(&u.win.Widget, nil, nil, 0)
 		return
 	}
-	d := adw.NewAlertDialog("关闭「"+a.Name+"」的分身？", "这会删除该应用的全部分身，数据移入回收站，可从回收站恢复。")
-	d.AddResponse("cancel", "取消")
-	d.AddResponse("trash", "移到回收站")
+	d := adw.NewAlertDialog(u.tr("ui.dialog.close_clones.title", map[string]any{"name": a.Name}), u.tr("ui.dialog.close_clones.body", nil))
+	d.AddResponse("cancel", u.tr("ui.dialog.cancel", nil))
+	d.AddResponse("trash", u.tr("ui.dialog.trash", nil))
 	d.SetDefaultResponse("cancel")
 	d.SetResponseAppearance("trash", adw.ResponseDestructiveValue)
 	u.cb.onDialog(d, func(resp string) {
@@ -944,23 +960,22 @@ func (u *ui) confirmDisable(a core.App, ref rowRef) {
 					u.revert(ref, a.Key, true)
 					var parts []string
 					if out.deleted > 0 {
-						parts = append(parts, fmt.Sprintf("已移入回收站 %d 个", out.deleted))
+						parts = append(parts, u.tr("ui.toast.trashed_n", map[string]any{"n": out.deleted}))
 					}
-					parts = append(parts, fmt.Sprintf("%d 个没能删除：%s",
-						out.failed, u.tr(errorKey(out.firstErr), errorArgs(out.firstErr))))
+					parts = append(parts, u.tr("ui.toast.delete_failed", map[string]any{"n": out.failed, "detail": u.tr(errorKey(out.firstErr), errorArgs(out.firstErr))}))
 					if out.running > 0 {
-						parts = append(parts, fmt.Sprintf("还有 %d 个在运行，退出应用后再关一次开关", out.running))
+						parts = append(parts, u.tr("ui.toast.running_left", map[string]any{"n": out.running}))
 					}
-					u.toastMsg(strings.Join(parts, "；"))
+					u.toastMsg(strings.Join(parts, u.tr("ui.toast.separator", nil)))
 				case out.running > 0:
 					u.revert(ref, a.Key, true)
 					if out.deleted > 0 {
-						u.toastMsg(fmt.Sprintf("已移入回收站 %d 个；还有 %d 个在运行，退出应用后再关一次开关", out.deleted, out.running))
+						u.toastMsg(u.tr("ui.toast.trashed_running", map[string]any{"deleted": out.deleted, "running": out.running}))
 					} else {
-						u.toastMsg(fmt.Sprintf("还有 %d 个分身正在运行，请先在应用里退出它们再关闭开关", out.running))
+						u.toastMsg(u.tr("ui.toast.running_only", map[string]any{"n": out.running}))
 					}
 				default:
-					u.toastMsg("已删除「" + a.Name + "」的全部分身（移入回收站）")
+					u.toastMsg(u.tr("ui.toast.all_trashed", map[string]any{"name": a.Name}))
 				}
 				u.reload()
 				return false

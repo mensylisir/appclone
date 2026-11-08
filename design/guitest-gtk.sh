@@ -61,7 +61,9 @@ if [ "$rc" -ne 0 ]; then
 fi
 # `-run` 匹配不到任何测试时 `go test` 仍返回 0（输出只剩 "[no test files]"）：
 # 测试被改名/移走会静默假绿，所以必须真的看到每一条 PASS。
-for name in TestGtkScreensLifecycle TestGtkLandsOnClonesView TestGtkEmptyStateMapped; do
+for name in TestGtkScreensLifecycle TestGtkLandsOnClonesView TestGtkEmptyStateMapped \
+            TestGtkSetupStates TestGtkErrorState TestGtkRetryableError \
+            TestGtkRapidRepush TestGtkFatalBanner TestGtkEnglishStrings; do
   if ! grep -q -- "--- PASS: $name" "$LOG"; then
     echo "guitest-gtk: 没有看到 $name 的 PASS（测试被移走/改名/跳过？）" >&2
     exit 5
