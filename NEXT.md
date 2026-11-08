@@ -684,6 +684,12 @@ dbus-daemon 加 `Pdeathsig: SIGTERM`（GUI 被信号打死时私有总线跟着�
 - ~~`/dev/fuse` 不可用~~ **已解除**（2026-11-07 本机出现 `/dev/fuse`，fuse-overlayfs 1.18 / fusermount3 3.18）：
   `design/probe-smoke.sh` 已跑通整条真机链路。测试脚本自身曾有两处 fixture 缺陷（XDG 根放在假 HOME 之外、
   `run --audit` 的 flag 写在位置参数之后），已修。
+- **CI 首次实跑仍无法在本机确认**（2026-11-08）：`b41f8fa` 已推送，会触发 `ci.yml` 的
+  go/packages/html/gtk/gtk-arm 五个 job；本机没有 `gh` CLI 与 GitHub 凭据，未认证请求读不到
+  （仓库返回 404），所以打包能力仍是 `implemented`。到 GitHub UI 看首次结果，全绿后再升 `verified`；
+  红了就把失败 job 的日志带回来修，不要凭"YAML 解析通过"当运行证据。
+- **`LICENSE` 未定**：用户/法务决策（tech-stack 建议 GPL-3.0-or-later）。未确认前 nfpm 不写 license 字段、
+  仓库不放 `LICENSE`；这不阻塞 deb/rpm/Arch 出包，但会阻塞进发行版官方仓库与 AUR 正式包。
 - **strace 降级未用真实日志校准**：直接 `strace -f /bin/true` 可用，但产品内由 Go 以 `setsid` 起的
   `strace` 在本次外层 strace 环境下报 `PTRACE_TRACEME: Operation not permitted`——需要单独确认真实
   触发条件（是否与嵌套 tracer / 沙箱有关），再把 `ParseStrace` 与真实日志对齐。
