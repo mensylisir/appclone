@@ -609,12 +609,12 @@
     <b>Esc 三级语义</b>：确认框开着 → 只关确认框；探测页开着 → 关探测页（等同取消）；都没有 → <b>不做导航</b>（Esc 不是"返回"，返回走头栏「←」）。
   </div>
   <div class="annot" id="annot3">
-    <h4>屏3 · 探测页 — 四态与四组</h4>
+    <h4>屏3 · 探测页 — 四态与五组</h4>
     <table>
       <tr><td>承载</td><td>原生为 <span class="w">AdwNavigationView</span> 的 push 页（不是对话框）；本稿用遮罩对话框表达同一状态机</td></tr>
       <tr><td>闸门（探测前）</td><td>四道闸门跑在探测会话启动<b>之前</b>：bwrap 不可用 / 缺 fuse（降级不阻断）/ <b>目标应用还在运行</b> / 拿不到全局写锁。硬闸门失败<b>直接进 error 并带原因</b>，不启动会话</td></tr>
       <tr><td>探测中</td><td><span class="w">GtkSpinner</span> + 「正在跟踪写入…」+ <b>已发现 N 个写入条目</b>（流式递增）+ HeaderBar「取消探测」——<b>取消必给</b>，探测十秒到一分钟。措辞是"条目"不是"命中次数"：overlay 只知道"写过/删过"，拿不到次数</td></tr>
-      <tr><td>确认</td><td>四组：① 应用自身数据（可勾 <span class="w">AdwSwitchRow</span>，<b>缓存项也在这组</b>、默认不勾并标「缓存」）② 单例处理（可勾 <span class="w">AdwSwitchRow</span>：私有 runtime / 私有 DBus，<b>由检出的单例项驱动、没检出就不出现</b>；本稿用 <span class="w">app.singleton</span> 演示——firefox/chrome/notion 就没有这一组）<b>注意</b>：本稿把 <span class="w">~/.dingtalk</span>、<span class="w">~/.mozilla</span> 这类顶层点目录标成「配置」且默认勾选，<b>只是演示</b>；真实 L2 规则里它们是灰区、默认不勾（discover.md §5 第 5 条）。照抄会把用户自己放在点目录里的文件误判成应用数据。<br>③ <b>公共目录（强制共享）</b>：只读 <span class="w">AdwActionRow</span> + <span class="w">.dim-label</span>，<b>一律显示、不可勾</b> ④ <b>共享但可写（不隔离）</b>：只读，<b>并写清代价</b>（"两个分身的最近文件会混在一起"）——不说，用户遇到就判定产品坏了</td></tr>
+      <tr><td>确认</td><td>五组：① 应用自身数据（可勾 <span class="w">AdwSwitchRow</span>，<b>缓存项也在这组</b>、默认不勾并标「缓存」）② <b>数据来源</b>（可勾 <span class="w">AdwSwitchRow</span>「从现有应用数据克隆起步」，<b>默认关</b>；只更新档案的 rediscover 入口必须隐藏；缺 fuse-overlayfs 时禁用——拨了也不会生效）③ 单例处理（可勾 <span class="w">AdwSwitchRow</span>：私有 runtime / 私有 DBus，<b>由检出的单例项驱动、没检出就不出现</b>；本稿用 <span class="w">app.singleton</span> 演示——firefox/chrome/notion 就没有这一组）<b>注意</b>：本稿把 <span class="w">~/.dingtalk</span>、<span class="w">~/.mozilla</span> 这类顶层点目录标成「配置」且默认勾选，<b>只是演示</b>；真实 L2 规则里它们是灰区、默认不勾（discover.md §5 第 5 条）。照抄会把用户自己放在点目录里的文件误判成应用数据。<br>④ <b>公共目录（强制共享）</b>：只读 <span class="w">AdwActionRow</span> + <span class="w">.dim-label</span>，<b>一律显示、不可勾</b> ⑤ <b>共享但可写（不隔离）</b>：只读，<b>并写清代价</b>（"两个分身的最近文件会混在一起"）——不说，用户遇到就判定产品坏了</td></tr>
       <tr><td>创建中</td><td><b>独立第四态</b>，不是"confirm 里加个 flag"：写档案 + 建实例目录 + 生成 .desktop 是几百毫秒的事务，期间再点一次确认会<b>建出两个实例</b>；中途取消会留下"档案写了、实例没建成"的半成品。故：确认按钮变「正在创建…」并禁用，<b>取消也禁用</b>，Esc 同样不生效</td></tr>
       <tr><td>失败</td><td><span class="w">AdwStatusPage</span>：<b>按 Reason 分文案</b>——<code>app_running</code> / <code>env_unavailable</code> / <code>no_writes</code> / <code>public_dir_leak</code>，每类一条独立键与"下一步做什么"；<b>禁止所有失败共用一句"探测失败"</b>。「这次没有跟踪到任何写入」也走这一态，<b>不生成空档案</b></td></tr>
       <tr><td>确认按钮</td><td><span class="w">suggested-action</span>：创建分身（setup/reconfig/clone）/ 开启分身（open）/ 保存档案（rediscover）；<b>门禁只数「应用自身数据」</b>——只勾缓存或单例时仍禁用，否则会生成一个什么都不隔离的空档案；探测中与创建中该按钮不存在/不可用</td></tr>
@@ -736,6 +736,9 @@ let dlgMode = 'setup';   // setup=首次配置 | reconfig=重新配置（档案�
 /* probing → confirm → creating → done | error。creating 是独立态，不是"confirm 里加个 flag"：
    写档案 + 建目录 + 生成 .desktop 是几百毫秒的事务，期间再点一次确认就会建出两个实例 */
 let dlgState = 'probing';
+/* 克隆起步（方案设计 §8.1）：写时复制继承现有应用数据。默认关，与 CLI 不带
+   --fork 一致；只有真正建实例的入口才显示，且每次打开对话框重置。 */
+let forkOn = false;
 let probeReason = 'no_writes';   // error 态的原因，决定文案；所有失败共用一句"探测失败"等于没告诉用户任何事
 let probeTimer = null, probeTick = null, createTimer = null;
 let foundCount = 0;
@@ -1041,6 +1044,18 @@ function renderDialog() {
       ${cands.filter(p => p.chip === 'config').map(p => chk(p, 'config')).join('')}
       ${cands.filter(p => p.chip === 'cache').map(p => chk(p, 'cache')).join('')}
     </div>
+    ${dlgMode === 'rediscover' ? '' : `
+    <div class="dlg-group">
+      <div class="group-label">数据来源</div>
+      <label class="chkrow">
+        <input type="checkbox" data-fork ${forkOn ? 'checked' : ''}>
+        <span class="cb"></span>
+        <div class="tt">
+          <div class="path">从现有应用数据克隆起步</div>
+          <div class="why">写时复制继承当前应用数据，不复制文件，主实例数据不会被改动；需要 fuse-overlayfs。</div>
+        </div>
+      </label>
+    </div>`}
     ${a.singleton === false ? '' : `
     <div class="dlg-group">
       <div class="group-label">单例处理</div>
@@ -1060,7 +1075,7 @@ function renderDialog() {
       <div class="group-label">公共目录（强制共享）</div>
       ${publicDirs.map(d => `<div class="readonly-row"><span class="path">${d}</span><span class="shared-tag">始终共享</span></div>`).join('')}
     </div>
-    <!-- 第四组：共享但可写。和"公共目录"不是一回事——那组是"没有商量余地"，
+    <!-- 第五组：共享但可写。和"公共目录"不是一回事——那组是"没有商量余地"，
          这组是"商量过了，代价是这样"。代价不写在界面上，用户遇到"两个分身的最近文件混在一起"
          会判定产品坏了 -->
     <div class="dlg-group">
@@ -1131,6 +1146,7 @@ function openDialog(app, mode) {
     ? (app.hasProfile ? 'reconfig' : 'setup')   // 没档案退回「首次配置」，档案失效才叫「重新配置」
     : mode;
   $('#overlay').classList.add('open');
+  forkOn = false;
   /* 只有"从没配过"（setup）、"档案失效"（reconfig）、"重新探测"（rediscover）要真跑探测；
      open/clone 都复用现有档案——配过一次的应用每次重开都重跑探测是白花十秒到一分钟 */
   if (PROBE_MODES.has(dlgMode)) {
@@ -1294,19 +1310,22 @@ document.addEventListener('click', e => {
     /* 进 creating 态并把结果绑定到点击那一刻的 app/mode：
        setTimeout 执行时 currentApp 可能已经被下一次交互改掉，用它就会把实例建到别的应用下 */
     const app = currentApp, mode = dlgMode;
+    /* 绑定点击那一刻的 fork 选择：setTimeout 执行时对话框可能已被重绘 */
+    const forkNow = forkOn;
     /* id 取第一个空闲、显示名取第一个空闲「分身 N」——文档 §4 的口径，别在稿子里另造一套 */
     const newId = allocId(app), dispName = allocName(app);
     dlgState = 'creating';
     renderDialog();
     createTimer = setTimeout(() => {
-      app.instances.push({ id:newId, display_name:dispName, size:'8 MB', last:'刚刚', running:false });
+      app.instances.push({ id:newId, display_name:dispName, size:'8 MB', last:'刚刚', running:false, fork:forkNow });
       app.probeMethod = 'overlay';
       app.hasProfile = true; app.creatable = true;   // setup/reconfig/open/clone 走到这里，档案必然可用
-      toast(mode === 'setup' || mode === 'reconfig'
+      toast((mode === 'setup' || mode === 'reconfig'
         ? `已生成档案并创建「${app.name} · ${dispName}」（隔离 ${nIsolated} 个路径）`
         : mode === 'open'
           ? `已开启「${app.name} · ${dispName}」（复用原有档案，隔离 ${nIsolated} 个路径）`
-          : `已创建「${dispName}」（隔离 ${nIsolated} 个路径）`);
+          : `已创建「${dispName}」（隔离 ${nIsolated} 个路径）`)
+        + (forkNow ? '，已从现有数据克隆起步' : ''));
       /* 首次配置也落到详情页：用户此刻该看到刚建出来的实例（方案设计 §6.1，replace 而非 pop） */
       closeDialog(true); renderList();
       /* 建完把视图放回「分身」：返回时刚建出的实例就在眼前，
@@ -1424,6 +1443,7 @@ document.addEventListener('change', e => {
     }
     return;
   }
+  if (e.target.closest('[data-fork]')) { forkOn = e.target.checked; return; }
   if (e.target.closest('[data-chk]')) refreshConfirm();
 });
 /* GtkSearchEntry：按显示名与 desktop id 双字段过滤（方案设计 §6.1.1）。

@@ -118,7 +118,7 @@ func (v *detailView) popped() {
 func (u *ui) nameOf(key string) string {
 	for _, a := range u.apps {
 		if a.Key == key {
-			return a.Name
+			return appDisplayName(a)
 		}
 	}
 	return key

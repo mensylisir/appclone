@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # guitest-gtk.sh —— GTK 侧回归（真实 GTK/libadwaita，不用合成输入）。
 #
-# 与 design/guitest.js 的分工：那个验 HTML 设计稿的交互语义（60 项），
+# 与 design/guitest.js 的分工：那个验 HTML 设计稿的交互语义（项数见其 EXPECTED），
 # 这个验 **GTK 实现**的页面生命周期与回调路径：列表渲染 → 配置确认 →
 # 创建实例 → 详情 → 返回，全程走产品自己的信号处理函数。
 #
@@ -64,7 +64,9 @@ fi
 for name in TestGtkScreensLifecycle TestGtkLandsOnClonesView TestGtkEmptyStateMapped \
             TestGtkSetupStates TestGtkErrorState TestGtkRetryableError \
             TestGtkRapidRepush TestGtkFatalBanner TestGtkEnglishStrings \
-            TestGtkDetailShowsStopWhenRunning TestDetachedRunnerSpawn \
+            TestGtkDetailShowsStopWhenRunning TestGtkForkTogglePersists \
+            TestGtkForkDisabledWhenDegraded TestGtkAppIconFallback \
+            TestDetachedRunnerSpawn \
             TestDetachLogHelpers TestDetachedTargetEnv; do
   if ! grep -q -- "--- PASS: $name" "$LOG"; then
     echo "guitest-gtk: 没有看到 $name 的 PASS（测试被移走/改名/跳过？）" >&2

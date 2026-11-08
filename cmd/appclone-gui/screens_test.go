@@ -46,6 +46,18 @@ func (noFuseMounter) Mount(string, string, string, string) (func() error, error)
 	return nil, errors.New("gtk e2e：不做挂载")
 }
 
+// availableMounter：自检报告 fuse 可用、但从不真的挂载。用于"开关必须
+// 可拨"的用例——noFuseMounter 会让界面进入降级态并按设计禁用克隆开关，
+// 用例再去拨它就成了和产品规则对抗（自检晚到的 SetSensitive 还会造成偶发
+// 回弹）。降级禁用由 TestGtkForkDisabledWhenDegraded 单独覆盖。
+type availableMounter struct{}
+
+func (availableMounter) Available() error { return nil }
+
+func (availableMounter) Mount(string, string, string, string) (func() error, error) {
+	return nil, errors.New("gtk e2e：不做挂载")
+}
+
 // gtkTestEnv 建一套隔离的假 HOME / XDG / AC_BASE，返回 Env 和只属于本次
 // 测试的 .desktop 目录。
 //
@@ -1439,6 +1451,293 @@ func TestGtkDetailShowsStopWhenRunning(t *testing.T) {
 	}
 	if !activated {
 		t.Fatal("activate 没有执行")
+	}
+}
+
+// TestGtkForkTogglePersists（§8.1/ADR-029）：确认页的数据来源开关默认关，
+// 打开后建出的实例必须把 fork 写进 instance.toml——开关只在界面上亮着、
+// 没进 CreateOptions 的话，用户以为克隆了、实际拿到空分身。
+func TestGtkForkTogglePersists(t *testing.T) {
+	env, appsDir := gtkTestEnv(t, "fork")
+	// 降级态按设计禁用克隆开关；本用例验的是开关接线，给一个"fuse 可用"的
+	// 自检结果（不会真的挂载）。
+	env.Mounter = availableMounter{}
+	if err := os.WriteFile(filepath.Join(appsDir, "demo.desktop"),
+		[]byte("[Desktop Entry]\nType=Application\nName=Demo\nExec=/usr/bin/true\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	profile := core.Profile{
+		App: "demo", Version: core.ProfileVersion, Exec: "/usr/bin/true",
+		Paths: []string{"~/.config/Demo"}, ProbeMethod: "manual",
+		Ignored: core.DefaultIgnored(), Env: map[string]string{},
+	}
+	if err := env.SaveProfile(profile); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := env.LoadProfile("demo"); err != nil {
+		t.Fatalf("测试预置档案读不回来：%v", err)
+	}
+	// 建实例要生成 .desktop 的 Exec，找不到 CLI 会报 create 失败。
+	env.CliPath = "/usr/bin/appclone"
+
+	app := adw.NewApplication("io.github.mensylisir.Appclone.GtkFork",
+		gio.GApplicationNonUniqueValue)
+	defer app.Unref()
+
+	u := &ui{app: app, env: env, lang: "zh_CN"}
+	var runErr error
+	activated := false
+	fail := func(format string, a ...any) {
+		if runErr == nil {
+			runErr = fmt.Errorf(format, a...)
+		}
+		app.Quit()
+	}
+	opened, submitted := false, false
+	actcb := func(_ gio.Application) {
+		if u.win != nil {
+			return
+		}
+		activated = true
+		u.buildWindow()
+		deadline := time.Now().Add(20 * time.Second)
+		var tick glib.SourceFunc
+		tick = func(uintptr) bool {
+			if time.Now().After(deadline) {
+				state, desc := "<nil>", ""
+				if v := u.activeSetup; v != nil {
+					state = v.state
+					if v.errPage != nil {
+						desc = v.errPage.GetTitle() + " / " + v.errPage.GetDescription()
+					}
+				}
+				fail("等克隆起步开关/实例落盘超时（loaded=%v setupState=%s desc=%q）", u.loaded, state, desc)
+				return false
+			}
+			if !u.loaded {
+				return true
+			}
+			if !opened {
+				opened = true
+				// open 入口复用档案、跳过探测，直接进确认页。
+				if !u.pushSetup("demo", "open", func(bool) {}) {
+					fail("pushSetup 被拒绝")
+					return false
+				}
+				return true
+			}
+			v := u.activeSetup
+			if !submitted {
+				if v == nil || v.state != "confirm" {
+					return true
+				}
+				if v.forkRow == nil {
+					fail("建实例的确认页必须显示数据来源开关")
+					return false
+				}
+				// 行必须真在控件树上：只建对象不 Add，SetActive 照样能改值、
+				// instance.toml 也照样写 fork=true，用户却看不到这个开关。
+				if p := v.forkRow.GetParent(); p == nil {
+					fail("数据来源开关没有挂进确认页（group.Add 漏了？）")
+					return false
+				} else {
+					p.Unref()
+				}
+				if v.forkRow.GetActive() {
+					fail("克隆起步默认应为关（与 CLI 默认一致）")
+					return false
+				}
+				v.forkRow.SetActive(true)
+				if !v.fork {
+					fail("开关 notify 没有接到 v.fork")
+					return false
+				}
+				// rediscover 只更新档案、不建实例：同一份确认页按这个 mode 重渲染
+				// 时开关必须消失（否则用户拨了它，最终什么都没发生）。
+				v.mode = "rediscover"
+				v.renderConfirm()
+				if v.forkRow != nil {
+					fail("rediscover 确认页不该出现数据来源开关")
+					return false
+				}
+				v.mode = "open"
+				v.renderConfirm()
+				if v.forkRow == nil || !v.forkRow.GetActive() {
+					fail("回到建实例入口后，数据来源开关应恢复且保持已勾选")
+					return false
+				}
+				v.submit()
+				submitted = true
+				return true
+			}
+			in, err := env.GetInstance("demo", "main")
+			if err != nil {
+				return true // 事务还没落盘
+			}
+			if !in.Fork {
+				fail("开关打开了，但 instance.toml 没有 fork=true")
+				return false
+			}
+			app.Quit()
+			return false
+		}
+		glib.TimeoutAdd(50, &tick, 0)
+	}
+	app.ConnectActivate(&actcb)
+	u.hold(&actcb)
+
+	if code := app.Run(1, os.Args[:1]); code != 0 {
+		t.Fatalf("GTK 主循环退出码 %d", code)
+	}
+	if runErr != nil {
+		t.Fatal(runErr)
+	}
+	if !activated {
+		t.Fatal("activate 没有执行")
+	}
+}
+
+// TestGtkForkDisabledWhenDegraded：缺 fuse-overlayfs 时「数据来源」开关必须
+// 禁用。允许拨动等于让用户相信克隆已生效，而 run 期每个路径都会降级跳过，
+// 最终得到一个空实例。判据是自检结果（noFuseMounter → degraded），不是渲染
+// 时刻的巧合；用例等 envChecked 再判定。
+func TestGtkForkDisabledWhenDegraded(t *testing.T) {
+	env, appsDir := gtkTestEnv(t, "forkdegraded")
+	env.Mounter = noFuseMounter{}
+	if err := os.WriteFile(filepath.Join(appsDir, "demo.desktop"),
+		[]byte("[Desktop Entry]\nType=Application\nName=Demo\nExec=/usr/bin/true\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := env.SaveProfile(core.Profile{
+		App: "demo", Version: core.ProfileVersion, Exec: "/usr/bin/true",
+		Paths: []string{"~/.config/Demo"}, ProbeMethod: "manual",
+		Ignored: core.DefaultIgnored(), Env: map[string]string{},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	env.CliPath = "/usr/bin/appclone"
+
+	app := adw.NewApplication("io.github.mensylisir.Appclone.GtkForkDegraded",
+		gio.GApplicationNonUniqueValue)
+	defer app.Unref()
+
+	u := &ui{app: app, env: env, lang: "zh_CN"}
+	var runErr error
+	activated, opened := false, false
+	fail := func(format string, a ...any) {
+		if runErr == nil {
+			runErr = fmt.Errorf(format, a...)
+		}
+		app.Quit()
+	}
+	actcb := func(_ gio.Application) {
+		if u.win != nil {
+			return
+		}
+		activated = true
+		u.buildWindow()
+		deadline := time.Now().Add(20 * time.Second)
+		var tick glib.SourceFunc
+		tick = func(uintptr) bool {
+			if time.Now().After(deadline) {
+				fail("等待降级自检/确认页超时（loaded=%v envChecked=%v）", u.loaded, u.envChecked)
+				return false
+			}
+			if !u.loaded || !u.envChecked {
+				return true
+			}
+			if !opened {
+				opened = true
+				if !u.pushSetup("demo", "open", func(bool) {}) {
+					fail("pushSetup 被拒绝")
+					return false
+				}
+				return true
+			}
+			v := u.activeSetup
+			if v == nil || v.state != "confirm" {
+				return true
+			}
+			if v.forkRow == nil {
+				fail("确认页没有数据来源开关")
+				return false
+			}
+			if v.forkRow.GetSensitive() {
+				fail("缺 fuse-overlayfs（降级态）时克隆起步开关必须禁用")
+				return false
+			}
+			app.Quit()
+			return false
+		}
+		glib.TimeoutAdd(50, &tick, 0)
+	}
+	app.ConnectActivate(&actcb)
+	u.hold(&actcb)
+
+	if code := app.Run(1, os.Args[:1]); code != 0 {
+		t.Fatalf("GTK 主循环退出码 %d", code)
+	}
+	if runErr != nil {
+		t.Fatal(runErr)
+	}
+	if !activated {
+		t.Fatal("activate 没有执行")
+	}
+}
+
+// TestGtkAppIconFallback（用户反馈"无图标的应用太丑"）：.desktop 没写 Icon、
+// 或写的绝对路径已不存在时，行前缀必须退回首字母头像，而不是一张空图或
+// 千篇一律的通用图标。用例直接调用 appIcon（真实构造 AdwAvatar/GtkImage），
+// 钉住三条判定（空值、缺失路径、未知主题名）与首字母提取。
+func TestGtkAppIconFallback(t *testing.T) {
+	if os.Getenv("APPCLONE_GTK_TEST") != "1" {
+		t.Skip("GTK 回归需要显式开关：design/guitest-gtk.sh")
+	}
+	if os.Getenv("DISPLAY") == "" && os.Getenv("WAYLAND_DISPLAY") == "" {
+		t.Skip("没有可用的显示（DISPLAY / WAYLAND_DISPLAY）")
+	}
+	gtk.Init()
+	u := &ui{lang: "zh_CN"}
+	dir := t.TempDir()
+	real := filepath.Join(dir, "real.png")
+	if err := os.WriteFile(real, []byte("not-a-real-image-but-exists"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	missing := filepath.Join(dir, "not-there.png")
+	for _, tc := range []struct {
+		icon      string
+		wantFallb bool
+	}{
+		{"", true},                     // 没写 Icon
+		{missing, true},                // 绝对路径但文件没了
+		{"ac-test-no-such-icon", true}, // 主题里没有这个名字
+		{real, false},                  // 存在的绝对路径
+	} {
+		w, fallback := u.appIcon(tc.icon, "微信", 32)
+		if w == nil {
+			t.Fatalf("appIcon(%q) 返回了 nil 控件", tc.icon)
+		}
+		if fallback != tc.wantFallb {
+			t.Errorf("appIcon(%q) fallback=%v，想要 %v（主题名必须过 HasIcon、路径必须存在）", tc.icon, fallback, tc.wantFallb)
+		}
+		w.Unref()
+	}
+	if _, ok := u.iconImage("ac-test-no-such-icon"); ok {
+		t.Fatal("主题里不存在的图标名不该被判为可用")
+	}
+	for name, want := range map[string]string{
+		"demo": "D", " demo": "D", "微信": "微", "7-Zip": "7", "  ": "?", "": "?",
+	} {
+		if got := avatarInitial(name); got != want {
+			t.Errorf("avatarInitial(%q) = %q，想要 %q", name, got, want)
+		}
+	}
+	// 空 Name 的 .desktop 也不能渲染成一条空白行：显示 desktop id。
+	if got := appDisplayName(core.App{Key: "weird.app"}); got != "weird.app" {
+		t.Errorf("空 Name 应回退到 key，得到 %q", got)
+	}
+	if got := appDisplayName(core.App{Key: "wechat", Name: "微信"}); got != "微信" {
+		t.Errorf("有 Name 时不得改写：%q", got)
 	}
 }
 

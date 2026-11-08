@@ -47,6 +47,10 @@ type setupView struct {
 	lockRow     *adw.SwitchRow
 	dbusRow     *adw.SwitchRow
 	runtimeRow  *adw.SwitchRow
+	// forkRow 是「从现有应用数据克隆起步」开关（§8.1）。默认关，与 CLI
+	// `add` 不带 --fork 的默认一致；只有真正建实例的入口才出现。
+	forkRow *adw.SwitchRow
+	fork    bool
 
 	profile core.Profile
 	cands   []core.Candidate
@@ -156,12 +160,10 @@ func (v *setupView) build() {
 	v.spinner.SetHalign(gtk.AlignCenterValue)
 	v.fixed.own(&v.spinner.Widget)
 	// 探测要等十秒到一分钟，页面上先放应用图标，用户一眼确认在等谁。
-	if icon := v.u.iconOf(v.appKey); icon != "" {
-		img := v.u.appIcon(icon)
-		img.SetPixelSize(64)
-		v.fixed.own(&img.Widget)
-		probing.Append(&img.Widget)
-	}
+	// 没有图标的应用也显示首字母色块：空白比通用图标更让人怀疑「是不是选错了应用」。
+	img, _ := v.u.appIcon(v.u.iconOf(v.appKey), v.appName(), 64)
+	v.fixed.own(img)
+	probing.Append(img)
 	ptitle := gtk.NewLabel(v.u.tr("ui.setup.probing.title", map[string]any{"name": v.appName()}))
 	ptitle.SetWrap(true)
 	ptitle.SetHalign(gtk.AlignCenterValue)
@@ -249,7 +251,7 @@ func (v *setupView) build() {
 func (v *setupView) appName() string {
 	for _, a := range v.u.apps {
 		if a.Key == v.appKey {
-			return a.Name
+			return appDisplayName(a)
 		}
 	}
 	return v.appKey
@@ -630,6 +632,7 @@ func (v *setupView) renderConfirm() {
 	v.lockRow = nil
 	v.dbusRow = nil
 	v.runtimeRow = nil
+	v.forkRow = nil
 
 	own := adw.NewPreferencesGroup()
 	v.scope.own(&own.Widget)
@@ -673,6 +676,27 @@ func (v *setupView) renderConfirm() {
 		own.Add(&row.Widget)
 	}
 	pg.Add(own)
+
+	// 数据来源（§8.1）：只有真正建实例的入口才出现。「重新探测」只写档案，
+	// 没有实例可承载 fork，不能给一个开了也不生效的开关。
+	if v.mode != "rediscover" {
+		fg := adw.NewPreferencesGroup()
+		v.scope.own(&fg.Widget)
+		fg.SetTitle(v.u.tr("ui.setup.group.source", nil))
+		fr := adw.NewSwitchRow()
+		v.scope.own(&fr.Widget)
+		fr.SetTitle(v.u.tr("ui.setup.row.fork.title", nil))
+		fr.SetSubtitle(v.u.tr("ui.setup.row.fork.subtitle", nil))
+		fr.SetActive(v.fork)
+		// 缺 fuse-overlayfs 时 fork 不会生效（run 期每个路径都降级跳过），
+		// 摆一个能拨的开关等于"看起来生效、实际建了个空实例"——与 rediscover
+		// 隐藏开关同一条原则。降级横幅已经解释了原因。
+		fr.SetSensitive(!v.u.degraded)
+		v.forkRow = fr
+		v.scope.switchRow(fr, func() { v.fork = fr.GetActive() })
+		fg.Add(&fr.Widget)
+		pg.Add(fg)
+	}
 
 	// 单例处理：由检出的单例项驱动（锁文件 / 私有 DBus / 私有 runtime），
 	// 一项都没检出就不出现——不弹一个没有开关内容的分组。
@@ -883,6 +907,10 @@ func (v *setupView) createInstance(p core.Profile) {
 	}
 	v.setState("creating")
 	v.hold()
+	// 在主线程快照选择：开关动画结束会补发一次 notify::active，写入 v.fork；
+	// goroutine 里直接读会与该写入构成数据竞争（-race 可检出）。这份语义是
+	// "提交那一刻的选择"，重试重新进 createInstance 会取到当前值。
+	fork := v.fork
 	go func() {
 		ctx := context.Background()
 		st, err := v.u.env.OpenState(ctx, 5*time.Second)
@@ -891,7 +919,9 @@ func (v *setupView) createInstance(p core.Profile) {
 		}
 		var cerr error
 		if err == nil {
-			_, cerr = v.u.env.CreateInstance(ctx, v.appKey, p, "")
+			// Fork 在建实例时定死（数据层来源不是每次运行的开关）；重试沿用
+			// 同一页面的选择，不会因为确认页已退场而读到零值。
+			_, cerr = v.u.env.CreateInstanceWith(ctx, v.appKey, p, "", core.CreateOptions{Fork: fork})
 		} else {
 			cerr = err
 		}

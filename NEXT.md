@@ -364,6 +364,50 @@ GTK 闸门补结构断言：无实例时 `GetVisibleChildName()=="all"`、创建
   `design/appclone-gui.html` 的确认页（加"继承现有数据"开关）+ `guitest.js` + GTK 用例，
   工作包比 core 大，留到下一轮；`STATUS` 已按"CLI 已验证、GUI 未覆盖"如实标注。
 
+**第四十轮：GUI 克隆起步入口 + 无图标应用的首字母头像**（2026-11-08）。用户反馈"无图标的应用太丑"。
+- **确认页新增「数据来源」组**：`AdwSwitchRow`「从现有数据克隆起步」，默认关，只在本入口
+  真要建实例时出现（setup/open/clone）；`rediscover` 只更新档案、不建实例，开关必须隐藏——
+  否则拨了看起来生效、实际什么都没发生。提交时走
+  `core.CreateInstanceWith(..., CreateOptions{Fork: v.fork})`，与 CLI `--fork` 写同一个
+  `instance.toml` 字段，两端默认一致（都不 fork）。文案（zh/en）说明"不复制文件；分身写过的
+  数据只影响自己"，不把 overlay 细节丢给用户。
+- **无图标应用改首字母头像**：`Icon` 是主题名时先过 `GtkIconTheme.HasIcon`，是绝对路径时
+  必须真实存在；取不到改 `AdwAvatar`（首字符转大写、空名 `?`），不再退化到
+  `application-x-executable`——通用图标看起来像加载失败，30 行列表全是它等于没有区分度。
+  列表行 32px、探测中页 64px 共用同一判定；设计稿本来就是字母色块（`.appicon`/`.insticon`），
+  现在 GTK 侧终于与基线一致。中文名取首字（`微信` → `微`）。
+- **交互基线同步**：`design/appclone-gui.html` 确认页加「数据来源」勾选组（`data-fork`），
+  创建出的实例带 `fork` 标记，toast 补"已从现有数据克隆起步"；rediscover 页面不得出现该组。
+  `design/guitest.js` 58 → **62 项**（默认关/拨开、实例 fork 标记、rediscover 不显示）。
+- **GTK 闸门**：新增 `TestGtkForkTogglePersists`（默认关 → `SetActive(true)` 经真实 notify
+  接到 `v.fork` → 提交 → `instance.toml fork=true`；只做个装饰性开关会由断言立即判红）与
+  `TestGtkAppIconFallback`（空 `Icon`/不存在的绝对路径不得判为可用；中文取首字、拉丁转大写、
+  空名 `?`）。`design/guitest-gtk.sh` 13 → **16 条 PASS**（另加 `TestGtkForkDisabledWhenDegraded`：降级态下开关必须禁用）。
+- 文档同步：`方案设计.md` §6.1 确认页补「数据来源」组与 rediscover 隐藏规则；
+  `tech-stack.md` §4.5 行图标回退改为 `AdwAvatar` 首字母色块。
+- **只读复审 REJECTED 后的修复**（无 P0/P1，5 条 P2 + 5 条 P3）：
+  ① 创建 goroutine 直接读 `v.fork` 与开关动画结束补发的 notify 构成数据竞争——
+     改为在主线程快照 `fork := v.fork` 再进 goroutine（`-race` 可复现）；
+  ② 开关测试只建对象不断言上树——补 `GetParent()!=nil`；否则漏 `group.Add` 时
+     用户看不到开关、`instance.toml` 却照样写 `fork=true`，测试仍绿；
+  ③ 图标测试没调用 `appIcon`/没覆盖主题分支——`appIcon` 返回 `fallback bool`，
+     测试在 `gtk.Init()` 后断言空 Icon、缺失路径、不存在的主题名都退回，存在文件
+     不退，并直接断言 `iconImage(不存在的主题名)==false`（去掉 `HasIcon` 检查会红）；
+  ④ 稿子注释仍写「四态与四组」、`tech-stack` §4.5 确认态映射漏了「数据来源」——
+     两者同步为五组并写明默认关/rediscover 隐藏/fuse 缺失禁用；
+  ⑤ 缺 fuse-overlayfs 时开关仍可拨（run 期会降级成空实例）——改为 `SetSensitive(false)`，
+     降级横幅已有原因；rediscover 隐藏分支补 GTK 断言（同一确认页按 mode 重渲染）。
+  P3 顺手收口：`DisplayGetDefault`/`IconThemeGetForDisplay` 包装的 `IncreaseRef` 用完
+  `Unref`；§6.1 副标题与模式列表对齐实现（subtitle 用消息表原文、含 reconfig）；
+  各处「60 项」计数改为以 `EXPECTED` 为准；**并加 `appDisplayName` 兜底**——`.desktop`
+  的 `Name` 解不出来时行标题/头像用 desktop id，任何情况下都不会出现一条既无图标
+  又无名字的空白行（用户反馈的空白行在本机 273 个 .desktop 里没有对应项，见下方说明）。
+- 证据：`gofmt -l .` 空、`go vet ./...` 与 `go vet -tags gtk_e2e` 干净、
+  `go test -count=1 ./...` 全绿、`go test -race ./core/... ./cmd/appclone` 绿、
+  `CGO_ENABLED=0 go build ./...` 通过、`node design/guitest.js` **62/62**、
+  `design/guitest-gtk.sh` **16/16 PASS**（约 4.6s，退出码 0）；
+  另以 `CGO_ENABLED=1 -race -tags gtk_e2e` 单跑 Fork/图标两用例通过（数据竞争修复有实测）。
+
 **第三十八轮：GUI 分身生命周期解耦（ADR-028）**（2026-11-08）。用户拍板：**分离运行 + 停止按钮**。
 - GUI 点「启动」不再在自己的进程里跑 `core.Run`，而是以自身二进制 fork 一个会话首进程（runner，
   `APPCLONE_GUI_DETACH_APP/ID` + `Setsid`）；runner 在 GTK 初始化前分流，复用与 CLI 同一条
@@ -510,11 +554,11 @@ dbus-daemon 加 `Pdeathsig: SIGTERM`（GUI 被信号打死时私有总线跟着�
 2. ~~`core` 其余部分~~ **已完成**（`BuildBwrapArgs` 纯函数 + 单测、档案 TOML、实例 CRUD、`id`/`display_name` 校验）
 3. ~~CLI MVP~~ **已完成**（`add/run/list/rm/doctor/repair-desktop/version`）
    ~~路线图 6：`add --fork`~~ **已完成（2026-11-08，第三十九轮，ADR-029）**：CLI 侧
-   `add --fork` + 运行期 per-path overlay + stale 挂载回收已真机验证；GUI 入口待接。
+   `add --fork` + 运行期 per-path overlay + stale 挂载回收已真机验证；GUI 确认页入口见第四十轮。
 4. `cmd/appclone-gui`（puregotk + libadwaita 三屏，控件映射见 `tech-stack.md` §4.5）。
    **v1 三屏已落地并通过两轮实现审查修复**（2026-11-08，见第二十八～三十轮；STATUS = `implemented`）。剩余：
    ① ~~**GTK 侧回归闸门**~~ **已落地（2026-11-08，第三十七轮补齐三屏四态 + 横幅/致命态）**：
-      `design/guitest-gtk.sh` + `cmd/appclone-gui/screens_test.go`（9 条用例）。
+      `design/guitest-gtk.sh` + `cmd/appclone-gui/screens_test.go`（2026-11-08 第四十轮起 15 条用例）。
       剩余：删除/重命名/关闭开关对话框、探测中取消之外的输入注入（需要可编程对话框响应
       或真实指针/键盘事件）；
    ② ~~GUI 与 CLI 的 setup 编排去重~~ **已完成**（2026-11-08，`core.FinalizeProbe`，见第三十三轮）；
@@ -564,6 +608,10 @@ dbus-daemon 加 `Pdeathsig: SIGTERM`（GUI 被信号打死时私有总线跟着�
 
 ## 最近完成
 
+- 2026-11-08 **第四十轮：GUI 克隆起步入口 + 无图标首字母头像**：确认页「数据来源」开关
+  （默认关、rediscover 隐藏）把 `--fork` 接进 GUI；无图标应用退 `AdwAvatar` 首字母色块
+  （列表 32px / 探测中 64px），不再用 `application-x-executable`。HTML 基线 62/62、
+  GTK 闸门 15/15（新增开关持久化与图标回退判定）。证据见第四十轮。
 - 2026-11-08 **第三十九轮：克隆起步 `add --fork`（ADR-029）+ 窗口默认 880×720**：
   运行期 per-path `fuse-overlayfs`（lower=宿主数据、upper=实例 root、merged bind 给 bwrap），
   空/缺失路径跳过、失败降级不阻断启动、SIGKILL 残留按 mountinfo 先卸后删；真机冒烟证明

@@ -1,13 +1,13 @@
-// 交互回归（60 项）：三屏 + 探测四态（probing/confirm/creating/error）+ 五入口 + 三处破坏性确认
+// 交互回归（62 项）：三屏 + 探测四态（probing/confirm/creating/error）+ 五入口 + 三处破坏性确认
 //                    + 门禁 + 搜索 + 横幅语义 + 空态可达性 + 运行/停止状态
-// 运行：node design/guitest.js        （退出码 0 = 60/60，非 0 = 设计基线被破坏）
+// 运行：node design/guitest.js        （退出码 0 = EXPECTED 全过，非 0 = 设计基线被破坏）
 // 依赖：任一本机 Chromium + puppeteer-core；路径可用环境变量覆盖：
 //   CHROMIUM=/path/to/chromium  PUPPETEER_CORE=/path/to/puppeteer-core
 const path = require('path');
 const fs = require('fs');
 const { pathToFileURL } = require('url');
 
-const EXPECTED = 60;   // 断言总数；改动断言必须同步改这里（否则退出码永远是 1）
+const EXPECTED = 62;   // 断言总数；改动断言必须同步改这里（否则退出码永远是 1）
 
 function loadPuppeteer() {
   const cands = [
@@ -180,7 +180,7 @@ const pp = loadPuppeteer();
       return rows.length > 0 && rows.every(r => /\d+ 个写入条目/.test(r.textContent))
         && !document.querySelector('#dlgBody').textContent.includes('命中');
     }); });
-  /* 第四组「共享但可写」：档案字段 shared_writes 的界面可见性。
+  /* 第五组「共享但可写」：档案字段 shared_writes 的界面可见性。
      代价（两个分身的最近文件会混）不写出来，用户遇到就判定产品坏了 */
   await t('共享但可写组存在、只读、且写清代价', async () => {
     return ev(() => {
@@ -208,6 +208,18 @@ const pp = loadPuppeteer();
   await t('恢复勾选 → 确认可用', async () => {
     return ev(() => { document.querySelectorAll('[data-chk]').forEach(c => { if(!c.checked) c.click(); });
       return !document.querySelector('#dlgConfirm').disabled; }); });
+  /* 数据来源（方案设计 §8.1）：默认关（与 CLI 不带 --fork 一致），用户显式开启才
+     从现有数据克隆；只有建实例的入口出现，重新探测没有它 */
+  await t('数据来源 → 克隆起步开关默认关、可开启', async () => {
+    const r = await ev(() => {
+      const f = document.querySelector('[data-fork]');
+      if (!f) return 'missing';
+      if (f.checked) return 'default-on';
+      f.click();
+      return f.checked && document.querySelector('#dlgBody').textContent.includes('写时复制');
+    });
+    return r === true || '克隆起步开关异常：' + r;
+  });
   /* creating 是独立第四态：写档案 + 建目录 + 生成 .desktop 几百毫秒，
      期间再点一次确认就会建出两个实例，而中途取消会留下"档案写了、实例没建成"的半成品 */
   await t('确认 → creating 态（按钮「正在创建…」、确认与取消都禁用）', async () => {
@@ -246,6 +258,13 @@ const pp = loadPuppeteer();
     return ev(() => !!document.querySelector('#scr2').offsetParent
               && document.querySelector('#hbTitle').textContent === '钉钉'
               && document.querySelector('#instBox').textContent.includes('分身 1')); });
+
+  await t('开启克隆起步后创建的实例带 fork 标记', async () => {
+    return ev(() => {
+      const a = apps.find(x => x.name === '钉钉');
+      return !!a && a.instances.length === 1 && a.instances[0].fork === true;
+    });
+  });
 
   // —— 屏1 搜索（397 个应用的入场券）——
   await t('搜索过滤「微」→ 未匹配的从所有应用组消失', async () => {
@@ -544,6 +563,8 @@ const pp = loadPuppeteer();
       && document.querySelector('#dlgCancel').textContent.includes('取消探测'));
     if (!head) return '标题或探测中态不对：' + await textOf('#dlgTitle');
     await waitFor(() => !!document.querySelector('[data-chk]'));
+    /* 重新探测只写档案、不建实例：fork 无处落地，不能给一个开了也不生效的开关 */
+    if (await ev(() => !!document.querySelector('[data-fork]'))) return '重新探测不该出现数据来源开关';
     const label = await textOf('#dlgConfirm');
     if (label !== '保存档案') return '确认按钮应为「保存档案」，实际：' + label;
     await click('#dlgConfirm');

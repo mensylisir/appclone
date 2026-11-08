@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 
 	"codeberg.org/puregotk/puregotk/v4/adw"
 	"codeberg.org/puregotk/puregotk/v4/gdk"
@@ -456,6 +457,17 @@ func (u *ui) checkEnv() {
 			u.fatal = bwrapErr != nil
 			u.degraded = bwrapErr == nil && fuseErr != nil
 			u.applyEnvBanners()
+			// 确认页可能先于自检落地（open/clone 直接进确认态）：开关的
+			// 可用性不能只在渲染那一刻取快照。环境变化时同步一次；降级
+			// 后已勾选的克隆起步一并撤销——它此刻不可能生效，留着只会
+			// 让用户在不知情的情况下得到一个空实例。
+			if v := u.activeSetup; v != nil && v.forkRow != nil {
+				if u.degraded && v.fork {
+					v.fork = false
+					v.forkRow.SetActive(false)
+				}
+				v.forkRow.SetSensitive(!u.degraded)
+			}
 			if wasFatal != u.fatal {
 				// 只有可操作性变了才重建列表：每 30 秒无条件重建会打断滚动与焦点。
 				u.renderList()
@@ -484,26 +496,65 @@ func (u *ui) allocText(p string) string {
 	return p
 }
 
-// appIcon 把 .desktop 的 Icon 值变成列表行前缀图标。Icon 规范允许主题名
-// 或绝对路径，两种都要认；都取不到时退到通用应用图标，不让一行应用因为
-// 图标缺失而消失。
-func (u *ui) appIcon(icon string) *gtk.Image {
-	var img *gtk.Image
+// appIcon 把 .desktop 的 Icon 值变成行前缀。Icon 规范允许主题名或绝对
+// 路径，两种都要认。
+//
+// 取不到时不再用 application-x-executable：一堆应用共用同一个灰色可执行
+// 文件图标，30 行看起来像同一行，用户也分不清谁是谁。改用 AdwAvatar 的
+// 首字母色块——libadwaita 原生组件，颜色由文本稳定派生，既区分应用，也
+// 不会把缺失画成破图占位。
+// 第二个返回值表示是否退回首字母头像（fallback）：调用方不需要，但它是
+// GTK 闸门唯一能在不依赖像素/类型自省的情况下钉住回退分支的出口。
+func (u *ui) appIcon(icon, name string, size int32) (*gtk.Widget, bool) {
+	if img, ok := u.iconImage(icon); ok {
+		img.SetPixelSize(size)
+		img.SetValign(gtk.AlignCenterValue)
+		return &img.Widget, false
+	}
+	av := adw.NewAvatar(size, avatarInitial(name), true)
+	av.SetValign(gtk.AlignCenterValue)
+	return &av.Widget, true
+}
+
+// iconImage 只在图标真的能取到时返回 Image：主题名先过 IconTheme.HasIcon，
+// 否则 GTK 会画一个破图，比没有图标更难看。
+func (u *ui) iconImage(icon string) (*gtk.Image, bool) {
 	switch {
 	case icon == "":
-		img = gtk.NewImageFromIconName("application-x-executable")
+		return nil, false
 	case filepath.IsAbs(icon):
-		if _, err := os.Stat(icon); err == nil {
-			img = gtk.NewImageFromFile(icon)
-		} else {
-			img = gtk.NewImageFromIconName("application-x-executable")
+		if _, err := os.Stat(icon); err != nil {
+			return nil, false
 		}
+		return gtk.NewImageFromFile(icon), true
 	default:
-		img = gtk.NewImageFromIconName(icon)
+		// DisplayGetDefault / IconThemeGetForDisplay 都给返回的包装 IncreaseRef，
+		// 按本项目所有权纪律用完必须 Unref（它们是 per-display 单例，不 Unref
+		// 不会泄漏对象本身，但引用计数会一直涨）。
+		display := gdk.DisplayGetDefault()
+		if display == nil {
+			return nil, false
+		}
+		defer display.Unref()
+		theme := gtk.IconThemeGetForDisplay(display)
+		if theme == nil {
+			return nil, false
+		}
+		defer theme.Unref()
+		if !theme.HasIcon(icon) {
+			return nil, false
+		}
+		return gtk.NewImageFromIconName(icon), true
 	}
-	img.SetPixelSize(32)
-	img.SetValign(gtk.AlignCenterValue)
-	return img
+}
+
+// avatarInitial 给出头像里的一个字：中文取首字，拉丁字母转大写。
+// 名字为空（理论上不会发生）时用「?」，不让 Avatar 退化成空白圆。
+func avatarInitial(name string) string {
+	for _, r := range strings.TrimSpace(name) {
+		return string(unicode.ToUpper(r))
+	}
+	return "?"
 }
 
 // iconOf 按应用 key 找 Icon，供探测页显示"正在跟踪谁"。
@@ -806,19 +857,29 @@ func (u *ui) moreRow(title string, sc *renderScope) *adw.ActionRow {
 	return row
 }
 
+// appDisplayName 保证列表行永远有字可显示。.desktop 的 Name 在规范里是必填，
+// 但现实里存在只有 Name[某地区] 的条目；localizedName 解不出来时显示 desktop
+// id 也比一条空白行好诊断（用户能据此告诉我们"这个名字怪的应用在这"）。
+func appDisplayName(a core.App) string {
+	if n := strings.TrimSpace(a.Name); n != "" {
+		return a.Name
+	}
+	return a.Key
+}
+
 func (u *ui) newAppRow(a core.App, on bool, sc *renderScope) *adw.SwitchRow {
 	row := adw.NewSwitchRow()
 	sc.own(&row.Widget)
-	row.SetTitle(a.Name)
+	row.SetTitle(appDisplayName(a))
 	row.SetSubtitle(u.appSub(a, on))
 	row.SetActive(on)
 
 	// 应用图标是列表里唯一能让人"一眼认出这是哪个应用"的东西；全是文字
 	// 时 30 行看起来一模一样。Icon 可能是主题名，也可能是绝对路径，两种
-	// 都支持，取不到就退到通用应用图标。
-	icon := u.appIcon(a.Icon)
-	sc.own(&icon.Widget)
-	row.AddPrefix(&icon.Widget)
+	// 都支持；取不到时用首字母色块，不用千篇一律的通用图标。
+	icon, _ := u.appIcon(a.Icon, appDisplayName(a), 32)
+	sc.own(icon)
+	row.AddPrefix(icon)
 
 	if u.fatal {
 		// bwrap 缺失时任何操作最终都会失败：开关停用、箭头不出现，
@@ -932,7 +993,7 @@ func (u *ui) confirmDisable(a core.App, ref rowRef) {
 		d.Choose(&u.win.Widget, nil, nil, 0)
 		return
 	}
-	d := adw.NewAlertDialog(u.tr("ui.dialog.close_clones.title", map[string]any{"name": a.Name}), u.tr("ui.dialog.close_clones.body", nil))
+	d := adw.NewAlertDialog(u.tr("ui.dialog.close_clones.title", map[string]any{"name": appDisplayName(a)}), u.tr("ui.dialog.close_clones.body", nil))
 	d.AddResponse("cancel", u.tr("ui.dialog.cancel", nil))
 	d.AddResponse("trash", u.tr("ui.dialog.trash", nil))
 	d.SetDefaultResponse("cancel")
@@ -977,7 +1038,7 @@ func (u *ui) confirmDisable(a core.App, ref rowRef) {
 						u.toastMsg(u.tr("ui.toast.running_only", map[string]any{"n": out.running}))
 					}
 				default:
-					u.toastMsg(u.tr("ui.toast.all_trashed", map[string]any{"name": a.Name}))
+					u.toastMsg(u.tr("ui.toast.all_trashed", map[string]any{"name": appDisplayName(a)}))
 				}
 				u.reload()
 				return false

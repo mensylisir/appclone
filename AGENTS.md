@@ -10,7 +10,7 @@ appclone 是把 Android「应用分身 / Cloned Apps」语义移植到 Linux 桌
 2. `docs/方案设计.md`：唯一设计契约基线——需求定义、目录布局、档案规范、CLI 命令面、验证清单，跨版本（bash/Go、CLI/GUI）稳定。
 3. `docs/tech-stack.md`：唯一技术选型与 ADR 基线（编号以该文 §7 索引为准）。
 4. `docs/discover.md`：路径自动探测方案谱系与三层管线（ADR-008 详情）。
-5. `design/appclone-gui.html`：**GUI 界面行为基线**。任何 GUI 相关改动（新增屏、改组件、调交互、改状态变体）之前必须读；改后必须跑 `node design/guitest.js`（60 项交互回归，需 chromium + puppeteer-core），退出码非 0 视为设计基线被破坏。
+5. `design/appclone-gui.html`：**GUI 界面行为基线**。任何 GUI 相关改动（新增屏、改组件、调交互、改状态变体）之前必须读；改后必须跑 `node design/guitest.js`（交互回归，项数以脚本内 `EXPECTED` 为准，当前 62 项，需 chromium + puppeteer-core），退出码非 0 视为设计基线被破坏。
 6. `docs/STATUS.md`：已验证功能状态。
 
 冲突裁决（三份各管一段，不要互相越界）：
@@ -78,7 +78,7 @@ appclone 是把 Android「应用分身 / Cloned Apps」语义移植到 Linux 桌
 
 一个功能只有同时满足以下要求才算完成：
 
-1. **回归通过**：改 `design/appclone-gui.html` 必须跑 `node design/guitest.js`（60/60）；改 Go 代码必须过 `go vet` + `go test ./...`，涉及 bwrap/探测行为时在隔离假 HOME 下完成功能冒烟（写入落实例目录、宿主零污染、公共目录共享可见）；改 `cmd/appclone-gui` 还必须跑 `design/guitest-gtk.sh`（真实 GTK 闸门，需显示 + 宿主 `bwrap`）。
+1. **回归通过**：改 `design/appclone-gui.html` 必须跑 `node design/guitest.js`（全过，项数以 `EXPECTED` 为准）；改 Go 代码必须过 `go vet` + `go test ./...`，涉及 bwrap/探测行为时在隔离假 HOME 下完成功能冒烟（写入落实例目录、宿主零污染、公共目录共享可见）；改 `cmd/appclone-gui` 还必须跑 `design/guitest-gtk.sh`（真实 GTK 闸门，需显示 + 宿主 `bwrap`）。
 2. **契约不破**：命令语义、实例目录布局、档案字段语义在改动前后保持兼容（CLI/GUI 视角一致）。
 3. **用户零门槛红线**：任何把"要求用户读 strace 输出 / 手写档案字段 / 开终端"的设计引入产品路径，一律打回——这是本产品与脚本工具的分界线。
 4. **文档同步**：涉及机制变更时同步更新对应 docs 并保持互引一致。
@@ -107,7 +107,7 @@ appclone 是把 Android「应用分身 / Cloned Apps」语义移植到 Linux 桌
 2. Go 代码遵守 `gofmt`/`go vet`/`staticcheck`；`core` 保持纯函数优先、可单测。
 3. 提交信息用中文，说明「为什么」而非罗列文件；一个任务一个 commit。
 4. **commit + push 默认放行**：一个任务做完就直接提交并推送到 `origin` 当前分支，**不要逐次征求确认**（用户在 2026-11-07 明确要求：每次改动不仅 commit，还要 push）。仍需逐次确认的是：`--force`/`--force-with-lease`、推到非当前分支、打 tag、发布（release），以及任何改写已推送历史的操作。
-   - 这里的"做完"指：验收命令已跑过并留下证据（回归 60/60、退出码 0；Go 侧 `go vet` + `go test`）。没跑过验证就提交，等于把未验证状态当成果。
+   - 这里的"做完"指：验收命令已跑过并留下证据（回归全过（项数以 `EXPECTED` 为准）、退出码 0；Go 侧 `go vet` + `go test`）。没跑过验证就提交，等于把未验证状态当成果。
    - 提交前 `git status` 自查：不要把 `.workbuddy/`（本地工作区数据）带进提交，它已在 `.gitignore` 里。
 6. **提交署名**：以用户本人 git 身份提交（`git config user.name` / `user.email` 为准），禁止使用 Claude、AI 或任何其他名义署名，不得添加 AI 署名 trailer。
 7. 远端使用 SSH：`git@github.com:mensylisir/appclone.git`（本机 HTTPS 无凭据，push 会失败）。
@@ -117,10 +117,10 @@ appclone 是把 Android「应用分身 / Cloned Apps」语义移植到 Linux 桌
 ```bash
 gofmt -l . && go vet ./... && go test ./...    # Go 门禁（go.mod 建成后才有意义）
 CGO_ENABLED=0 go build ./...                   # 全仓零 cgo（puregotk 不需要 C 工具链）
-# GUI 交互回归（60 项，退出码 0 才算过；脚本自动发现 chromium 与 puppeteer-core）
+# GUI 交互回归（项数以脚本内 EXPECTED 为准，当前 62 项；退出码 0 才算过；脚本自动发现 chromium 与 puppeteer-core）
 node design/guitest.js
 # 找不到依赖时：npm i puppeteer-core，或用 PUPPETEER_CORE=/path、CHROMIUM=/path 指定
-# GTK 侧回归（真实 GTK，需 DISPLAY/WAYLAND + 宿主 bwrap；假 HOME，约 1 秒）
+# GTK 侧回归（真实 GTK，需 DISPLAY/WAYLAND + 宿主 bwrap；假 HOME，16 条约 5 秒）
 design/guitest-gtk.sh                          # --keep 保留临时目录与假 HOME 便于排查
 # 隔离冒烟（假 HOME，不污染真实主目录）：
 TESTROOT=$(mktemp -d); export AC_BASE="$TESTROOT/xdg/appclone" XDG_DATA_HOME="$TESTROOT/xdg"
