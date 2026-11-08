@@ -78,7 +78,7 @@ appclone 是把 Android「应用分身 / Cloned Apps」语义移植到 Linux 桌
 
 一个功能只有同时满足以下要求才算完成：
 
-1. **回归通过**：改 `design/appclone-gui.html` 必须跑 `node design/guitest.js`（58/58）；改 Go 代码必须过 `go vet` + `go test ./...`，涉及 bwrap/探测行为时在隔离假 HOME 下完成功能冒烟（写入落实例目录、宿主零污染、公共目录共享可见）。
+1. **回归通过**：改 `design/appclone-gui.html` 必须跑 `node design/guitest.js`（58/58）；改 Go 代码必须过 `go vet` + `go test ./...`，涉及 bwrap/探测行为时在隔离假 HOME 下完成功能冒烟（写入落实例目录、宿主零污染、公共目录共享可见）；改 `cmd/appclone-gui` 还必须跑 `design/guitest-gtk.sh`（真实 GTK 闸门，需显示 + 宿主 `bwrap`）。
 2. **契约不破**：命令语义、实例目录布局、档案字段语义在改动前后保持兼容（CLI/GUI 视角一致）。
 3. **用户零门槛红线**：任何把"要求用户读 strace 输出 / 手写档案字段 / 开终端"的设计引入产品路径，一律打回——这是本产品与脚本工具的分界线。
 4. **文档同步**：涉及机制变更时同步更新对应 docs 并保持互引一致。
@@ -120,6 +120,8 @@ CGO_ENABLED=0 go build ./...                   # 全仓零 cgo（puregotk 不需
 # GUI 交互回归（58 项，退出码 0 才算过；脚本自动发现 chromium 与 puppeteer-core）
 node design/guitest.js
 # 找不到依赖时：npm i puppeteer-core，或用 PUPPETEER_CORE=/path、CHROMIUM=/path 指定
+# GTK 侧回归（真实 GTK，需 DISPLAY/WAYLAND + 宿主 bwrap；假 HOME，约 1 秒）
+design/guitest-gtk.sh                          # --keep 保留临时目录与假 HOME 便于排查
 # 隔离冒烟（假 HOME，不污染真实主目录）：
 TESTROOT=$(mktemp -d); export AC_BASE="$TESTROOT/xdg/appclone" XDG_DATA_HOME="$TESTROOT/xdg"
 HOME="$TESTROOT/home" ./appclone add t main    # Go CLI 建成后替换为 go run ./cmd/appclone

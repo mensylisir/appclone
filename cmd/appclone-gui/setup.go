@@ -156,6 +156,13 @@ func (v *setupView) build() {
 	v.spinner.Start()
 	v.spinner.SetHalign(gtk.AlignCenterValue)
 	v.fixed.own(&v.spinner.Widget)
+	// 探测要等十秒到一分钟，页面上先放应用图标，用户一眼确认在等谁。
+	if icon := v.u.iconOf(v.appKey); icon != "" {
+		img := v.u.appIcon(icon)
+		img.SetPixelSize(64)
+		v.fixed.own(&img.Widget)
+		probing.Append(&img.Widget)
+	}
 	ptitle := gtk.NewLabel("正在跟踪「" + v.appName() + "」的写入…")
 	ptitle.SetWrap(true)
 	ptitle.SetHalign(gtk.AlignCenterValue)
@@ -340,18 +347,27 @@ func (v *setupView) updateConfirmGate() {
 func (v *setupView) start() {
 	if v.mode == "open" || v.mode == "clone" {
 		p, err := v.u.env.LoadProfile(v.appKey)
-		if err != nil {
+		switch {
+		case err == nil:
+			v.profile = p
+			v.cands = candidatesFromProfile(v.u, p)
+			v.setState("confirm")
+			v.renderConfirm()
+			return
+		case errorKey(err) == "err.profile.not_found":
+			// 列表扫描与用户拨开关之间档案被删（另一个 CLI 执行了
+			// --purge-profile，或外部删除）：按"没有旧档案"重新走首次配置，
+			// 而不是把用户钉在只有「取消」的错误页上（对抗性复审 P2）。
+			// CLI 的 add 用同一口径：not_found 继续探测。
+			v.mode = "setup"
+			v.page.SetTitle(v.title())
+		default:
 			// 复用档案失败（版本超前 / 损坏）没有可重试的动作：重跑 start()
 			// 只会读到同一份档案。给「重试」等于让用户对着一个永远失败的
 			// 按钮点（P3，复审发现）。
 			v.showProfileRejected(err)
 			return
 		}
-		v.profile = p
-		v.cands = candidatesFromProfile(v.u, p)
-		v.setState("confirm")
-		v.renderConfirm()
-		return
 	}
 	// 重新配置/重新探测只重定案**路径**：既有档案的 env、extra_binds、
 	// isolate_runtime、audit、未知字段是用户的显式配置，探测产物里没有它们。
@@ -625,6 +641,9 @@ func (v *setupView) renderConfirm() {
 		row := adw.NewSwitchRow()
 		v.scope.own(&row.Widget)
 		row.SetTitle(v.u.allocText(c.Path))
+		ic := v.u.symbolicIcon("folder-symbolic")
+		v.scope.own(&ic.Widget)
+		row.AddPrefix(&ic.Widget)
 		d := v.u.tr(c.Why, nil)
 		if c.Observed > 0 {
 			d = fmt.Sprintf("%s · 观测到 %d 个写入条目", d, c.Observed)

@@ -187,6 +187,73 @@ STATUS 里的函数名 `MergeNonPathFields` 顺手改准为 `MergeNonPathFieldsW
 未改的 P3：`append(cands, extra...)` 的理论别名问题——真实 `MergeUpper` 产物 `cap==len`，
 无调用方持有同底层数组的长 slice，改动（`slices.Concat`）只会增加噪音。
 
+**第三十四轮：GTK 侧回归闸门落地（覆盖面受限）**（2026-11-08）。此前 GUI 只有 broadway 人工截图，
+STATUS 因此停在 `implemented`。本轮新增 `cmd/appclone-gui/screens_test.go` + `design/guitest-gtk.sh`：
+在**真实 GTK/libadwaita** 里用假 HOME 走一遍"列表空态可见 → 搜索过滤 → 拨开关 → 确认页路径行 →
+创建实例 → 详情页（数据核对）→ 返回并清空 `activeDetail`"，任一断言失败或 45 秒不推进即以非 0 退出。
+最终树连续 2 次 PASS、单次约 1.4–1.5s（`DISPLAY=:0`）。STATUS 记为 `verified（范围受限）`——覆盖的只是这条
+页面生命周期，不是 GUI 全部交互。
+**入口与用户操作的等价性要分层说**：开关这一环是真的——`setBool(row,"active",true)` 走 gobject
+属性接口，与 `gtk_switch_set_active` 同路，会发真实 `notify::active` 进 `u.onSwitch`；确认页的
+`v.submit()` 与按钮 clicked 绑的是同一个处理函数，属于直调处理函数而非合成点击。而本机 XTEST 被禁、
+broadway 在 push 后自崩，所以这是目前唯一能自动跑起来的 GTK 闸门。测试文件带
+`//go:build linux && gtk_e2e`：puregotk 在包 init 期 dlopen GTK，没有 GTK 运行库的机器来不及
+`t.Skip` 就会 panic，默认 `go test ./...` 因此根本不编译它。
+**审查后修掉的一个真实健壮性问题**：`AdwSwitchRow` 会在开关动画结束时（约 200ms 后）**补发一次
+`notify::active`**。先前在测试里绕开（改从 `u.beginEnable` 进入），复审指出这是把产品缺陷当测试假象；
+现在产品侧加结构性去重 `ui.toggled map[toggleMark]bool`（键 = 渲染代数 + 应用 key，值 = 已受理的
+目标值），闸门恢复真拨开关；step 2 检测"原来那一页之外又冒出配置页"，step 3 保留 400ms
+观察窗、step 4 返回后再复查一次。**变异测试证明有牙**：注释掉去重守卫后闸门在第 2 步
+立即变红（不是等 45 秒超时），恢复后 PASS。
+**复审（REJECTED → 修复）收口的其余项**：`GApplicationNonUnique` + 断言 `activated`/步数，堵住
+"activate 被转发给别的实例、断言一次都不执行"的假通过；补 `AC_HOME` 并与 `HOME` 一起钉死
+（`PathResolver` 用 `AC_HOME` 作可见 Home、用 `$HOME` 作 RealHome；只设 AC_HOME 不设 HOME 时
+RealHome 仍指真实主目录，bwrap 的受限目录会跟着指错）；`AppDirList` 只扫闸门自己写的 demo/alpha 两个
+`.desktop`，不再随本机 269 个应用漂移，且搜索过滤断言因此有牙；确认行验 `GetParent() != nil`，
+堵住"忘了 Add 的用户空页"；`Mounter` 注入 stub，不在 `$TMPDIR` 触发真实 fuse 冒烟；脚本用
+`CGO_ENABLED=0` 构建 CLI 与测试、支持 `--keep` 保留现场；失败时先报 `runErr` 再报 `activated/step`。
+标准复审（第三轮）另给 9 条 P3，已逐条收口：脚本预检宿主 `bwrap`（缺则 exit 4，不再等 45 秒超时）、
+`--keep` 真正保留假 HOME（`APPCLONE_GTK_ROOT` 放在 `$WORK` 下，测试不再用会被自动删除的
+`t.TempDir`）、`onSwitch` 补旧渲染代数守卫、step 4 返回后再等 300ms 并断言不再冒出配置页、
+注释与文档措辞按代码实际（`AC_HOME` 作可见 Home / `$HOME` 作 RealHome；确认是"直调同一个回调"
+而非合成点击）；GTK 闸门写进 AGENTS.md 的完成定义（改 `cmd/appclone-gui` 必须跑）。
+对抗性复审又抓到一个闸门完整性缺口并已修：`go test -run` 匹配不到测试时仍返回 0（测试被
+移走/改名会静默假绿），脚本现在把输出落盘并 `grep '--- PASS: TestGtkScreensLifecycle'`，
+没有这条就 exit 5；同轮把 step 2 的"又冒出配置页"改成按页面指针立即判红，不再靠 45 秒超时。
+两条闸门完整性修复也做了反证：把 `screens_test.go` 移走后脚本 exit 5（不再 `[no test files]` 假绿）；
+用只有 go/CLI 的最小 PATH 运行时脚本 exit 4 并直说缺 bwrap（不再 45 秒超时）。
+**仍未覆盖**：探测四态、删除/重命名/关闭开关对话框、横幅与错误态文案、fuse 致命态回退、
+指针与键盘事件注入——这些需要输入注入或可编程对话框响应，留给后续；ADR-027 的 i18n 退出条件
+因此在 `docs/tech-stack.md` 里明确为"闸门走遍三屏四态之后"，`u.lang` 暂不改回 `i18n.Lang()`。
+证据：`design/guitest-gtk.sh` 最终树连续 2 次 PASS（1.40s / 1.45s；含 `go vet`/`go vet -tags gtk_e2e`/`gofmt` 干净、
+`go test -count=1 ./...` 全绿且 GUI 包默认不编译、`CGO_ENABLED=0 go build ./...`、
+`node design/guitest.js` 58/58）。
+
+**第三十五轮：界面视觉收口（用户反馈"太朴素、不如原型图"）**（2026-11-08）。仍是 libadwaita
+原生控件、不写自定义 CSS（ADR-013/§4.6），只把稿子里承载信息的视觉元素补进原生结构：
+- **列表行加应用图标**（`GtkImage`，32px；`Icon` 支持主题名与绝对路径，取不到退
+  `application-x-executable`）。这是原实现最明显的缺口——30 行纯文字长得一模一样。
+- **修掉空态被裁成半截图标**：`AdwPreferencesPage` 的 `Add` 只接受 `AdwPreferencesGroup`，
+  而 Group 只接 `AdwPreferencesRow`；把 `AdwStatusPage` 塞进 Group 会得到一张只剩灰色半圆的
+  空页。改为挂在搜索栏与列表页之间，`renderList` 只切 visible；空态时列表只剩「所有应用」组。
+- **标题栏与搜索分层**：HeaderBar 恢复显示「应用分身」，搜索条单独一行、铺满宽度且不抢初始
+  焦点（窗口映射后把焦点交给列表页），不再是顶栏里孤零零一个输入框。
+- **详情页**：HeaderBar 换成 `AdwWindowTitle`（应用名 +「N 个分身 · M 个运行中」两行）；
+  实例行加 `edit-copy-symbolic` 前缀，新建分身行改 `list-add-symbolic` + 设计稿副标题；
+  启动/重命名/删除改用 `AdwButtonContent` 图标+文字；实例组/隔离设置组补 `SetDescription`；
+  隔离路径、探测方式、单例处理、最近审计、实例根目录、重新探测各加语义图标（16px）；
+  档案损坏态同样改为带警告图标的只读组（StatusPage 误用的另一个落点）。
+- **探测页**：探测中显示 64px 应用图标（"在等谁"一眼可见）；确认页路径行加 `folder-symbolic`。
+验证：`DISPLAY=:0` 真机截图核对了空态、有实例列表、详情页、确认页四张；Go 门禁全绿；
+`design/guitest-gtk.sh` 2/2 PASS（空态断言已改为"StatusPage 可见 + 有 parent + 只剩 1 组"）；
+`node design/guitest.js` 58/58（HTML 基线未动）。
+对抗性复审的 P2 产品边界同时收口：open/clone 入口里档案在"列表扫描 → 用户拨开关"之间被删时，
+不再落到只有「取消」的错误页，而是按 not_found 重新走首次配置（与 CLI `add` 同口径），
+页面标题同步改成「首次配置 · X」。（临时在 /tmp 副本注入"拨开关前删档案"验证：闸门进入 probing/带「重试」的 error，而不是无重试终态，PASS。）
+**未修的两条理论风险**（复审标记为未复现，均属既有逻辑）：删除事务仍是"先全量判运行态再逐个删"的
+TOCTOU——删除循环期间用户若启动实例，可能出现部分执行（结果会如实报 deleted/running 计数）；
+busy 事务没有超时，`gio trash` 或等锁卡死时关窗会被一直拒绝。留待后续评估，不在本轮改动。
+
 ## 下一步
 
 路线图第 1 项（`core` 探测原语）**被本机环境挡住**：`fuse-overlayfs 1.18` 与 `fusermount3 3.18.3` 已装（用户确认），
@@ -212,7 +279,9 @@ STATUS 里的函数名 `MergeNonPathFields` 顺手改准为 `MergeNonPathFieldsW
 3. ~~CLI MVP~~ **已完成**（`add/run/list/rm/doctor/repair-desktop/version`）
 4. `cmd/appclone-gui`（puregotk + libadwaita 三屏，控件映射见 `tech-stack.md` §4.5）。
    **v1 三屏已落地并通过两轮实现审查修复**（2026-11-08，见第二十八～三十轮；STATUS = `implemented`）。剩余：
-   ① **GTK 侧回归闸门**（broadway 不稳，考虑 Xvfb/嵌套 mutter 或纯逻辑抽测）；
+   ① ~~**GTK 侧回归闸门**~~ **已落地（部分覆盖，2026-11-08）**：`design/guitest-gtk.sh` +
+      `cmd/appclone-gui/screens_test.go`。剩余：探测四态 / 对话框 / 横幅的自动化（需要可编程
+      对话框响应或输入注入）；
    ② ~~GUI 与 CLI 的 setup 编排去重~~ **已完成**（2026-11-08，`core.FinalizeProbe`，见第三十三轮）；
    ③ GUI 文案进 i18n 目录（ADR-027 的退出条件），之后 `u.lang` 才能跟随 `i18n.Lang()`。
 
@@ -224,8 +293,10 @@ STATUS 里的函数名 `MergeNonPathFields` 顺手改准为 `MergeNonPathFieldsW
 - **strace 降级未用真实日志校准**：直接 `strace -f /bin/true` 可用，但产品内由 Go 以 `setsid` 起的
   `strace` 在本次外层 strace 环境下报 `PTRACE_TRACEME: Operation not permitted`——需要单独确认真实
   触发条件（是否与嵌套 tracer / 沙箱有关），再把 `ParseStrace` 与真实日志对齐。
-- **GUI 侧的自动化闸门尚未存在**：`guitest.js` 只覆盖 HTML 稿。GTK 实现的回归用
-  broadway + chromium/puppeteer 试过：可以截图**静态页**（列表/详情/确认页/对话框），但
+- **GUI 侧的自动化闸门**：`guitest.js` 只覆盖 HTML 稿；GTK 实现现由 `design/guitest-gtk.sh`
+  覆盖**页面生命周期**（列表/确认/创建/详情/返回，2026-11-08 起），但**指针与键盘事件注入仍不可行**
+  （本会话 XTEST 被禁，xdotool 指针/键盘无效），所以探测四态、删除/重命名对话框、横幅交互
+  还不能脚本化。broadway 的结论保留在下方，供后续参考。
   `gtk4-broadwayd` 在 `NavigationView` push 后会以其自身断言
   （`gdk/broadway/broadway-output.c:458 append_node_ops: !reused_node->consumed`）**自崩**，
   `/tmp/.X11-unix` 下无 Xvfb，嵌套 `mutter --headless` 能起 Xwayland 但合成器重定向使
@@ -235,11 +306,12 @@ STATUS 里的函数名 `MergeNonPathFields` 顺手改准为 `MergeNonPathFieldsW
   （`@/run/user/<uid>/broadway<N>.socket`），而 GDK 客户端找文件系统路径 → `Failed to open display`；
   带 `-u` 时 HTTP 端口根本不监听（`-u` 替换了 TCP 监听）。用 socat 把文件系统 socket 桥到抽象 socket
   能连上，但 GDK 立刻报 `Unknown input command d/w` 并 EOF（协议桥接不可靠）。另外本会话的 X 会话
-  禁止 XTEST 注入（`xdotool mousemove` 不移动指针），所以三屏交互无法在本会话脚本化。
+  禁止 XTEST 注入（`xdotool mousemove` 不移动指针），所以**需要真实点击**的交互（对话框、
+  探测中取消）仍无法脚本化——页面生命周期已改由 `design/guitest-gtk.sh` 覆盖。
   可行路线：装 Xvfb（或换一台能跑 Xvfb 的机器）、在 GUI 内做 `APPCLONE_GUI_SHOT` 出口，
-  或把三屏的纯逻辑状态机从 GTK 里抽出来做无显示测试。不需要输入的 GTK 生命周期假设可用
-  `design/navspike` 这类自驱动 spike 验证（本轮已验证导航页 Unref 时机）。
-  在那之前 GUI 无自动回归保护，不能标 `verified`。
+  或把三屏的纯逻辑状态机从 GTK 里抽出来做无显示测试。不需要输入的 GTK 生命周期已由
+  `design/navspike`（导航页 Unref 时机）与 `design/guitest-gtk.sh`（列表 → 确认 → 创建 →
+  详情 → 返回）覆盖；**未覆盖部分**（探测四态、删除/重命名对话框、横幅）仍不能声称已验证。
 - 复现命令（broadway 冒烟，假 HOME）：`gtk4-broadwayd -p 8095 :5` +
   `GDK_BACKEND=broadway BROADWAY_DISPLAY=:5 HOME=<fake> AC_BASE=<fake>/xdg/appclone ./appclone-gui`，
   浏览器打开 `http://127.0.0.1:8095/`（注意 `XDG_RUNTIME_DIR` 必须是 broadwayd 所在的那个，

@@ -25,7 +25,9 @@ type detailView struct {
 	profile core.Profile
 	audits  []auditEntry
 	groups  []*adw.PreferencesGroup
-	scope   *renderScope
+	// title 是 HeaderBar 里的两行标题（应用名 + 实例数），随 build 更新。
+	title *adw.WindowTitle
+	scope *renderScope
 	// fixed 持有详情页的静态控件（工具栏、内容页），popped 时统一 Unref；
 	// 导航页本身的 sink 引用由 popped 末尾的 releasePage 延后一个 idle 释放
 	// （design/navspike 验证过：popped 之后 Unref 安全，不释放则整页泄漏）。
@@ -69,7 +71,9 @@ func (u *ui) pushDetail(appKey string) {
 
 	hb := adw.NewHeaderBar()
 	v.fixed.own(&hb.Widget)
-	hb.SetShowTitle(true)
+	v.title = adw.NewWindowTitle(u.nameOf(appKey), "")
+	v.fixed.own(&v.title.Widget)
+	hb.SetTitleWidget(&v.title.Widget)
 
 	tv := adw.NewToolbarView()
 	v.fixed.own(&tv.Widget)
@@ -207,31 +211,69 @@ func (v *detailView) reset() {
 // "看起来正常、其实所有按钮都点不动"的死页（P2，复审发现）。
 func (v *detailView) buildBroken(msg string) {
 	v.reset()
-	sp := adw.NewStatusPage()
-	sp.SetIconName("dialog-warning-symbolic")
-	sp.SetTitle("档案读不出来")
-	sp.SetDescription(msg + "\n\n返回列表，用开关重新配置这个应用即可生成新档案。")
-	v.scope.own(&sp.Widget)
+	// 不能把 StatusPage 塞进 PreferencesGroup：Group 只接 AdwPreferencesRow，
+	// 塞进去会被裁成半截图标（列表空态踩过同一个坑）。这里用带警告图标的
+	// 只读行承载原因，信息一样完整。
 	g := adw.NewPreferencesGroup()
 	v.scope.own(&g.Widget)
-	g.Add(&sp.Widget)
+	g.SetTitle("档案读不出来")
+	g.SetDescription(msg)
+	row := adw.NewActionRow()
+	v.scope.own(&row.Widget)
+	row.SetTitle("无法读取这份档案")
+	row.SetSubtitle("返回列表，用开关重新配置这个应用即可生成新档案")
+	row.SetSubtitleLines(0)
+	v.prefix(row, "dialog-warning-symbolic")
+	row.SetSensitive(false)
+	g.Add(&row.Widget)
 	v.content.Add(g)
 	v.groups = append(v.groups, g)
+}
+
+// prefix 给只读行加一个 16px 符号图标，让密集的档案信息有视觉锚点。
+func (v *detailView) prefix(row *adw.ActionRow, icon string) {
+	ic := v.u.symbolicIcon(icon)
+	v.scope.own(&ic.Widget)
+	row.AddPrefix(&ic.Widget)
+}
+
+// instanceSummary 是详情页标题的第二行：实例数与运行中数量。
+func instanceSummary(insts []core.Instance, running map[string]bool) string {
+	if len(insts) == 0 {
+		return "还没有分身"
+	}
+	n := 0
+	for _, in := range insts {
+		if running[in.ID] {
+			n++
+		}
+	}
+	if n > 0 {
+		return fmt.Sprintf("%d 个分身 · %d 个运行中", len(insts), n)
+	}
+	return fmt.Sprintf("%d 个分身", len(insts))
 }
 
 func (v *detailView) build() {
 	v.reset()
 	p := v.profile
+	if v.title != nil {
+		v.title.SetSubtitle(instanceSummary(v.insts, v.running))
+	}
 
 	// ---- 实例 ----
 	ig := adw.NewPreferencesGroup()
 	v.scope.own(&ig.Widget)
 	ig.SetTitle("分身实例")
+	ig.SetDescription("每个分身拥有独立的配置与数据；公共目录仍然共享。")
 	for _, in := range v.insts {
 		running := v.running[in.ID]
 		row := adw.NewActionRow()
 		v.scope.own(&row.Widget)
 		row.SetTitle(in.DisplayName)
+		ic := v.u.symbolicIcon("edit-copy-symbolic")
+		v.scope.own(&ic.Widget)
+		row.AddPrefix(&ic.Widget)
 		sub := "已停止"
 		if running {
 			sub = "运行中"
@@ -245,18 +287,21 @@ func (v *detailView) build() {
 		v.scope.own(&box.Widget)
 		box.SetValign(gtk.AlignCenterValue)
 
-		launch := gtk.NewButtonWithLabel("启动")
+		launch, launchC := v.u.iconButton("media-playback-start-symbolic", "启动")
 		v.scope.own(&launch.Widget)
+		v.scope.own(&launchC.Widget)
 		launch.AddCssClass("suggested-action")
 		launch.SetSensitive(!running)
 		launch.SetTooltipText("在这个分身的沙箱里启动应用")
 
-		rename := gtk.NewButtonWithLabel("重命名")
+		rename, renameC := v.u.iconButton("document-edit-symbolic", "重命名")
 		v.scope.own(&rename.Widget)
+		v.scope.own(&renameC.Widget)
 		rename.SetSensitive(!running)
 
-		del := gtk.NewButtonWithLabel("删除")
+		del, delC := v.u.iconButton("user-trash-symbolic", "删除")
 		v.scope.own(&del.Widget)
+		v.scope.own(&delC.Widget)
 		del.AddCssClass("destructive-action")
 		del.SetSensitive(!running)
 		del.SetTooltipText("移到回收站（可恢复）")
@@ -281,7 +326,11 @@ func (v *detailView) build() {
 	}
 	add := adw.NewActionRow()
 	v.scope.own(&add.Widget)
-	add.SetTitle("＋ 新建分身")
+	add.SetTitle("新建分身")
+	add.SetSubtitle("沿用现有隔离设置，直接再建一个；设置失效时会先带你重新配置")
+	addIc := v.u.symbolicIcon("list-add-symbolic")
+	v.scope.own(&addIc.Widget)
+	add.AddPrefix(&addIc.Widget)
 	add.SetActivatable(true)
 	v.scope.row(add, func() {
 		mode := "clone"
@@ -302,11 +351,13 @@ func (v *detailView) build() {
 	pg := adw.NewPreferencesGroup()
 	v.scope.own(&pg.Widget)
 	pg.SetTitle("隔离设置")
+	pg.SetDescription("只隔离下面列出的目录，其余文件与主实例共享。")
 
 	paths := adw.NewActionRow()
 	v.scope.own(&paths.Widget)
 	paths.SetTitle("隔离路径")
 	paths.SetSubtitle(fmt.Sprintf("%d 个", len(p.Paths)))
+	v.prefix(paths, "folder-symbolic")
 	list := make([]string, 0, len(p.Paths))
 	for _, raw := range p.Paths {
 		if abs, err := v.u.env.Resolver.Expand(raw); err == nil {
@@ -338,6 +389,7 @@ func (v *detailView) build() {
 	} else {
 		conf.SetSubtitle("overlay-diff 跟踪 · 覆盖本次会话实际发生的写入（没走到的功能分支查不到）")
 	}
+	v.prefix(conf, "system-search-symbolic")
 	conf.SetSensitive(false)
 	pg.Add(&conf.Widget)
 
@@ -353,6 +405,7 @@ func (v *detailView) build() {
 		}
 		sh.SetSubtitle(strings.Join(sl, " · ") + " — 不隔离，两个分身共用同一份状态")
 		sh.SetSubtitleLines(0)
+		v.prefix(sh, "folder-publicshare-symbolic")
 		sh.SetSensitive(false)
 		pg.Add(&sh.Widget)
 	}
@@ -375,6 +428,7 @@ func (v *detailView) build() {
 		parts = append(parts, "DBus 会话共享")
 	}
 	single.SetSubtitle(strings.Join(parts, " · "))
+	v.prefix(single, "system-lock-screen-symbolic")
 	single.SetSensitive(false)
 	pg.Add(&single.Widget)
 
@@ -386,6 +440,7 @@ func (v *detailView) build() {
 	} else {
 		audit.SetSubtitle("没有审计证据 — 无法判定隔离是否有效（打开运行期审计后才有结论）")
 	}
+	v.prefix(audit, "security-high-symbolic")
 	audit.SetSensitive(false)
 	pg.Add(&audit.Widget)
 
@@ -397,6 +452,7 @@ func (v *detailView) build() {
 	} else {
 		rootRow.SetSubtitle("—")
 	}
+	v.prefix(rootRow, "folder-symbolic")
 	rootRow.SetSensitive(false)
 	pg.Add(&rootRow.Widget)
 
@@ -410,6 +466,7 @@ func (v *detailView) build() {
 	v.scope.own(&redisc.Widget)
 	redisc.SetTitle("重新探测")
 	redisc.SetSubtitle("应用更新后数据目录可能变了；重新跟踪一次，校正隔离路径")
+	v.prefix(redisc, "view-refresh-symbolic")
 	redisc.SetActivatable(true)
 	v.scope.row(redisc, func() {
 		v.u.pushSetup(v.appKey, "rediscover", func(ok bool) {

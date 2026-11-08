@@ -5,6 +5,8 @@ package main
 import (
 	"context"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -38,6 +40,10 @@ type ui struct {
 	header *adw.HeaderBar
 	search *gtk.SearchEntry
 	page   *adw.PreferencesPage
+	// emptyPage 是首屏空态。它不能塞进 AdwPreferencesGroup——Group 只接受
+	// AdwPreferencesRow，StatusPage 放进去会被裁成半截图标（截图上只剩一个
+	// 灰色半圆）。所以它挂在搜索栏与列表页之间，由 renderList 显隐。
+	emptyPage *adw.StatusPage
 
 	// 环境自检（§4.5）：bwrap 缺失 = 致命（整页只读），缺 fuse = 降级
 	// （列表页横幅可「了解」收掉，探测页那条不可收）。
@@ -63,6 +69,13 @@ type ui struct {
 	// pending 挡住一次拨动引发的重复 notify：GtkSwitch 的 active 变化可能
 	// 连发多条信号，没有它会在关闭开关时叠出两个确认框。
 	pending map[string]bool
+	// toggled 记下"这一轮渲染里已经受理过的目标值"。AdwSwitchRow 的 active
+	// 绑定会在开关动画结束时对同一个值再发一次 notify::active；只靠 pending
+	// 是时序守卫——流程若在补发之前跑完（确认+创建+pop 只要几百毫秒，自动化
+	// 与主循环饥饿都可能），pending 已清，同一个开关会二进流程、再开一个
+	// 配置页。这里按（渲染代数, 应用, 目标值）去重：行重建后是合法的新操作，
+	// 回弹（revert）会删掉表项，失败后用户可以重新拨。
+	toggled map[toggleMark]bool
 	// 当前压在最上面的探测页/详情页。页面被返回按钮 pop 时靠 pages 收尾，
 	// 这两个指针只用于"当前该刷新谁"与去重。
 	activeSetup  *setupView
@@ -158,10 +171,17 @@ func (u *ui) endBusy() {
 	u.app.Release()
 }
 
+// toggleMark 是 toggled 的键：同一轮渲染里的同一个开关才算"同一次拨动"。
+type toggleMark struct {
+	gen int
+	key string
+}
+
 // buildWindow 只做一次：根页是列表，详情/探测页按需 push。
 func (u *ui) buildWindow() {
 	u.suppress = map[string]bool{}
 	u.pending = map[string]bool{}
+	u.toggled = map[toggleMark]bool{}
 	u.cb = newCallbacks()
 	u.pages = map[uintptr]func(){}
 
@@ -195,7 +215,8 @@ func (u *ui) buildWindow() {
 		u.searchTimer = glib.TimeoutAdd(searchDebounceMs, &u.searchFn, 0)
 	}
 	u.search.ConnectSearchChanged(&searchcb)
-	u.header.SetTitleWidget(&u.search.Widget)
+	// 标题栏只放标题与应用菜单，搜索条单独一行（见下面的 searchBox）。
+	u.header.SetShowTitle(true)
 
 	tv := adw.NewToolbarView()
 	tv.AddTopBar(&u.header.Widget)
@@ -215,9 +236,33 @@ func (u *ui) buildWindow() {
 	}
 	u.softBanner.ConnectButtonClicked(&u.softDismissFn)
 
+	// 搜索条固定在标题栏下方（与稿子的位置一致），列表在它下面独立滚动；
+	// 塞进 HeaderBar 的 title widget 会让窗口顶部只剩一个输入框，应用名
+	// 与分组标题都显得没着落。
+	searchBox := gtk.NewBox(gtk.OrientationHorizontalValue, 0)
+	searchBox.SetMarginStart(12)
+	searchBox.SetMarginEnd(12)
+	searchBox.SetMarginTop(6)
+	searchBox.SetMarginBottom(6)
+	u.search.SetHexpand(true)
+	searchBox.Append(&u.search.Widget)
+
+	// 空态挂在搜索栏和列表页之间：它取代「已开启分身」这一组，但搜索与
+	// 「所有应用」照常可见（§4.5 空态约束）。
+	u.emptyPage = adw.NewStatusPage()
+	u.emptyPage.SetIconName("edit-copy-symbolic")
+	u.emptyPage.SetTitle("还没有分身")
+	u.emptyPage.SetDescription("在下方「所有应用」里找到要分身的应用，点亮它的开关——appclone 会先跟踪它的数据写入位置，确认后创建分身。")
+	u.emptyPage.SetVisible(false)
+
 	rootBox := gtk.NewBox(gtk.OrientationVerticalValue, 0)
 	rootBox.Append(&u.fatalBanner.Widget)
 	rootBox.Append(&u.softBanner.Widget)
+	rootBox.Append(&searchBox.Widget)
+	rootBox.Append(&u.emptyPage.Widget)
+	// PreferencesPage 自带滚动容器，必须在纵向 box 里显式 vexpand，
+	// 否则会被搜索栏与空态挤成一条。
+	u.page.SetVexpand(true)
 	rootBox.Append(&u.page.Widget)
 	tv.SetContent(&rootBox.Widget)
 	rootPage := adw.NewNavigationPage(&tv.Widget, "应用分身")
@@ -291,6 +336,13 @@ func (u *ui) buildWindow() {
 	u.hold(&closecb)
 
 	u.win.Present()
+	// 一开窗就高亮搜索框会让人以为必须先输入；等窗口映射完成后把焦点交给
+	// 列表页（可聚焦的滚动容器），用户点搜索框或按 Tab 时再进去。
+	u.goIdle(func(uintptr) bool {
+		u.page.Widget.SetFocusable(true)
+		u.page.Widget.GrabFocus()
+		return false
+	})
 	u.reload()
 	u.checkEnv()
 	// 运行状态轮询（§4.7）：1 秒一拍，详情页每拍刷、列表每两拍刷——
@@ -365,6 +417,58 @@ func (u *ui) allocText(p string) string {
 		return "~" + strings.TrimPrefix(p, home)
 	}
 	return p
+}
+
+// appIcon 把 .desktop 的 Icon 值变成列表行前缀图标。Icon 规范允许主题名
+// 或绝对路径，两种都要认；都取不到时退到通用应用图标，不让一行应用因为
+// 图标缺失而消失。
+func (u *ui) appIcon(icon string) *gtk.Image {
+	var img *gtk.Image
+	switch {
+	case icon == "":
+		img = gtk.NewImageFromIconName("application-x-executable")
+	case filepath.IsAbs(icon):
+		if _, err := os.Stat(icon); err == nil {
+			img = gtk.NewImageFromFile(icon)
+		} else {
+			img = gtk.NewImageFromIconName("application-x-executable")
+		}
+	default:
+		img = gtk.NewImageFromIconName(icon)
+	}
+	img.SetPixelSize(32)
+	img.SetValign(gtk.AlignCenterValue)
+	return img
+}
+
+// iconOf 按应用 key 找 Icon，供探测页显示"正在跟踪谁"。
+func (u *ui) iconOf(key string) string {
+	for _, a := range u.apps {
+		if a.Key == key {
+			return a.Icon
+		}
+	}
+	return ""
+}
+
+// symbolicIcon 是行内 16px 符号图标（实例行、路径行）。libadwaita 的行
+// prefix 用这个尺寸，和文字基线对齐。
+func (u *ui) symbolicIcon(name string) *gtk.Image {
+	img := gtk.NewImageFromIconName(name)
+	img.SetPixelSize(16)
+	img.SetValign(gtk.AlignCenterValue)
+	return img
+}
+
+// iconButton 建一个图标+文字的按钮（AdwButtonContent）。两个返回对象都要由
+// 调用方登记释放：ButtonContent 挂进按钮后，构造器那份额外引用仍归我们。
+func (u *ui) iconButton(icon, label string) (*gtk.Button, *adw.ButtonContent) {
+	btn := gtk.NewButton()
+	bc := adw.NewButtonContent()
+	bc.SetIconName(icon)
+	bc.SetLabel(label)
+	btn.SetChild(&bc.Widget)
+	return btn, bc
 }
 
 func (u *ui) appSub(a core.App, on bool) string {
@@ -478,6 +582,13 @@ func (u *ui) renderList() {
 	}
 	// 旧行从这一刻起不再有效：任何还握着它们指针的异步回调都要放弃写界面。
 	u.listGen++
+	// 旧代数的受理记录随旧行一起作废（旧行已被 Unref，不会再发 notify），
+	// 不清会让表随每轮轮询无限增长。
+	for k := range u.toggled {
+		if k.gen != u.listGen {
+			delete(u.toggled, k)
+		}
+	}
 	sc := &renderScope{c: u.cb}
 	u.listScope = sc
 
@@ -493,23 +604,14 @@ func (u *ui) renderList() {
 		}
 	}
 
-	if len(on) == 0 {
-		// 空态只取代「已开启分身」这一组：搜索与「所有应用」照常渲染。
-		// 整页藏掉会让首启用户看不到任何开关（引导语指向不存在的区域）。
-		g := adw.NewPreferencesGroup()
-		sc.own(&g.Widget)
-		sp := adw.NewStatusPage()
-		sp.SetIconName("system-users-symbolic")
-		sp.SetTitle("还没有分身")
-		sp.SetDescription("在下方「所有应用」里点亮一个开关，appclone 会为它准备一个独立的副本。")
-		sc.own(&sp.Widget)
-		g.Add(&sp.Widget)
-		u.page.Add(g)
-		u.groups = append(u.groups, g)
-	} else {
+	// 空态只取代「已开启分身」这一组：搜索与「所有应用」照常渲染。
+	// 整页藏掉会让首启用户看不到任何开关（引导语指向不存在的区域）。
+	u.emptyPage.SetVisible(len(on) == 0)
+	if len(on) > 0 {
 		g := adw.NewPreferencesGroup()
 		sc.own(&g.Widget)
 		g.SetTitle("已开启分身")
+		g.SetDescription("这些应用已经拥有独立的数据空间。")
 		for _, a := range on {
 			g.Add(&u.newAppRow(a, true, sc).Widget)
 		}
@@ -520,6 +622,7 @@ func (u *ui) renderList() {
 	g := adw.NewPreferencesGroup()
 	sc.own(&g.Widget)
 	g.SetTitle("所有应用")
+	g.SetDescription("点亮开关，为应用建立独立的数据空间；公共目录仍然共享。")
 	pool := off
 	var extra *adw.ActionRow
 	if u.query == "" && !u.expanded && len(off) > listLimit {
@@ -579,6 +682,13 @@ func (u *ui) newAppRow(a core.App, on bool, sc *renderScope) *adw.SwitchRow {
 	row.SetSubtitle(u.appSub(a, on))
 	row.SetActive(on)
 
+	// 应用图标是列表里唯一能让人"一眼认出这是哪个应用"的东西；全是文字
+	// 时 30 行看起来一模一样。Icon 可能是主题名，也可能是绝对路径，两种
+	// 都支持，取不到就退到通用应用图标。
+	icon := u.appIcon(a.Icon)
+	sc.own(&icon.Widget)
+	row.AddPrefix(&icon.Widget)
+
 	if u.fatal {
 		// bwrap 缺失时任何操作最终都会失败：开关停用、箭头不出现，
 		// 而不是允许用户点进去走一遍必然失败的路（§4.5）。
@@ -613,10 +723,23 @@ func (u *ui) onSwitch(a core.App, ref rowRef, was bool) {
 	if u.suppress[a.Key] || u.pending[a.Key] {
 		return
 	}
+	// 旧代数的行已经不在列表里（可能仍被信号分发链暂时保活）：它的状态
+	// 属于上一轮渲染，不能拿来开流程。revert 用同一条代数守卫。
+	if ref.gen != u.listGen {
+		return
+	}
 	if ref.row.GetActive() == was {
 		return
 	}
-	if ref.row.GetActive() {
+	// 同一个目标值在同一轮渲染里只受理一次：AdwSwitchRow 会在动画结束时
+	// 补发 notify::active，重复受理会二进流程（见 toggled 注释）。
+	target := ref.row.GetActive()
+	mark := toggleMark{gen: ref.gen, key: a.Key}
+	if seen, ok := u.toggled[mark]; ok && seen == target {
+		return
+	}
+	u.toggled[mark] = target
+	if target {
 		u.beginEnable(a, ref)
 	} else {
 		u.confirmDisable(a, ref)
@@ -632,6 +755,8 @@ func (u *ui) revert(ref rowRef, key string, to bool) {
 	u.suppress[key] = true
 	ref.row.SetActive(to)
 	u.suppress[key] = false
+	// 开关被程序拨回去了：同一目标值的下次拨动是用户的新操作，不是补发。
+	delete(u.toggled, toggleMark{gen: ref.gen, key: key})
 }
 
 // beginEnable 按档案状态选入口：没档案 → 首次配置；档案失效 → 重新配置；

@@ -164,7 +164,8 @@ puregotk 自称 experimental，所以**不允许"边写产品边试"**。第一�
 - ⑤ 在 `ubuntu:24.04`（GTK 4.14.5 / libadwaita 1.5.0）容器内 Xvfb 跑通同一程序、退出码 0，
   无 `init` 符号缺失 panic；**未覆盖三屏本身**——S0 验的是"绑定在 1.5 上可用"。
   三屏 v1 已落地（`cmd/appclone-gui/`，2026-11-08），在 1.5 上的控件子集未再加测；
-  GTK 侧回归闸门仍未建立（见 `STATUS.md` 与 `NEXT.md` "被挡住的"）。
+  GTK 侧回归闸门已建立但**只覆盖页面生命周期**（`design/guitest-gtk.sh`：列表 → 确认 →
+  创建 → 详情 → 返回），探测四态/对话框/横幅仍无自动化（见 `STATUS.md` 与 `NEXT.md` "被挡住的"）。
 
 ### 4.4 版本门槛与一条必须承认的边界
 
@@ -197,11 +198,11 @@ puregotk 自称 experimental，所以**不允许"边写产品边试"**。第一�
 
 | 屏 | 承载结构 | 细节 |
 |---|---|---|
-| ① 应用列表 | `AdwNavigationView` 根页 = `AdwToolbarView{ AdwHeaderBar, AdwPreferencesPage }` | 致命横幅（bwrap 缺失）下**整页只读**：开关、行点击、搜索全部停用（任何操作最终都要 bwrap，允许进详情只会让用户在一屏点不动的界面里迷路）； 顶部 `GtkSearchEntry`（397 个应用必须有搜索，见 ADR-024）；分组「已开启分身」/「所有应用」；**两组用同一套 `AdwSwitchRow`**（title=应用名，subtitle=`App.InstanceN` + `App.RunningN` 拼出「N 个分身」/「N 个分身 · M 个运行中」/「未开启 · 已有隔离档案」/「尚未生成隔离档案」/「档案已失效」）；只有已开启行带行尾 `GtkButton` + `AdwButtonContent`（icon `go-next-symbolic`，`.flat`）进详情——未开启的应用没有实例可管，不进详情；libadwaita 没有 `AdwButton` 类型 |
+| ① 应用列表 | `AdwNavigationView` 根页 = `AdwToolbarView{ AdwHeaderBar, AdwPreferencesPage }` | 致命横幅（bwrap 缺失）下**整页只读**：开关、行点击、搜索全部停用（任何操作最终都要 bwrap，允许进详情只会让用户在一屏点不动的界面里迷路）； HeaderBar 显示「应用分身」，顶部单独一行 `GtkSearchEntry`（397 个应用必须有搜索，见 ADR-024）；分组「已开启分身」/「所有应用」；**两组用同一套 `AdwSwitchRow`**（title=应用名，subtitle=`App.InstanceN` + `App.RunningN` 拼出「N 个分身」/「N 个分身 · M 个运行中」/「未开启 · 已有隔离档案」/「尚未生成隔离档案」/「档案已失效」，行首 `GtkImage` 应用图标 32px——`Icon` 主题名/绝对路径都认，取不到退 `application-x-executable`）；只有已开启行带行尾 `GtkButton` + `AdwButtonContent`（icon `go-next-symbolic`，`.flat`）进详情——未开启的应用没有实例可管，不进详情；libadwaita 没有 `AdwButton` 类型 |
 | ② 应用详情 | `AdwPreferencesPage` | `AdwPreferencesGroup("分身实例")`，每行 `AdwActionRow`（实例名 + 运行状态）+ 尾部「启动」「删除」（**运行中两者都禁用**——`rm` 对运行中实例拒绝，退出码 7，界面不能更宽松）；`AdwPreferencesGroup("档案")` 只读行：隔离路径数、探测方式与置信度（**只说证据来源与覆盖范围，禁写"结果完整"**）、**共享但可写（`shared_writes`，含代价说明）**、单例处理、最近审计结论、实例根目录；重命名用 `AdwEntryRow`（GNOME 原生表单模式，不用行内 contenteditable） |
 | ③ 探测页（**四态**） | `AdwPreferencesPage` + `AdwBanner` | **探测中**：`GtkSpinner` + 「正在跟踪「X」的写入…」+ **已发现 N 个写入条目**（流式；措辞不是"命中次数"）+ HeaderBar「取消探测」；**确认**：①「应用自身数据」可勾 `AdwSwitchRow`（含缓存项）②「单例处理」可勾（**由检出的单例项驱动，没检出就不出现**）③「公共目录（强制共享）」只读 ④**「共享但可写（不隔离）」只读且写明代价** + suggested-action「创建分身」（open 为「开启分身」、reconfig 为「创建分身」、rediscover 为「保存档案」）；**创建中**：「正在创建…」+ 确认与取消**都** disabled（第二次提交会建出两个实例，中途取消会留半成品）；**失败**：`AdwStatusPage` 按 `Reason` 分四套文案 + 「重试」（**恒可用**，不沿用上一态的 disabled）。降级时**同一 `AdwBanner` 从探测中起常驻、切到确认态不消失**，且列表页那条被「了解」收起后这里仍在（push 页盖住了窗口顶部横幅） |
 | 反馈 | `AdwToastOverlay`（包住 NavigationView） | 创建/删除/重命名结果——**不用模态弹窗报成功**。`AdwToastOverlay` 一次只显示一条、新的顶掉旧的（不是队列），所以 toast 只承载"刚才那步成了"这种一次性确认，**关键结果必须同时体现在行内** |
-| 空态 | `AdwStatusPage` **取代「已开启分身」这一组** | **不取代整页**：搜索框与「所有应用」照常渲染。整页藏掉，引导语（"在下方「所有应用」里点亮开关"）就指向一个不存在的区域，首启用户看不到任何开关——产品首启死路 |
+| 空态 | `AdwStatusPage` **取代「已开启分身」这一组** | **不取代整页**：搜索框与「所有应用」照常渲染。整页藏掉，引导语（"在下方「所有应用」里点亮开关"）就指向一个不存在的区域，首启用户看不到任何开关——产品首启死路。**StatusPage 不能放进 `AdwPreferencesGroup`**：`AdwPreferencesPage.Add` 只收 Group，Group 又只收 `AdwPreferencesRow`，硬塞会被裁成半截图标（只剩一个灰色半圆）；实现挂在搜索栏与列表页之间，`renderList` 只切 visible |
 | 危险确认 | `AdwAlertDialog` | 两处：删除单个实例、关闭应用开关（会连带删除该应用全部实例）。**`default response` 必须是「取消」**——把 `destructive` 响应设成默认，回车即删，而对话框存在的意义正是"不要一键删"；纯提示型对话框（"还有分身正在运行"）才把「知道了」设为默认 |
 
 ### 4.6 与 `design/appclone-gui.html` 的裁决规则（冲突时以原生为准）
@@ -470,4 +471,4 @@ activated / response / idle，地址恒定、注册一次后不再重新赋值�
 | 024 | **397 个应用的列表策略**：`GtkSearchEntry`（名称 + desktop id 双字段过滤）+ 默认只渲染前 30 + 组尾「显示全部 N 个应用」；元数据并发解析并缓存到 `cache/apps.toml`（带源文件 `mtime+size` 校验）。**不做 `GtkListView` 虚拟化**——`AdwPreferencesGroup` 不是虚拟化列表，改造成本要用整个 boxed-list 观感去换，数量级到四位数再谈 | 已定 |
 | 025 | **i18n 走 `core/i18n` 的 Go 消息表**（zh_CN + en，`LANG` 前缀匹配，其他语言回落英文），**不用 gettext**（与零 cgo 单二进制一致，且 `.mo` 文件还要装到 `/usr/share/locale`，与"单二进制 + 包依赖"的分发形态不匹配）。界面字符串不得硬编码在 GUI 代码（**落地节奏见 ADR-027**）；用户数据（实例显示名、应用名）不翻译；`.desktop` 的 `Name[zh_CN]`/`Name[en]` 同源 | 已定 |
 | 026 | **私有 runtime / 私有 DBus 的生命周期**：`runtime/` 随实例复用（启动前清残留 socket）；`dbus-daemon --session --nofork --print-address` 由 `run` 起子进程（`--nofork` 必须带，否则父进程先退拿不到地址），与 bwrap 同生共死，结束后杀 daemon 删 socket；缺 `dbus-daemon` 时**降级为共享并明确告知**（"可能无法双开"），不静默 | 已定 |
-| 027 | **GUI 文案本地化分期**（ADR-025 的落地节奏，目标不变）：GUI v1 的界面文案以 zh_CN 单语交付，`u.lang` **固定 `zh_CN`**（不是 `"zh"`——消息表键是 `zh_CN`，查不到会静默回落英文，实测出现过中文界面里插英文 reason）。理由：GTK 侧仍无自动回归闸门（`guitest.js` 只验 HTML 稿），把三屏 ~80 条文案一次性搬进消息表时，漏一个键就会在界面上直接显示成键名，而现在没有能自动走遍三屏四态的测试；英文译文也需要人工校对。**硬编码是临时状态、不是裁决**：退出条件 = GTK 回归闸门落地后，三屏文案按 `ui.*` 入表并补 en 译文，`u.lang` 改回 `i18n.Lang()`。在此之前**禁止中英混排**：动态文案（reason、core 错误）必须与静态文案同语言 | 已定（临时） |
+| 027 | **GUI 文案本地化分期**（ADR-025 的落地节奏，目标不变）：GUI v1 的界面文案以 zh_CN 单语交付，`u.lang` **固定 `zh_CN`**（不是 `"zh"`——消息表键是 `zh_CN`，查不到会静默回落英文，实测出现过中文界面里插英文 reason）。理由：GTK 侧此前没有自动回归闸门（`guitest.js` 只验 HTML 稿），把三屏 ~80 条文案一次性搬进消息表时，漏一个键就会在界面上直接显示成键名，而没有能自动走遍三屏四态的测试；英文译文也需要人工校对。**硬编码是临时状态、不是裁决**：退出条件 = GTK 回归闸门**走遍三屏四态**后，三屏文案按 `ui.*` 入表并补 en 译文，`u.lang` 改回 `i18n.Lang()`。现状（2026-11-08）：闸门只覆盖页面生命周期（列表→确认→创建→详情→返回，`design/guitest-gtk.sh`），探测四态/对话框/横幅尚不在其中，**退出条件未满足，`u.lang` 不得改回 `i18n.Lang()`**。在此之前**禁止中英混排**：动态文案（reason、core 错误）必须与静态文案同语言 | 已定（临时） |

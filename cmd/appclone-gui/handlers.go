@@ -48,7 +48,13 @@ func newCallbacks() *callbacks {
 		dialog:  map[uintptr]func(string){},
 		idle:    map[uintptr]func(uintptr) bool{},
 	}
-	c.notifyFn = func(obj gobject.Object, _ uintptr) {
+	c.notifyFn = func(obj gobject.Object, pspec uintptr) {
+		// 只认 active：行在挂载/换父时会发 parent、root 等无关 notify，
+		// 全部交给 onSwitch 等于把一个隐式不变量押在"值恰好没变"上
+		// （对抗性复审 P3）。动画结束的补发仍是 active，由 ui.toggled 去重。
+		if pspec != 0 && gobject.ParamSpecNewFromInternalPtr(pspec).GetName() != "active" {
+			return
+		}
 		if fn := c.switchHandler(obj.GoPointer()); fn != nil {
 			fn()
 		}
