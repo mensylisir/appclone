@@ -660,39 +660,23 @@ dbus-daemon 加 `Pdeathsig: SIGTERM`（GUI 被信号打死时私有总线跟着�
 
 ## 下一步
 
-路线图第 1 项（`core` 探测原语）**被本机环境挡住**：`fuse-overlayfs 1.18` 与 `fusermount3 3.18.3` 已装（用户确认），
-但容器内没有 `/dev/fuse` 设备节点（`mknod` 被沙箱拒），`fuse-overlayfs` 挂不起来。
-所以探测要拆成两半，先后顺序按"现在能不能验证"排：
+功能面已收口：探测（overlay + strace 兜底）→ 档案 → CLI → GUI 三屏 → 克隆起步 → deb/rpm/Arch 包
+→ CI/发版流程都已落地，最终树的真机冒烟（`design/probe-smoke.sh`）与三套闸门（Go / HTML 62 / GTK 18）
+全绿。剩下的不是新功能，而是**外部验证与用户决策**，按依赖顺序：
 
-1a. **可离线验证的部分**（**已完成** 2026-11-07）：`MergeUpper`（upper 归并：取应用目录/单文件本身、
-   剔除 XDG 根、whiteout 单列、按路径稳定排序）+ `Classify`（§5 有序规则表）+ `ProfileFromCandidates`
-   （paths / shared_writes / unsupported 三落点互斥）→ `core/classify_test.go` 8 组断言。
-1b. **需要真实会话的部分**（**已完成真机验证** 2026-11-07）：overlay 会话编排、两轮探测、
-    公共目录摘出、审计层 → `design/probe-smoke.sh /tmp/appclone` 退出码 0（详见"最近完成"）。
-    剩余：strace 降级尚未用真实日志校准（见"被挡住的"）。
+1. **等首次 CI 实跑**：`b41f8fa` 起每次 push 都会触发 `ci.yml` 的 go/packages/html/gtk/gtk-arm。
+   本机没有 `gh` CLI 与 GitHub 凭据、未认证请求读不到（仓库返回 404），只能在 GitHub 页面看：
+   https://github.com/mensylisir/appclone/actions
+   全绿后把 STATUS 的打包行从 `implemented` 升 `verified`；任一 job 红了，把日志带回来修，
+   不要用「YAML 解析通过」「本机跑过」替代 CI 证据。首次绿之前已经踩掉的坑：
+   - libadwaita 1.5 没有 `adw_preferences_group_get_row`（1.8 才有），4.24 本机永远暴露不出来；
+   - 无 GPU 的 Xvfb 上 GLX 可能 `BadAccess`，GTK step 已固定 `GSK_RENDERER=cairo`。
 
-其余路线图项（编号沿用 `docs/方案设计.md` §10）：
+2. **CI 绿之后的发版硬化**（不急，等稳定性证据）：actions 从 tag 改钉 commit SHA；
+   评估卸载时是否清理 `/etc/apparmor.d/bwrap`（删除比保留更有风险，需要单独设计）；
+   AUR 源码包（取决于 LICENSE）。
 
-0. **S0 spike**（半天，先把 GUI 绑定钉死）：30 行 puregotk 程序验五条——`AdwSwitchRow` 的 `notify::active` 进 Go 回调、
-   `AdwNavigationView` push/pop + Esc、`AdwAlertDialog` 异步 response id、中文 + 系统暗色，
-   以及**在 Ubuntu 24.04（libadwaita 1.5.0 / GTK 4.14.2）里跑通**（门槛定 1.5 的唯一依据）。不过就换 gotk4。
-   依赖已确认可获取：模块路径 `codeberg.org/puregotk/puregotk`，
-   `GOPROXY=https://goproxy.cn,direct` 可取到 `v0.0.0-20261003054014-d92056b0aa41`。
-1. `core` 探测原语（1a + 1b）
-2. ~~`core` 其余部分~~ **已完成**（`BuildBwrapArgs` 纯函数 + 单测、档案 TOML、实例 CRUD、`id`/`display_name` 校验）
-3. ~~CLI MVP~~ **已完成**（`add/run/list/rm/doctor/repair-desktop/version`）
-   ~~路线图 6：`add --fork`~~ **已完成（2026-11-08，第三十九轮，ADR-029）**：CLI 侧
-   `add --fork` + 运行期 per-path overlay + stale 挂载回收已真机验证；GUI 确认页入口见第四十轮。
-4. `cmd/appclone-gui`（puregotk + libadwaita 三屏，控件映射见 `tech-stack.md` §4.5）。
-   **v1 三屏已落地并通过两轮实现审查修复**（2026-11-08，见第二十八～三十轮；STATUS = `implemented`）。剩余：
-   ① ~~**GTK 侧回归闸门**~~ **已落地（2026-11-08，第三十七轮补齐三屏四态 + 横幅/致命态）**：
-      `design/guitest-gtk.sh` + `cmd/appclone-gui/screens_test.go`（2026-11-08 第四十轮起；第四十一轮加对话框响应后 18 条）。
-      剩余：真实指针/键盘事件注入（删除/重命名/关闭开关三类对话框响应已由
-      `TestGtkDialogResponses`、`TestGtkCloseSwitchDialog` 通过 `dialogHook` 覆盖）；
-   ② ~~GUI 与 CLI 的 setup 编排去重~~ **已完成**（2026-11-08，`core.FinalizeProbe`，见第三十三轮）；
-   ③ ~~GUI 文案进 i18n 目录~~ **已完成（2026-11-08，第三十七轮）**：三屏静态文案全部按
-      `ui.*` 入 `core/i18n`（zh_CN + en），`newUI` 用 `i18n.Lang()`；`i18n_test.go` 钉住
-      两语言键与占位符一致，`TestGtkEnglishStrings` 验证 en 界面真的拿英文文案。
+3. 仍被挡住的条目见下节：arm64 真机、strace 真实日志校准、LICENSE 决策、CI 首次实跑。
 
 ## 被挡住的
 
