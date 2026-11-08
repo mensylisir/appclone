@@ -365,6 +365,12 @@ func (u *ui) buildWindow() {
 	// Esc 语义（§4.6）：确认框由对话框自己处理；探测页的 Esc 等于「取消」，
 	// 其余页面**不返回**——返回靠 HeaderBar 后退按钮。AdwNavigationView
 	// 默认会把 Esc 当 pop，必须在窗口级截住，否则用户按 Esc 会误以为操作被取消。
+	// 先关掉 nav 自带的 pop-on-escape（1.4+）：只靠窗口控制器的传播顺序挡住它
+	// 是隐式的——快捷键控制器挂在 nav 上，焦点在子控件时会在冒泡阶段先于
+	// 窗口控制器触发。关闭后**页面导航**不再有第二个 Esc 处理者（对话框与
+	// 搜索框仍按各自控件语义消费 Esc），语义不再取决于控件树深度。
+	// 边界：Alt+←、鼠标返回键与触摸手势仍由 AdwNavigationView 原生处理。
+	u.nav.SetPopOnEscape(false)
 	esc := gtk.NewEventControllerKey()
 	esccb := func(_ gtk.EventControllerKey, keyval uint32, _ uint32, _ gdk.ModifierType) bool {
 		if int32(keyval) != gdk.KEY_Escape {

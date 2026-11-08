@@ -661,10 +661,10 @@ dbus-daemon 加 `Pdeathsig: SIGTERM`（GUI 被信号打死时私有总线跟着�
 **已知策略**：`display_name` 的默认值「分身 N」是用户数据，不随界面语言翻译（ADR-025）；
 英文界面首次创建仍显示「分身 1」，这是有意选择，若要中性默认名需单独定案。
 **未覆盖**：删除/重命名/关闭开关对话框的
-响应路径（第四十一轮已由 `dialogHook` 覆盖）、真实指针/键盘注入，以及 **Esc 是否会被
-`AdwNavigationView` 的 pop-on-escape 抢在窗口级 key controller 之前**（对抗复审指出：
-闸门从不发 Esc；创建态有 `SetCanPop(false)` 兜底，但普通页的「Esc=取消」语义仍需
-一条真实按键用例才能钉住）。
+响应路径（第四十一轮已由 `dialogHook` 覆盖）、真实指针/键盘注入。**Esc 竞态已结构性收口**
+（2026-11-09）：不再假设窗口级控制器一定先于 `AdwNavigationView` 的快捷键控制器——直接
+`SetPopOnEscape(false)`（1.4+），页面导航不再有第二个 Esc 处理者（对话框/搜索框仍各自处理）；闸门断言 `GetPopOnEscape()==false`，
+GTK 18 条全过。真实按键注入仍不可用（本机 XTEST 被禁），但语义已不依赖事件传播顺序。
 **许可证已定**（2026-11-08，GPL-3.0-or-later，ADR-030）：`LICENSE` 入仓、nfpm 写 SPDX 标识符、
 三格式包随附许可证文本；AUR 与发行版官方仓库的许可证前置条件不再缺失（AUR 提交本身仍未做）。
 
@@ -743,6 +743,14 @@ dbus-daemon 加 `Pdeathsig: SIGTERM`（GUI 被信号打死时私有总线跟着�
 
 ## 最近完成
 
+- 2026-11-09 **Esc 语义结构性收口**：GUI 除窗口级 `GtkEventControllerKey` 外，
+  调用 `AdwNavigationView.SetPopOnEscape(false)`（libadwaita 1.4+）。此前"窗口控制器先于
+  nav 的快捷键控制器"依赖控件树传播顺序：焦点在子控件时 nav 可能先冒泡触发并 pop，
+  与 §4.3「Esc 不承担返回」冲突。关闭后页面导航不再有第二个 Esc 处理者（探测/确认页取消、
+  其余页什么都不做；对话框/搜索框仍按各自控件语义消费 Esc），Alt+← / 鼠标返回键 /
+  触摸手势仍由 nav 原生处理。`TestGtkScreensLifecycle` 新增 `GetPopOnEscape()==false` 断言；
+  `gofmt`/`go vet`/`go test ./...`、`design/guitest-gtk.sh` **18/18 / 退出码 0**、
+  HTML 62/62。仍不可做真实指针/键盘注入（本机 XTEST 被禁），但语义不再依赖事件顺序。
 - 2026-11-08 **许可证定为 GPL-3.0-or-later（ADR-030）**：仓库根新增 `LICENSE`（GNU GPLv3 全文，
   取自 gnu.org，与本机 `/usr/share/automake-1.19/COPYING`、`/usr/share/R/licenses/GPL-3` **逐字节一致**，
   sha256 `3972dc…`；与 SPDX 副本只差 `(C)`/`©` 与 why-not-lgpl 链接写法）；另增 `packaging/copyright`

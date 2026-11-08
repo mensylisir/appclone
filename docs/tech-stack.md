@@ -155,6 +155,10 @@ puregotk 自称 experimental，所以**不允许"边写产品边试"**。第一�
 证据与边界：
 - ① push/pop 与 `popped` 信号正常；**Esc 会触发 NavigationView pop**（Xvfb + xdotool 实测），
   与 §4.3"Esc 不承担页面返回"冲突——原生实现必须在窗口级拦截 Esc，不能依赖控件默认行为。
+  **2026-11-09 收口**：窗口控制器之外再调 `adw_navigation_view_set_pop_on_escape(FALSE)`
+  （1.4+）；两道拦截中这一道是结构性的，页面导航不再有第二个 Esc 处理者（对话框/搜索框
+  仍各自消费 Esc），不再依赖控制器在控件树中的传播顺序（焦点在子控件时 nav 的快捷键
+  控制器可能先于窗口控制器冒泡触发）。边界：Alt+←、鼠标返回键、触摸手势仍由 nav 原生 pop。
 - ② `AdwSwitchRow` 的 `notify` 进 Go 回调并回读到 `active=true`（生死线通过）。
   附带约束：SwitchRow 只能放进 `GtkListBox`（`AdwPreferencesGroup` 提供），
   直接塞 `GtkBox` 会告警且行不可用。

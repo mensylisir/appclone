@@ -173,6 +173,13 @@ func TestGtkScreensLifecycle(t *testing.T) {
 		}
 		activated = true
 		u.buildWindow()
+		// Esc 的页面导航语义只有一个处理者：nav 自带的 pop-on-escape 是结构性
+		// 不变量，任何路径都不得重新打开；否则焦点在子控件时它会先于窗口控制器
+		// 冒泡触发，把"探测页取消"变成"返回"。对话框与搜索框的 Esc 不受影响。
+		if u.nav.GetPopOnEscape() {
+			fail("AdwNavigationView 的 pop-on-escape 必须关闭")
+			return
+		}
 		deadline := time.Now().Add(45 * time.Second)
 		var tick glib.SourceFunc
 		tick = func(uintptr) bool {
