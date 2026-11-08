@@ -90,7 +90,11 @@ type profileWire struct {
 	ProbeMethod    string            `toml:"probe_method,omitempty"`
 	Audit          bool              `toml:"audit,omitempty"`
 	Unsupported    []unsupportedWire `toml:"unsupported,omitempty"`
-	Ignored        []string          `toml:"ignored,omitempty"`
+	// Ignored 用指针区分"没写"与"写了空表"：`ignored = []` 是用户要求
+	// "全部隔离、不要默认忽略表"的显式声明，nil 才是"没声明"（用默认表）。
+	// 用 []string + omitempty 会把空表当零值丢掉，重新加载后又变回 nil，
+	// 等于把用户的显式配置静默换成默认值（§5.5）。
+	Ignored *[]string `toml:"ignored,omitempty"`
 }
 
 type unsupportedWire struct {
@@ -220,8 +224,12 @@ func parseProfile(app, path string, data []byte) (Profile, error) {
 		Cwd:            w.Cwd,
 		ProbeMethod:    w.ProbeMethod,
 		Audit:          w.Audit,
-		Ignored:        w.Ignored,
 		Unknown:        unknownFields(prims),
+	}
+	// `ignored = []` 与"没写 ignored"语义不同：前者是用户显式声明空表，
+	// 后者才走默认忽略表。指针保留这个区别，不能折叠成同一个 nil。
+	if w.Ignored != nil {
+		p.Ignored = *w.Ignored
 	}
 	for _, u := range w.Unsupported {
 		p.Unsupported = append(p.Unsupported, Unsupported{Kind: u.Kind, Path: u.Path, Reason: u.Reason})
@@ -261,7 +269,7 @@ func (e *Env) SaveProfile(p Profile) error {
 		Cwd:            p.Cwd,
 		ProbeMethod:    p.ProbeMethod,
 		Audit:          p.Audit,
-		Ignored:        p.Ignored,
+		Ignored:        ignoredWire(p.Ignored),
 	}
 	for _, b := range p.ExtraBinds {
 		w.ExtraBinds = append(w.ExtraBinds, b.Src+"|"+b.Dst)
@@ -281,6 +289,15 @@ func (e *Env) SaveProfile(p Profile) error {
 	return writeFileAtomic(e.ProfilePath(p.App), data, 0o600)
 }
 
+// ignoredWire 把内存里的 ignored 带进落盘形状，保留 nil 与空表的区别。
+// nil（没声明）不写这个键；非 nil（含 `[]`）都写出来，空表写成 `ignored = []`。
+func ignoredWire(v []string) *[]string {
+	if v == nil {
+		return nil
+	}
+	return &v
+}
+
 // encodeProfile 是 CreateInstance 事务的前半段：它要拿到字节写进临时文件，
 // 由提交点的 rename 决定是否真的落盘，所以不能直接调 SaveProfile。
 func encodeProfile(p Profile) ([]byte, error) {
@@ -298,7 +315,7 @@ func encodeProfile(p Profile) ([]byte, error) {
 		Cwd:            p.Cwd,
 		ProbeMethod:    p.ProbeMethod,
 		Audit:          p.Audit,
-		Ignored:        p.Ignored,
+		Ignored:        ignoredWire(p.Ignored),
 	}
 	for _, b := range p.ExtraBinds {
 		w.ExtraBinds = append(w.ExtraBinds, b.Src+"|"+b.Dst)

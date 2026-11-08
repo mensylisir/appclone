@@ -1,0 +1,790 @@
+// Command appclone-gui 是普通用户的主入口：GTK4 + libadwaita 原生三屏，
+// 经 puregotk 绑定（零 cgo）。core 是唯一事实来源，这里只做展示与交互。
+package main
+
+import (
+	"context"
+	"fmt"
+	"strings"
+	"sync"
+	"time"
+
+	"codeberg.org/puregotk/puregotk/v4/adw"
+	"codeberg.org/puregotk/puregotk/v4/gdk"
+	"codeberg.org/puregotk/puregotk/v4/glib"
+	"codeberg.org/puregotk/puregotk/v4/gtk"
+
+	"github.com/mensylisir/appclone/core"
+	"github.com/mensylisir/appclone/core/i18n"
+)
+
+// 列表上限（ADR-024）：AdwPreferencesGroup 不是虚拟化列表，
+// 一次建 400 行会让搜索输入明显顿挫。
+const (
+	listLimit   = 30
+	searchLimit = 100
+	// 搜索防抖：逐字符重建两组（最多 130 行）会让输入卡顿。
+	searchDebounceMs = 120
+)
+
+type ui struct {
+	app  *adw.Application
+	env  *core.Env
+	lang string
+
+	win    *adw.ApplicationWindow
+	nav    *adw.NavigationView
+	toast  *adw.ToastOverlay
+	header *adw.HeaderBar
+	search *gtk.SearchEntry
+	page   *adw.PreferencesPage
+
+	// 环境自检（§4.5）：bwrap 缺失 = 致命（整页只读），缺 fuse = 降级
+	// （列表页横幅可「了解」收掉，探测页那条不可收）。
+	fatalBanner *adw.Banner
+	softBanner  *adw.Banner
+	// softDismissFn 是 banner 按钮的唯一回调变量：地址恒定，只连一次。
+	softDismissFn func(adw.Banner)
+	fatal         bool
+	degraded      bool
+	softDismissed bool
+	envChecked    bool
+
+	apps      []core.App
+	groups    []*adw.PreferencesGroup
+	query     string
+	expanded  bool
+	reloadNo  int  // 全量扫描代数：只由 reload 推进
+	refreshNo int  // 运行态轮询代数：只由 refreshRunning 推进
+	loaded    bool // 首轮扫描是否已经落到界面上
+	// suppress 挡住"程序把开关拨回去"触发的 notify，避免取消操作后
+	// 又走进一次开启流程（那是死循环，不是交互）。
+	suppress map[string]bool
+	// pending 挡住一次拨动引发的重复 notify：GtkSwitch 的 active 变化可能
+	// 连发多条信号，没有它会在关闭开关时叠出两个确认框。
+	pending map[string]bool
+	// 当前压在最上面的探测页/详情页。页面被返回按钮 pop 时靠 pages 收尾，
+	// 这两个指针只用于"当前该刷新谁"与去重。
+	activeSetup  *setupView
+	activeDetail *detailView
+
+	// cb 是全部信号回调的唯一入口（见 handlers.go 的回调纪律）。
+	cb *callbacks
+	// pages 把导航页指针映射到 pop 后的收尾函数：探测页要停会话并回弹开关，
+	// 详情页要清指针并注销处理器。用页面指针而不是"猜当前是哪一页"，
+	// 是因为 pop 可能来自屏幕手势，而收尾必须对应到具体那一页。
+	pages map[uintptr]func()
+	// listScope 是列表页这一轮渲染登记的处理器；重建前整体注销。
+	listScope *renderScope
+	// listGen 是列表渲染代数。异步流程（探测失败回弹开关、关闭开关确认框）
+	// 会跨多秒，期间列表可能已重建、旧行连同整棵子树被 Unref 释放——
+	// 拿着旧行指针再 SetActive 就是 use-after-free（P1，复审发现）。
+	// 行只在代数未变时才可以直接改；变了就以数据为准（界面已经重建过）。
+	listGen int
+
+	// busy 是正在跑的删除事务数。删除要列实例、逐个 gio trash、再刷新列表，
+	// 与 setup 的 creating 同属事务态：进程被关窗带走会留下"删了一半"的
+	// 实例目录。Hold 让 GApplication 活到事务结束，关窗则直接拒绝。
+	busy int
+
+	// 搜索防抖用的一次性定时源（字段持有 → C 槽只有一个）。
+	searchFn    glib.SourceFunc
+	searchTimer uint32
+
+	// keep 只保活"取过地址、交给 puregotk"的回调变量：它的信号 trampoline 在
+	// 触发时会解引用那个地址，变量被回收就是读已释放内存。
+	// 控件包装**不用**保活：puregotk 不给包装装 finalizer，C 侧自己持有对象，
+	// 而处理器表里的闭包在登记期间持有相关包装（保活控件反而会让 keep 随每次
+	// 渲染无限增长——搜索每敲一个字就重建一次列表）。
+	keepMu sync.Mutex
+	keep   []any
+}
+
+func (u *ui) hold(v ...any) {
+	u.keepMu.Lock()
+	u.keep = append(u.keep, v...)
+	u.keepMu.Unlock()
+}
+
+// goIdle 把一次性的后台结果切回主线程。可以放心地从后台线程调用：
+// 任务进表（带锁），C 槽由 cb.idleFn 独占，不会随调用次数增长。
+func (u *ui) goIdle(fn func(uintptr) bool) { u.cb.idleAdd(fn) }
+
+func (u *ui) tr(key string, args map[string]any) string {
+	return i18n.T(u.lang, key, args)
+}
+
+func (u *ui) toastMsg(s string) {
+	t := adw.NewToast(s)
+	t.SetTimeout(3)
+	u.toast.AddToast(t)
+}
+
+// pushPage 压入导航页并登记收尾函数。收尾在 popped 信号里执行（页面真的
+// 离开栈之后），所以在收尾里 push 新页面不会和 pop 动画打架。
+func (u *ui) pushPage(page *adw.NavigationPage, cleanup func()) {
+	if cleanup != nil {
+		u.pages[page.GoPointer()] = cleanup
+	}
+	u.nav.Push(page)
+}
+
+// releasePage 释放我们持有的导航页 sink 引用。push 的 page 是 transfer none
+// （nav 自己引用它），而 puregotk 构造器已经 ref_sink 过一次；popped 之后
+// 不 Unref，每进一次详情/探测页就泄漏整页（含子树）。
+//
+// 延后一个 idle：popped 信号发出时页面可能还在信号分发的引用链上，
+// 在信号处理函数里直接 Unref 有把对象释放给正在使用的代码的风险。
+func (u *ui) releasePage(page *adw.NavigationPage) {
+	if page == nil {
+		return
+	}
+	u.goIdle(func(uintptr) bool {
+		page.Unref()
+		return false
+	})
+}
+
+// beginBusy/endBusy 包住主线程发起、后台执行的事务（目前是删除）。两个函数
+// 都只在主线程调用：Hold/Release 改的是 GApplication 的 use count，与创建
+// 窗口、销毁窗口同一条线程才安全。
+func (u *ui) beginBusy() {
+	u.busy++
+	u.app.Hold()
+}
+
+func (u *ui) endBusy() {
+	u.busy--
+	u.app.Release()
+}
+
+// buildWindow 只做一次：根页是列表，详情/探测页按需 push。
+func (u *ui) buildWindow() {
+	u.suppress = map[string]bool{}
+	u.pending = map[string]bool{}
+	u.cb = newCallbacks()
+	u.pages = map[uintptr]func(){}
+
+	u.win = adw.NewApplicationWindow(&u.app.Application)
+	u.win.SetTitle("应用分身")
+	u.win.SetDefaultSize(560, 760)
+
+	u.nav = adw.NewNavigationView()
+
+	u.page = adw.NewPreferencesPage()
+	u.page.SetTitle("应用分身")
+
+	u.header = adw.NewHeaderBar()
+	u.search = gtk.NewSearchEntry()
+	u.search.SetPlaceholderText("搜索应用")
+	u.searchFn = func(uintptr) bool {
+		u.searchTimer = 0
+		q := strings.ToLower(strings.TrimSpace(u.search.GetText()))
+		if q == u.query {
+			return false
+		}
+		u.query = q
+		u.renderList()
+		return false
+	}
+	// 窗口级回调只建一次（地址恒定），符合 handlers.go 的回调纪律。
+	searchcb := func(_ gtk.SearchEntry) {
+		if u.searchTimer != 0 {
+			glib.SourceRemove(u.searchTimer)
+		}
+		u.searchTimer = glib.TimeoutAdd(searchDebounceMs, &u.searchFn, 0)
+	}
+	u.search.ConnectSearchChanged(&searchcb)
+	u.header.SetTitleWidget(&u.search.Widget)
+
+	tv := adw.NewToolbarView()
+	tv.AddTopBar(&u.header.Widget)
+
+	// 列表页两条横幅（§4.5）：bwrap 缺失是致命态（整个列表只读），缺 fuse 是
+	// 降级态（探测仍可用，只是覆盖不完整）。两者互斥——bwrap 都没有时谈
+	// "fuse 降级"没有意义。致命横幅没有关闭按钮：环境没好，"知道了"不能
+	// 把状态解除。
+	u.fatalBanner = adw.NewBanner("分身功能不可用：未检测到 bubblewrap (bwrap)。装好它之前，下面的开关不会有反应。")
+	u.fatalBanner.SetRevealed(false)
+	u.softBanner = adw.NewBanner("探测将在兼容模式下进行（未检测到 fuse-overlayfs），结果可能不完整。")
+	u.softBanner.SetButtonLabel("了解")
+	u.softBanner.SetRevealed(false)
+	u.softDismissFn = func(adw.Banner) {
+		u.softDismissed = true
+		u.softBanner.SetRevealed(false)
+	}
+	u.softBanner.ConnectButtonClicked(&u.softDismissFn)
+
+	rootBox := gtk.NewBox(gtk.OrientationVerticalValue, 0)
+	rootBox.Append(&u.fatalBanner.Widget)
+	rootBox.Append(&u.softBanner.Widget)
+	rootBox.Append(&u.page.Widget)
+	tv.SetContent(&rootBox.Widget)
+	rootPage := adw.NewNavigationPage(&tv.Widget, "应用分身")
+	rootPage.SetTag("root")
+	u.nav.Push(rootPage)
+
+	// 页面被 pop（HeaderBar 返回按钮 / 屏幕手势）时收尾：探测页要停会话并
+	// 回弹开关，详情页要清指针并注销处理器。按页面指针查表，不猜当前状态。
+	poppedcb := func(_ adw.NavigationView, page uintptr) {
+		cleanup := u.pages[page]
+		delete(u.pages, page)
+		if cleanup != nil {
+			cleanup()
+		}
+	}
+	u.nav.ConnectPopped(&poppedcb)
+	u.hold(&poppedcb)
+
+	u.toast = adw.NewToastOverlay()
+	u.toast.SetChild(&u.nav.Widget)
+	u.win.SetContent(&u.toast.Widget)
+
+	// Esc 语义（§4.6）：确认框由对话框自己处理；探测页的 Esc 等于「取消」，
+	// 其余页面**不返回**——返回靠 HeaderBar 后退按钮。AdwNavigationView
+	// 默认会把 Esc 当 pop，必须在窗口级截住，否则用户按 Esc 会误以为操作被取消。
+	esc := gtk.NewEventControllerKey()
+	esccb := func(_ gtk.EventControllerKey, keyval uint32, _ uint32, _ gdk.ModifierType) bool {
+		if int32(keyval) != gdk.KEY_Escape {
+			return false
+		}
+		if v := u.activeSetup; v != nil {
+			// 创建中是事务态：§6.1 要求 Esc 也不生效（半成品比多点一次更糟）。
+			if v.state != "creating" {
+				v.finish(false)
+			}
+		}
+		return true
+	}
+	esc.ConnectKeyPressed(&esccb)
+	u.win.AddController(&esc.EventController)
+
+	// 只保活取过地址的回调变量：puregotk 的信号 trampoline 在触发时
+	// 会解引用它们，变量被 GC 掉就是读已释放内存。控件本身由 C 侧持有，
+	// 不需要 Go 侧锚定（锚定反而会随每次渲染无限增长）。
+	u.hold(&searchcb, &esccb)
+
+	// 关窗时先取消正在跑的探测：Probe 的 defer 会卸载 overlay、按规则
+	// 保留/清掉写层；不取消就退出，/var/tmp 下会留下挂载点与现场。
+	// 创建/保存是事务态：关窗不能把事务打断在半路（半成品比多等一秒更糟），
+	// 与 Esc、返回手势同一条规则（§6.1）。
+	closecb := func(_ gtk.Window) bool {
+		// 删除事务同样不能在半路被关窗带走（数据目录删一半比多等一秒糟）。
+		if u.busy > 0 {
+			u.toastMsg("正在处理删除，请稍候…")
+			return true
+		}
+		if v := u.activeSetup; v != nil {
+			if v.state == "creating" {
+				u.toastMsg("正在完成操作，请稍候…")
+				return true
+			}
+			v.done = true
+			if v.cancel != nil {
+				v.cancel()
+			}
+			u.activeSetup = nil
+		}
+		return false
+	}
+	u.win.ConnectCloseRequest(&closecb)
+	u.hold(&closecb)
+
+	u.win.Present()
+	u.reload()
+	u.checkEnv()
+	// 运行状态轮询（§4.7）：1 秒一拍，详情页每拍刷、列表每两拍刷——
+	// 用户在应用里退出分身，详情页的「删除/启动」要在一秒内解禁；列表的
+	// 「M 个运行中」晚一秒无所谓，没必要每秒扫一遍实例目录。
+	// 窗口不可见（最小化/在别的桌面）时整拍跳过：没人看的界面不值得开文件。
+	var tick int
+	pollcb := glib.SourceFunc(func(uintptr) bool {
+		if !u.win.GetVisible() {
+			return true
+		}
+		tick++
+		if v := u.activeDetail; v != nil {
+			v.refresh()
+		}
+		if tick%2 == 0 {
+			u.refreshRunning()
+		}
+		// 每 30 秒重跑一次环境自检：bwrap 装好之后致命态必须能自己解除
+		// （只能进不能出的状态等于卡死，§4.5）。结果没变时不会重建列表。
+		if tick%30 == 0 {
+			u.checkEnv()
+		}
+		return true
+	})
+	u.hold(&pollcb)
+	glib.TimeoutAdd(1000, &pollcb, 0)
+}
+
+// checkEnv 是启动自检（§4.5）：后台跑一次，结果回主线程决定横幅与列表是否
+// 可操作。bwrap 用 LookPath 判定；fuse 用与探测**同一份** mounter 实现判定——
+// 自检和探测各写一套"能不能用"，迟早出现"横幅说能用、探测却降级"。
+//
+// 它也能从致命态回到可用态（tech-stack §4.5 第 245 行的要求：只能进不能出
+// 的状态等于卡死）：轮询会周期性重跑，环境恢复后横幅收起、开关重新可用。
+func (u *ui) checkEnv() {
+	go func() {
+		bwrapErr := core.CheckBwrap()
+		var fuseErr error
+		if bwrapErr == nil {
+			fuseErr = u.env.OverlayAvailable()
+		}
+		u.goIdle(func(uintptr) bool {
+			u.envChecked = true
+			wasFatal := u.fatal
+			u.fatal = bwrapErr != nil
+			u.degraded = bwrapErr == nil && fuseErr != nil
+			u.applyEnvBanners()
+			if wasFatal != u.fatal {
+				// 只有可操作性变了才重建列表：每 30 秒无条件重建会打断滚动与焦点。
+				u.renderList()
+			}
+			return false
+		})
+	}()
+}
+
+func (u *ui) applyEnvBanners() {
+	u.fatalBanner.SetRevealed(u.fatal)
+	u.softBanner.SetRevealed(u.degraded && !u.fatal && !u.softDismissed)
+	// 致命态下搜索也停用：搜出一排点不动的开关，只会让用户以为程序坏了。
+	u.search.SetSensitive(!u.fatal)
+}
+
+// allocText 把绝对路径换成 ~ 形式，只用于展示。
+func (u *ui) allocText(p string) string {
+	home := u.env.Resolver.Home
+	if p == home {
+		return "~"
+	}
+	if strings.HasPrefix(p, home+"/") {
+		return "~" + strings.TrimPrefix(p, home)
+	}
+	return p
+}
+
+func (u *ui) appSub(a core.App, on bool) string {
+	if !on {
+		switch {
+		case !a.HasProfile:
+			return "尚未生成隔离档案"
+		case !a.Creatable:
+			return "未开启 · 档案已失效，点开关重新配置"
+		default:
+			return "未开启 · 已有隔离档案"
+		}
+	}
+	if a.RunningN > 0 {
+		return fmt.Sprintf("%d 个分身 · %d 个运行中", a.InstanceN, a.RunningN)
+	}
+	return fmt.Sprintf("%d 个分身", a.InstanceN)
+}
+
+// reload 重新扫描应用与实例。扫描放到后台，结果回主线程再碰控件。
+func (u *ui) reload() {
+	u.reloadNo++
+	gen := u.reloadNo
+	go func() {
+		apps, _ := u.env.ListApps(context.Background())
+		u.goIdle(func(uintptr) bool {
+			if gen != u.reloadNo {
+				return false // 已有更新的一轮，丢弃旧结果
+			}
+			u.apps = apps
+			u.loaded = true
+			u.renderList()
+			return false
+		})
+	}()
+}
+
+// refreshRunning 只刷新"已有实例"的应用，避免每 2 秒全量扫描 400 个 .desktop。
+//
+// 它**不能**推进 reloadNo：首屏全量扫描要一两秒，轮询恰好落在这段时间里时
+// 会把 reload 的结果判成过期丢掉，窗口就一直空着（真机上复现过）。轮询只
+// 跟随当前代数：更新的一轮 reload 会让在途的轮询结果作废，反之不行。
+// 另外刷新之间也要用自己的序号，避免两轮轮询乱序覆盖（旧快照后到）。
+func (u *ui) refreshRunning() {
+	if !u.loaded {
+		return // 首轮扫描还没回来，没有可刷新的基准
+	}
+	gen := u.reloadNo
+	u.refreshNo++
+	seq := u.refreshNo
+	// 在主线程序列化一份快照再交给 goroutine：直接读 u.apps 会和
+	// reload 的结果写回并发，是真实的数据竞争（go test -race 会抓）。
+	snapshot := make([]core.App, len(u.apps))
+	copy(snapshot, u.apps)
+	go func() {
+		updated := make([]core.App, len(snapshot))
+		copy(updated, snapshot)
+		for i := range updated {
+			if updated[i].InstanceN == 0 {
+				continue
+			}
+			insts, err := u.env.ListInstances(updated[i].Key)
+			if err != nil {
+				continue
+			}
+			updated[i].InstanceN = len(insts)
+			updated[i].RunningN = 0
+			for _, in := range insts {
+				if running, _ := u.env.IsRunning(updated[i].Key, in.ID); running {
+					updated[i].RunningN++
+				}
+			}
+		}
+		u.goIdle(func(uintptr) bool {
+			if gen != u.reloadNo || seq != u.refreshNo {
+				return false
+			}
+			if !sameList(u.apps, updated) {
+				u.apps = updated
+				u.renderList()
+			}
+			return false
+		})
+	}()
+}
+
+func sameList(a, b []core.App) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i].Key != b[i].Key || a[i].InstanceN != b[i].InstanceN || a[i].RunningN != b[i].RunningN ||
+			a[i].HasProfile != b[i].HasProfile || a[i].Creatable != b[i].Creatable {
+			return false
+		}
+	}
+	return true
+}
+
+// renderList 重建两组。分组键是"有没有实例"，不是"有没有档案"：
+// 关掉开关后应用必须回到「所有应用」，否则组名与行内状态自相矛盾。
+func (u *ui) renderList() {
+	// 先摘掉旧行，再关旧 scope：scope.close 会 Unref 本轮创建的 C 对象，
+	// 而父容器此时的引用还兜着它们——先 Remove 再 Unref 的顺序最不容易出错。
+	for _, g := range u.groups {
+		u.page.Remove(g)
+	}
+	u.groups = nil
+	if u.listScope != nil {
+		u.listScope.close()
+	}
+	// 旧行从这一刻起不再有效：任何还握着它们指针的异步回调都要放弃写界面。
+	u.listGen++
+	sc := &renderScope{c: u.cb}
+	u.listScope = sc
+
+	var on, off []core.App
+	for _, a := range u.apps {
+		if a.InstanceN > 0 {
+			on = append(on, a)
+			continue
+		}
+		if u.query == "" || strings.Contains(strings.ToLower(a.Name), u.query) ||
+			strings.Contains(strings.ToLower(a.Key), u.query) {
+			off = append(off, a)
+		}
+	}
+
+	if len(on) == 0 {
+		// 空态只取代「已开启分身」这一组：搜索与「所有应用」照常渲染。
+		// 整页藏掉会让首启用户看不到任何开关（引导语指向不存在的区域）。
+		g := adw.NewPreferencesGroup()
+		sc.own(&g.Widget)
+		sp := adw.NewStatusPage()
+		sp.SetIconName("system-users-symbolic")
+		sp.SetTitle("还没有分身")
+		sp.SetDescription("在下方「所有应用」里点亮一个开关，appclone 会为它准备一个独立的副本。")
+		sc.own(&sp.Widget)
+		g.Add(&sp.Widget)
+		u.page.Add(g)
+		u.groups = append(u.groups, g)
+	} else {
+		g := adw.NewPreferencesGroup()
+		sc.own(&g.Widget)
+		g.SetTitle("已开启分身")
+		for _, a := range on {
+			g.Add(&u.newAppRow(a, true, sc).Widget)
+		}
+		u.page.Add(g)
+		u.groups = append(u.groups, g)
+	}
+
+	g := adw.NewPreferencesGroup()
+	sc.own(&g.Widget)
+	g.SetTitle("所有应用")
+	pool := off
+	var extra *adw.ActionRow
+	if u.query == "" && !u.expanded && len(off) > listLimit {
+		pool = off[:listLimit]
+		extra = u.moreRow(fmt.Sprintf("显示全部 %d 个应用", len(off)), sc)
+	} else if u.query != "" && len(off) > searchLimit {
+		pool = off[:searchLimit]
+		// 搜索溢出说明是纯文本，不是可点的「显示全部」：搜索分支不读
+		// expanded，做成可点行就是一个点不动的死点击（设计稿也是纯文本）。
+		row := adw.NewActionRow()
+		row.SetTitle(fmt.Sprintf("已显示前 %d 个匹配（共 %d 个），再输几个字缩小范围", searchLimit, len(off)))
+		row.SetSensitive(false)
+		sc.own(&row.Widget)
+		extra = row
+	}
+	for _, a := range pool {
+		g.Add(&u.newAppRow(a, false, sc).Widget)
+	}
+	if len(pool) == 0 {
+		row := adw.NewActionRow()
+		sc.own(&row.Widget)
+		if u.query != "" {
+			row.SetTitle("没有匹配「" + u.search.GetText() + "」的应用")
+		} else {
+			row.SetTitle("全部应用都已开启分身")
+		}
+		row.SetSensitive(false)
+		g.Add(&row.Widget)
+	} else if extra != nil {
+		g.Add(&extra.Widget)
+	}
+	u.page.Add(g)
+	u.groups = append(u.groups, g)
+}
+
+func (u *ui) moreRow(title string, sc *renderScope) *adw.ActionRow {
+	row := adw.NewActionRow()
+	sc.own(&row.Widget)
+	row.SetTitle(title)
+	if u.fatal {
+		// 致命态下整页只读（§4.5）：行还看得见，但不响应任何点击。
+		row.SetSensitive(false)
+		return row
+	}
+	row.SetActivatable(true)
+	sc.row(row, func() {
+		u.expanded = true
+		u.renderList()
+	})
+	return row
+}
+
+func (u *ui) newAppRow(a core.App, on bool, sc *renderScope) *adw.SwitchRow {
+	row := adw.NewSwitchRow()
+	sc.own(&row.Widget)
+	row.SetTitle(a.Name)
+	row.SetSubtitle(u.appSub(a, on))
+	row.SetActive(on)
+
+	if u.fatal {
+		// bwrap 缺失时任何操作最终都会失败：开关停用、箭头不出现，
+		// 而不是允许用户点进去走一遍必然失败的路（§4.5）。
+		row.SetSensitive(false)
+		return row
+	}
+
+	// 先设属性再挂回调：属性变化本身也会发 notify，挂在后面等于只监听用户操作。
+	ref := rowRef{row: row, gen: u.listGen}
+	sc.switchRow(row, func() { u.onSwitch(a, ref, on) })
+
+	if on {
+		btn := gtk.NewButtonFromIconName("go-next-symbolic")
+		sc.own(&btn.Widget)
+		btn.AddCssClass("flat")
+		btn.SetTooltipText("打开详情")
+		sc.button(btn, func() { u.pushDetail(a.Key) })
+		row.AddSuffix(&btn.Widget)
+	}
+	return row
+}
+
+// rowRef 绑定"哪一轮渲染的哪一行"。异步结果回来时先比代数：列表重建过就
+// 不再碰旧控件（它已经被 Unref 释放），真实状态由重建后的界面自行表达。
+type rowRef struct {
+	row *adw.SwitchRow
+	gen int
+}
+
+// onSwitch 只在用户真的拨动开关时进入流程：程序回拨会先置 suppress。
+func (u *ui) onSwitch(a core.App, ref rowRef, was bool) {
+	if u.suppress[a.Key] || u.pending[a.Key] {
+		return
+	}
+	if ref.row.GetActive() == was {
+		return
+	}
+	if ref.row.GetActive() {
+		u.beginEnable(a, ref)
+	} else {
+		u.confirmDisable(a, ref)
+	}
+}
+
+// revert 把开关拨回用户拨动前的状态。行若已随上一轮渲染销毁就什么都不做：
+// 那次重建读的是磁盘真实状态，界面本来就是对的。
+func (u *ui) revert(ref rowRef, key string, to bool) {
+	if ref.gen != u.listGen {
+		return
+	}
+	u.suppress[key] = true
+	ref.row.SetActive(to)
+	u.suppress[key] = false
+}
+
+// beginEnable 按档案状态选入口：没档案 → 首次配置；档案失效 → 重新配置；
+// 档案可用 → 直接开启（复用档案，跳过探测）。
+func (u *ui) beginEnable(a core.App, ref rowRef) {
+	u.pending[a.Key] = true
+	mode := "open"
+	switch {
+	case !a.HasProfile:
+		mode = "setup"
+	case !a.Creatable:
+		mode = "reconfig"
+	}
+	// id 分配在 core 里做（AllocID 保证"第一个空闲"，删掉中间一个也不会重名）。
+	if !u.pushSetup(a.Key, mode, func(ok bool) {
+		u.pending[a.Key] = false
+		if !ok {
+			u.revert(ref, a.Key, false)
+			return
+		}
+		u.reload()
+		// §6.1：确认后落到刚建出来的详情页，而不是回列表——用户此刻要看的是
+		// 那个实例。open（复用已有档案）同样建出了一个新实例，一并落到详情页。
+		u.pushDetail(a.Key)
+	}) {
+		u.pending[a.Key] = false
+		u.revert(ref, a.Key, false)
+	}
+}
+
+func (u *ui) confirmDisable(a core.App, ref rowRef) {
+	u.pending[a.Key] = true
+	if a.RunningN > 0 {
+		d := adw.NewAlertDialog("还有分身正在运行", "请先在应用里退出正在运行的分身，再关闭开关。")
+		d.AddResponse("ok", "知道了")
+		d.SetDefaultResponse("ok")
+		u.cb.onDialog(d, func(_ string) {
+			u.pending[a.Key] = false
+			u.revert(ref, a.Key, true)
+		})
+		d.Choose(&u.win.Widget, nil, nil, 0)
+		return
+	}
+	d := adw.NewAlertDialog("关闭「"+a.Name+"」的分身？", "这会删除该应用的全部分身，数据移入回收站，可从回收站恢复。")
+	d.AddResponse("cancel", "取消")
+	d.AddResponse("trash", "移到回收站")
+	d.SetDefaultResponse("cancel")
+	d.SetResponseAppearance("trash", adw.ResponseDestructiveValue)
+	u.cb.onDialog(d, func(resp string) {
+		u.pending[a.Key] = false
+		if resp != "trash" {
+			u.revert(ref, a.Key, true)
+			return
+		}
+		// 事务期间 Hold + 挡住关窗：删一半的实例目录比多等一秒糟。
+		u.beginBusy()
+		go func() {
+			out := u.deleteAllInstances(a.Key)
+			u.goIdle(func(uintptr) bool {
+				u.endBusy()
+				switch {
+				case out.openErr != nil:
+					// 拿不到写锁/列不出实例不是"有分身在跑"：按真实原因提示，
+					// 否则用户会去应用里找一个根本不存在的运行实例。
+					u.revert(ref, a.Key, true)
+					u.toastMsg(u.tr(errorKey(out.openErr), errorArgs(out.openErr)))
+				case out.firstErr != nil:
+					// 有失败就说明还有实例没删掉，开关必须回到"开"。
+					// 个数必须能对上：deleted + failed + running = 总数，
+					// 少报一类会让用户以为"都处理完了"（P3，复审发现）。
+					u.revert(ref, a.Key, true)
+					var parts []string
+					if out.deleted > 0 {
+						parts = append(parts, fmt.Sprintf("已移入回收站 %d 个", out.deleted))
+					}
+					parts = append(parts, fmt.Sprintf("%d 个没能删除：%s",
+						out.failed, u.tr(errorKey(out.firstErr), errorArgs(out.firstErr))))
+					if out.running > 0 {
+						parts = append(parts, fmt.Sprintf("还有 %d 个在运行，退出应用后再关一次开关", out.running))
+					}
+					u.toastMsg(strings.Join(parts, "；"))
+				case out.running > 0:
+					u.revert(ref, a.Key, true)
+					if out.deleted > 0 {
+						u.toastMsg(fmt.Sprintf("已移入回收站 %d 个；还有 %d 个在运行，退出应用后再关一次开关", out.deleted, out.running))
+					} else {
+						u.toastMsg(fmt.Sprintf("还有 %d 个分身正在运行，请先在应用里退出它们再关闭开关", out.running))
+					}
+				default:
+					u.toastMsg("已删除「" + a.Name + "」的全部分身（移入回收站）")
+				}
+				u.reload()
+				return false
+			})
+		}()
+	})
+	d.Choose(&u.win.Widget, nil, nil, 0)
+}
+
+// deleteOutcome 把"删除发生了什么事"拆开记：全成功 / 还有在跑的 / 真删失败 /
+// 连实例列表都读不到。合成一个 bool 会让界面用一句"有实例正在运行"掩盖
+// 锁超时、gio 缺失、权限不足这些完全不同的原因（CLI 的退出码也是分开的）。
+type deleteOutcome struct {
+	deleted  int
+	running  int // 因运行中而没删的实例数
+	failed   int // 因删除本身失败而没删的实例数
+	firstErr error
+	openErr  error // 拿不到写锁或列不出实例：什么都没做
+}
+
+// deleteAllInstances 删除一个应用的全部分身。
+//
+// 运行态必须**整体**判：确认框弹出后用户可能又启动了一个，若逐个"边删边判"，
+// 已停止的实例会被删掉、运行中的被挡住，等于部分执行了一个本应整体拒绝的
+// 操作（§6.1「有实例正在运行 → 先拒绝」）。所以先全量检查，任一在跑就
+// 一个都不删。
+func (u *ui) deleteAllInstances(key string) deleteOutcome {
+	var out deleteOutcome
+	ctx := context.Background()
+	st, err := u.env.OpenState(ctx, 5*time.Second)
+	if err != nil {
+		out.openErr = err
+		return out
+	}
+	defer st.Close()
+	insts, err := u.env.ListInstances(key)
+	if err != nil {
+		out.openErr = err
+		return out
+	}
+	for _, in := range insts {
+		if running, _ := u.env.IsRunning(key, in.ID); running {
+			out.running++
+		}
+	}
+	if out.running > 0 {
+		return out
+	}
+	for _, in := range insts {
+		if derr := u.env.DeleteInstance(ctx, key, in.ID); derr != nil {
+			// 删除期间被启动也算"运行中"：DeleteInstance 拿不到 run.lock 时
+			// 报的就是它。区分这两种失败，提示才指得对方向。
+			if running, _ := u.env.IsRunning(key, in.ID); running {
+				out.running++
+				continue
+			}
+			out.failed++
+			if out.firstErr == nil {
+				out.firstErr = derr
+			}
+			continue
+		}
+		out.deleted++
+	}
+	return out
+}

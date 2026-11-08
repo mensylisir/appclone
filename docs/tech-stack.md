@@ -162,7 +162,9 @@ puregotk 自称 experimental，所以**不允许"边写产品边试"**。第一�
   真实点击仍属 GUI 冒烟待办（S0 只验绑定能力）。
 - ④ 中文标题渲染正常，`AdwStyleManager.GetDark()` 可读（本机会话为浅色）。
 - ⑤ 在 `ubuntu:24.04`（GTK 4.14.5 / libadwaita 1.5.0）容器内 Xvfb 跑通同一程序、退出码 0，
-  无 `init` 符号缺失 panic；**未覆盖三屏本身**——三屏尚未实现，这一条验的是"绑定在 1.5 上可用"。
+  无 `init` 符号缺失 panic；**未覆盖三屏本身**——S0 验的是"绑定在 1.5 上可用"。
+  三屏 v1 已落地（`cmd/appclone-gui/`，2026-11-08），在 1.5 上的控件子集未再加测；
+  GTK 侧回归闸门仍未建立（见 `STATUS.md` 与 `NEXT.md` "被挡住的"）。
 
 ### 4.4 版本门槛与一条必须承认的边界
 
@@ -257,17 +259,30 @@ HTML 稿是**交互行为基线，不是视觉基线**。它不是 GTK 渲染的
 - 进度用 `AdwBanner` + 行内 `GtkSpinner` 呈现，**不用模态对话框堵住窗口**（用户要能中途取消）；
 - `core.Probe(ctx, app, ProgressFn)` 是唯一入口，GUI 侧 `ProgressFn` 内部转 `IdleAdd`——这层转换是 GUI 包唯一的 GTK 耦合点。
 
-`ProgressFn` 必须能表达"还在动"，否则十秒的静默等于卡死。事件结构（`core` 定义，GUI 只渲染）：
+`ProgressFn` 必须能表达"还在动"，否则十秒的静默等于卡死。事件结构（`core.ProbeProgress`，`core` 定义，GUI 只渲染）：
 
 | 字段 | 用途 |
 |---|---|
-| `Stage` | `checking`（四道闸门）/ `running`（应用在跑）/ `collecting`（收集 upper）/ `done` |
-| `FoundPaths` | 已发现路径数，**流式递增**——数字在涨，用户就知道没卡 |
-| `Degraded` / `Reason` | 是否降级到 strace + 原因；GUI 据此切 `AdwBanner` 文案 |
+| `Stage` | `round_done`（一轮会话结束，附合并后的条目数）/ `fallback`（无 fuse-overlayfs，本次改走 strace） |
+| `Round` / `Rounds` | 第几轮 / 共几轮；两轮是默认值（登录态往往第二轮才落盘） |
+| `Entries` | 已发现的**写入条目数**（不是路径数、不是命中次数，§6.1 文案红线）；每轮结束流式递增，数字在涨就说明没卡 |
+
+实现口径（2026-11-08）：`fallback` 事件在**目标应用未运行的闸门之后**才发——闸门失败时用户该看到的是
+`app_running`，不是一条不会发生的 fuse 降级横幅。`checking`/`collecting` 这类闸门级事件不进
+`ProbeProgress`：GUI 自己就有 `probing` 态，多一个 core 侧枚举只会两处不同步。
 
 **取消必须真的传播**：`ctx.Done()` 要一路传到 `kill(-pgid)` 与 `fusermount3 -u`，
 不能只把 UI 切回列表就完事——留下的进程会继续写 upper，下次探测拿到一份混了两个会话的结果。
 取消后的状态是"什么都没发生"：档案不写、实例不建、`probe/` 清空。
+
+**回调槽纪律（purego 的硬上限，2026-11-08 复审发现并修复）**：purego 给每个 `*func` 变量地址在进程内
+**永久**占一个 C 回调槽，上限 **2000**（`purego/syscall_sysv.go` 的 `maxCB`；`NewCallbackFnPtr` 只按变量地址复用）。
+所以**渲染路径里禁止"每次新建闭包变量再 Connect"**——列表每重建一次（搜索每敲一个字都会重建）就要
+几十个槽，一小时内必然 `panic: purego: the maximum number of callbacks has been reached`。
+GUI 的做法（`cmd/appclone-gui/handlers.go`）：C 槽只由 5 个 `callbacks` 字段独占（notify / clicked /
+activated / response / idle，地址恒定、注册一次后不再重新赋值），渲染只往按 GObject 指针索引的
+**处理器表**里登记纯 Go 闭包；页面重建时整表注销（`renderScope.close()`）。新增控件一律走
+`renderScope` 的三个登记方法（登记即连接），不要回到 per-widget 闭包的写法。
 
 **四态是一个状态机，不是四段 if**：`probing → confirm → creating → done`，`probing → error`；
 `probing` 期间「取消」可用、「创建」不存在（不是禁用）；`creating` 期间**取消也不可用**（事务已经开始）；
@@ -279,9 +294,9 @@ HTML 稿是**交互行为基线，不是视觉基线**。它不是 GTK 渲染的
 | 项 | 策略 | 理由 |
 |---|---|---|
 | 详情页实例运行态 | 1s 轮询该应用的实例 `run.lock`（`LOCK_NB` 试探） | 用户在应用里退出分身，界面要在一秒内反映出来，否则「删除」会一直是灰的 |
-| 列表页「M 个运行中」 | 2s 轮询**只有实例的应用**（`InstanceN > 0`） | 全量 397 个应用 × flock 是纯浪费；无实例的应用运行数恒为 0，不必问 |
-| 窗口不可见 | **暂停轮询**（`GtkWindow::notify::is-active` + `AdwApplicationWindow` 的 `window-state`） | 最小化/切到后台还每秒开文件是耗电，也不礼貌 |
-| 轮询失败（IO 错误） | 不弹错，标注「状态未知」并降级到 5s | 运行态查询失败不该打断用户操作 |
+| 列表页「M 个运行中」 | 每两拍（2s）轮询**只有实例的应用**（`InstanceN > 0`） | 全量 397 个应用 × flock 是纯浪费；无实例的应用运行数恒为 0，不必问 |
+| 窗口不可见 | **暂停轮询**（`GtkWindow::GetVisible`） | 最小化/切到别的桌面还每秒开文件是耗电，也不礼貌 |
+| 轮询失败（IO 错误） | 不弹错、不动界面（保持上一次的数字） | 运行态查询失败不该打断用户操作；下一次轮询自己会恢复 |
 
 ### 4.8 应用标识与桌面集成（GNOME 原生行为都是白拿的）
 
@@ -453,5 +468,6 @@ HTML 稿是**交互行为基线，不是视觉基线**。它不是 GTK 渲染的
 | 022 | **状态一致性按多进程处理**（桌面入口、GUI、CLI 会同时动作）：写操作持 `AC_BASE/.lock`（`flock(LOCK_EX)`，等 5 秒超时，退出码 6）；所有 TOML 写入 `tmp + fsync + rename`；实例创建用 `os.Mkdir` 的 `EEXIST` 作唯一判重（**不在锁外 stat+Mkdir**，那是 TOCTOU） | 已定 |
 | 023 | **运行状态判定用 `run.lock` 的 flock**，不用 `pgrep`（同名主实例让判定永真）、不用 PID 文件（崩溃后 stale 假阳性）：`run` 持锁 → GUI 用 `LOCK_NB` 试探，"拿得到=没跑、拿不到=在跑"，进程死锁由内核释放 | 已定 |
 | 024 | **397 个应用的列表策略**：`GtkSearchEntry`（名称 + desktop id 双字段过滤）+ 默认只渲染前 30 + 组尾「显示全部 N 个应用」；元数据并发解析并缓存到 `cache/apps.toml`（带源文件 `mtime+size` 校验）。**不做 `GtkListView` 虚拟化**——`AdwPreferencesGroup` 不是虚拟化列表，改造成本要用整个 boxed-list 观感去换，数量级到四位数再谈 | 已定 |
-| 025 | **i18n 走 `core/i18n` 的 Go 消息表**（zh_CN + en，`LANG` 前缀匹配，其他语言回落英文），**不用 gettext**（与零 cgo 单二进制一致，且 `.mo` 文件还要装到 `/usr/share/locale`，与"单二进制 + 包依赖"的分发形态不匹配）。界面字符串不得硬编码在 GUI 代码；用户数据（实例显示名、应用名）不翻译；`.desktop` 的 `Name[zh_CN]`/`Name[en]` 同源 | 已定 |
+| 025 | **i18n 走 `core/i18n` 的 Go 消息表**（zh_CN + en，`LANG` 前缀匹配，其他语言回落英文），**不用 gettext**（与零 cgo 单二进制一致，且 `.mo` 文件还要装到 `/usr/share/locale`，与"单二进制 + 包依赖"的分发形态不匹配）。界面字符串不得硬编码在 GUI 代码（**落地节奏见 ADR-027**）；用户数据（实例显示名、应用名）不翻译；`.desktop` 的 `Name[zh_CN]`/`Name[en]` 同源 | 已定 |
 | 026 | **私有 runtime / 私有 DBus 的生命周期**：`runtime/` 随实例复用（启动前清残留 socket）；`dbus-daemon --session --nofork --print-address` 由 `run` 起子进程（`--nofork` 必须带，否则父进程先退拿不到地址），与 bwrap 同生共死，结束后杀 daemon 删 socket；缺 `dbus-daemon` 时**降级为共享并明确告知**（"可能无法双开"），不静默 | 已定 |
+| 027 | **GUI 文案本地化分期**（ADR-025 的落地节奏，目标不变）：GUI v1 的界面文案以 zh_CN 单语交付，`u.lang` **固定 `zh_CN`**（不是 `"zh"`——消息表键是 `zh_CN`，查不到会静默回落英文，实测出现过中文界面里插英文 reason）。理由：GTK 侧仍无自动回归闸门（`guitest.js` 只验 HTML 稿），把三屏 ~80 条文案一次性搬进消息表时，漏一个键就会在界面上直接显示成键名，而现在没有能自动走遍三屏四态的测试；英文译文也需要人工校对。**硬编码是临时状态、不是裁决**：退出条件 = GTK 回归闸门落地后，三屏文案按 `ui.*` 入表并补 en 译文，`u.lang` 改回 `i18n.Lang()`。在此之前**禁止中英混排**：动态文案（reason、core 错误）必须与静态文案同语言 | 已定（临时） |

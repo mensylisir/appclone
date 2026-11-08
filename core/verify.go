@@ -56,6 +56,21 @@ func (e *Env) AuditDir(app, id string) string {
 	return filepath.Join(e.InstancePath(app, id), "audit")
 }
 
+// CachedAuditVerdict 读上一次 verify 写下的结论，**只读、不消费证据**。
+// GUI 详情页需要显示"最近审计"，但它不能调用 Verify：那会拿 run.lock、
+// 甚至 finalize 掉证据，等于看一眼就把证据吃掉。
+//
+// reason 一起返回：`unverified` 不是一种状态而是四种（没开审计 / 证据没写完 /
+// 确实没观测到写入 / 证据读不出来）。只把结论交给界面，就等于把"证据读不出"
+// 显示成"没结论"——用户据此会去重跑而不是去修文件。
+func (e *Env) CachedAuditVerdict(app, id string) (conclusion, reason, generatedAt string, ok bool) {
+	s, has, err := readSummary(filepath.Join(e.AuditDir(app, id), "summary.toml"))
+	if err != nil || !has {
+		return "", "", "", false
+	}
+	return s.Conclusion, s.Reason, s.GeneratedAt, true
+}
+
 // latestQuarantine 返回实例 audit/ 下最近的一份 quarantine-*。
 // 名字里带 UTC 时间戳，字典序即时间序。没有则返回空串。
 func (e *Env) latestQuarantine(app, id string) string {
@@ -86,10 +101,10 @@ func (e *Env) upperDir(app, id string) string {
 
 // Verify 判定"这个分身有没有写到实例目录之外"（§6.5）。
 //
-// 能力边界必须说清：本版本没有审计写入器（`run --audit` 未实现），所以正常情况下
-// `audit/upper` 不存在，结论只能是 `unverified` + `reason=audit_not_enabled`。
-// 但判定逻辑本身是完整的、可测的——喂给它一棵 upper 树，它就能给出 verified /
-// leak-detected。等审计层落地时，缺的只是一个"生产者"。
+// 证据生产者是 `run --audit`（探针写层）；没有审计过的实例读不到 upper，
+// 结论只能是 `unverified` + `reason=audit_not_enabled`——**不是通过**。
+// 判定逻辑本身是纯的、可测的：喂给它一棵 upper 树，它就能给出 verified /
+// leak-detected。
 func (e *Env) Verify(app, id string) (Verdict, error) {
 	in, err := e.GetInstance(app, id)
 	if err != nil {

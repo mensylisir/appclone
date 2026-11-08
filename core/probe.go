@@ -13,6 +13,17 @@ import (
 	"time"
 )
 
+// ProbeProgress 是探测的进度事件。GUI 靠它显示"已发现 N 个写入条目"，
+// 而不是等全部结束才一次性画出来——十几秒到一分钟的空屏会被当成卡死。
+//
+// Entries 是**写入条目数**，不是次数（overlay 拿不到次数，§6.1 文案红线）。
+type ProbeProgress struct {
+	Stage   string // round_done | fallback（无 fuse-overlayfs，本次走 strace）
+	Round   int
+	Rounds  int
+	Entries int
+}
+
 // ProbeOptions 是探测的全部可调项。
 type ProbeOptions struct {
 	Command  []string  // 应用命令（Exec + 参数）
@@ -20,6 +31,8 @@ type ProbeOptions struct {
 	Stderr   io.Writer // 会话的 stderr（GUI 无 stderr，可为 nil）
 	Mounter  OverlayMounter
 	Runner   SessionRunner
+	// Progress 可为 nil；调用发生在后台会话线程里，调用方自己负责切回 UI 线程。
+	Progress func(ProbeProgress)
 	// Timeout 是**每一轮**会话的硬上限：用户开了应用就不管了的情况必须有尽头。
 	Timeout time.Duration
 	// Rounds 是要跑几轮，默认 2（§4）。登录态、token 往往第二次启动才落盘：
@@ -37,6 +50,22 @@ type ProbeResult struct {
 }
 
 const probeTimeoutDefault = 30 * time.Minute
+
+// reportProbeProgress 把"到目前为止合并后的条目数"交给调用方。
+// 用候选数而不是原始 upper 条目数：白化文件与 XDG 根本身不是"会隔离的写入"，
+// 拿它们计数会让界面数字比最终确认页多出一截。
+func reportProbeProgress(opt ProbeOptions, e *Env, round, rounds int, entries []UpperEntry) {
+	if opt.Progress == nil {
+		return
+	}
+	cands, _ := e.Resolver.MergeUpper(entries)
+	opt.Progress(ProbeProgress{
+		Stage:   "round_done",
+		Round:   round + 1,
+		Rounds:  rounds,
+		Entries: len(cands),
+	})
+}
 
 // Probe 跑一次 overlay-diff 探测并产出档案（docs/discover.md §3 全节）。
 //
@@ -75,6 +104,8 @@ func (e *Env) Probe(ctx context.Context, app string, opt ProbeOptions) (ProbeRes
 		if opt.Stderr != nil {
 			fmt.Fprintln(opt.Stderr, "appclone: 没有可用的 fuse-overlayfs，改用 strace 跟踪（结果置信度较低，且需要多开几次应用）")
 		}
+		// 降级事件由 probeStrace 在闸门之后发（见那里的注释）：还没确认能真的
+		// 开跑就告诉界面"已降级"，紧接着又报 app_running，横幅会和错误文案打架。
 		return e.probeStrace(ctx, app, opt, runner)
 	}
 	return e.probeSession(ctx, app, opt, mounter, runner)
@@ -91,6 +122,12 @@ func (e *Env) probeStrace(ctx context.Context, app string, opt ProbeOptions, run
 		return ProbeResult{}, err
 	} else if running {
 		return ProbeResult{}, errBusy("err.probe.app_running", map[string]any{"exec": filepath.Base(opt.Command[0])})
+	}
+	// 闸门过了、strace 会话确定要跑，才把"本次降级"告诉界面：GUI 会在探测页
+	// 起一条常驻横幅，切到确认态也不消失。提前发就等于给一个不会发生的
+	// 会话挂横幅（闸门失败时用户看到的应是 app_running，不是 fuse 提示）。
+	if opt.Progress != nil {
+		opt.Progress(ProbeProgress{Stage: "fallback"})
 	}
 	work, err := os.MkdirTemp(e.tmpRoot(), fmt.Sprintf("appclone-strace-%d-", e.UID))
 	if err != nil {
@@ -159,6 +196,7 @@ func (e *Env) probeStrace(ctx context.Context, app string, opt ProbeOptions, run
 			entries = append(entries, ParseStrace(f, e.Resolver.Home)...)
 			f.Close()
 		}
+		reportProbeProgress(opt, e, round, rounds, entries)
 	}
 	cands, whiteouts := e.Resolver.MergeUpper(entries)
 	p := e.Resolver.ProfileFromCandidates(app, "strace", cands)
@@ -316,6 +354,11 @@ func (e *Env) probeSession(ctx context.Context, app string, opt ProbeOptions, mo
 		// 后续轮次沿用最后一轮的结果；前面轮次只要没报错就继续——
 		// "第二轮才写 token" 正是要覆盖的情形。
 		res = r
+		// 中途读一次 upper 只为进度展示；读失败不影响主流程（结束时还有一次
+		// 权威读取，错误会在那里上报）。
+		if ents, present, rerr := readUpperTree(upper); rerr == nil && present {
+			reportProbeProgress(opt, e, round, rounds, ents)
+		}
 	}
 
 	// 会话结束 → 先停 dbus、再卸载（顺序反了会 EBUSY）。

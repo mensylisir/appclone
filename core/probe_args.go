@@ -279,10 +279,12 @@ func (e *Env) probeSharedWrites() []string {
 }
 
 // probeUnsupported 记录"文件路径判定不了"的东西：凭证在 DBus 服务里。
+// 路径用档案的 store 形态（`~/…`）：候选派生（ProfileFromCandidates）与模板
+// 写出的都是这种形态，混用绝对路径会让同一目录在合并时变成两条。
 func probeUnsupported(e *Env) []Unsupported {
 	return []Unsupported{{
 		Kind:   "keyring",
-		Path:   filepath.Join(e.Resolver.RealHome, ".local", "share", "keyrings"),
+		Path:   e.Resolver.ToStoreForm(filepath.Join(e.Resolver.RealHome, ".local", "share", "keyrings")),
 		Reason: "probe.why.keyring",
 	}}
 }

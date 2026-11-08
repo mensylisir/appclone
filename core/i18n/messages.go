@@ -27,6 +27,7 @@ var messages = map[string]map[string]string{
 		"err.env.trash_failed":  "移入回收站失败：{output}",
 
 		"err.env.root":           "appclone 不能用 root 运行：root 会话下整个根文件系统是可写的，误操作会改到宿主系统；而且 root 下 bwrap 本来就能跑通，验证结果会掩盖普通用户的问题。请用你自己的账号运行。",
+		"err.env.bwrap_missing":  "系统里找不到 bwrap（bubblewrap），分身功能不可用。请先安装 bubblewrap（多数发行版包名就叫 bubblewrap）再打开 appclone。",
 		"err.env.no_dbus_daemon": "系统里没有 dbus-daemon，无法为这个分身启动私有会话总线；分身将与主实例共用会话总线，可能无法双开。",
 
 		// 运行
@@ -161,6 +162,7 @@ var messages = map[string]map[string]string{
 		"err.env.trash_failed":  "Moving to trash failed: {output}",
 
 		"err.env.root":           "appclone refuses to run as root: with root the whole filesystem is writable and a mistake can damage the host; also bwrap always works as root, which hides non-privileged failures. Run it as your own user.",
+		"err.env.bwrap_missing":  "bwrap (bubblewrap) was not found, so cloned apps cannot run. Install bubblewrap (the package is usually called bubblewrap) and reopen appclone.",
 		"err.env.no_dbus_daemon": "dbus-daemon is missing, so no private session bus can be started; this clone will share the session bus and may fail to run alongside the original.",
 		"err.run.start_failed":   "Starting failed ({exec}). Run appclone doctor to check bwrap and user namespaces.",
 

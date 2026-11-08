@@ -42,6 +42,127 @@ Xvfb）同一份 `CGO_ENABLED=0` 程序均跑通 SwitchRow notify→Go 回调、
 证据：`gofmt -l .` 空、`go vet ./...` 干净、`go test ./...` 全绿（GVM go1.26.5），
 `design/probe-smoke.sh /tmp/appclone` 退出码 0（9 步全过）。
 
+**第二十八轮：GUI v1 三屏落地（`implemented`）**（2026-11-08）。`cmd/appclone-gui/` 以 puregotk 直连
+GTK4 + libadwaita，零 cgo：列表（SwitchRow/运行态/搜索/分页/空态只取代一组）、详情（启动/重命名/删除、
+只读档案、最近审计、重新探测）、首次配置四态机（probing→confirm→creating→error；确认页四组 +
+「共享但可写」代价文案；strace 降级横幅常驻）。Esc 在窗口级拦截（`NavigationView` 默认会 pop），
+返回时取消探测并回弹开关；`core` 仍是唯一事实来源（GUI 只调 `ListApps`/`CreateInstance`/`Probe` 等）。
+**冒烟暴露并修掉一个真实缺陷**：首屏全量扫描与 2 秒运行态轮询共用 `reloadNo`，首轮扫描超过两秒时
+轮询会把尚未回写的结果判成过期 → 首次启动可长时间空列表；改为两个独立代数 + `loaded` 门。
+证据：`gofmt -l .` 空、`go vet ./...` 干净、`go test -count=1 ./...` 全绿（新增
+`TestProbeReportsFallbackToGUI`）、`CGO_ENABLED=0 go build ./...` 通过、`node design/guitest.js` 58/58；
+broadway + chromium/puppeteer（假 HOME）截图确认列表/搜索/详情/删除确认默认「取消」/返回/open 确认页，
+并从 GUI 建出实例（`instance.toml` 落盘）。**未像素验证**：probe→confirm→create 的页面切换——
+`gtk4-broadwayd` 在 push 后频繁以 `broadway-output.c:458 append_node_ops` 断言自崩（上游缺陷），
+应用进程与状态机回调均正常（instrumented 构建确认 Probe 返回、result idle 执行），该链路 core 部分由
+CLI `add` 真机冒烟覆盖。GTK 侧回归闸门仍未建立，故 STATUS 只标 `implemented`。
+
+**第二十九轮：GUI 实现审查（REJECTED）修复**（2026-11-08）。只读 subagent 判 **REJECTED**
+（1 P0 + 7 P1 + 11 P2 + 11 P3）。**P0 是 purego 的 2000 个 C 回调槽**：旧实现每次渲染给每个控件
+新建闭包变量再 `Connect`，而搜索每敲一个字就重建一次列表 —— 约 40 次重建后
+`purego: the maximum number of callbacks has been reached` 直接崩进程。改为**五个稳定回调**
+（notify/clicked/activated/response/idle，`callbacks` 字段，地址恒定、注册一次后只读）+
+按 GObject 指针索引的处理器表 + `renderScope` 重建时整表注销；新增控件一律走「登记即连接」的
+三个方法（第一版只把处理器写进表、忘了 Connect，冒烟时表现为「按钮点了没反应」，已修）。
+P1：`hold` 加锁（后台线程不再 append 切片）；creating 期间 `SetCanPop(false)` 且 Esc 无效；
+创建成功后落到**详情页**（§6.1；收尾放进 `popped` 再 push，不和 pop 动画打架）；关闭开关删除前
+**重判运行态、逐个收集错误**（不再在部分失败时弹「已删除全部分身」）；rename/remove 的后台结果只在
+仍是当前详情页时改界面；`buildProfile` 补回 `Env`，`ignored = []` 不再被默认表覆盖。
+P2：setup/reconfig/rediscover **一律探测**（内置模板只作预填，分类仍走 `Classify`），确认按钮门禁
+只数「应用自身数据」（只勾缓存/单例仍禁用），搜索 120ms 防抖，轮询 1s（详情）/2s（列表）分层 +
+窗口不可见时暂停，Esc 在探测/确认页等于取消，app id 改 `io.github.mensylisir.Appclone`，二次启动
+present 已有窗口（不再建第二个窗口）。core：`fallback` 进度事件移到「应用没在跑」闸门之后。
+**未修并记录理由**：① GUI 文案本地化（ADR-027：`u.lang` 固定 `zh_CN`，静态文案暂留 GUI 代码，
+避免中文界面插英文 reason；退出条件=GTK 闸门落地后按 `ui.*` 入表并改回 `i18n.Lang()`）；② 列表页致命/降级横幅、GTK 侧回归闸门
+（见"被挡住的"）；③ `CachedAuditVerdict` 仍不能区分"没有审计证据"与"证据读不出来"，GUI 文案
+保持保守说法（要改就得动 core 签名，收益低于风险）。
+证据：`gofmt -l .` 空、`go vet ./...` 干净、`go test -count=1 ./...` 全绿、`CGO_ENABLED=0 go build ./...` 通过、
+`node design/guitest.js` 58/58；broadway 冒烟（假 HOME → probe → confirm → 创建 → 详情页落盘
+`instances/telegram/main`）与**重建 hammer**：搜索击键触发 150 次 `renderList`，进程存活、无 panic
+（旧实现约 40 次即崩）。
+
+**第三十轮：GUI 复审（REJECTED）与档案合并收口**（2026-11-08）。第二次只读 subagent 判 **REJECTED**
+（3 P1 + 8 P2 + 7 P3）。
+P1：① **重新探测会抹掉用户配置**——GUI 用内置模板/零值重建档案，CLI 的 `add` 在模板与探测两条路上也有同样问题；
+抽出 `core.MergeNonPathFields`（重新配置/重新探测**只重定 `paths`**，`env`/`extra_binds`/`isolate_dbus`/
+`isolate_runtime`/`sockets`/`cwd`/`audit`/`ignored`/未知字段以既有档案为准，探测给出 `exec` 时以探测为准），
+GUI 与 CLI 共用一份规则；② 内置模板的非路径字段过去只被用来"预填路径"，`isolate_*`/`env` 等全丢，
+确认页也没有 runtime 开关、详情页不显示 runtime 状态——改为 `applyBaseFields` 按"既有档案 > 模板"合并、
+确认页按需出现「隔离私有 runtime 目录」开关、详情页单例行补「私有 runtime 已启用 / runtime 共享」；
+③ 探测 goroutine 在 `Probe` 的 defer 清理完成前进程可能退出（GUI 无 daemon，窗口关掉就走）——改为
+`Application.Hold()/Release()`（幂等）包住探测、保存档案与创建实例，清理一定跑完。
+P2：零写入判定改用 `ProfileFromCandidates` 的派生结果（模板预填的非空 `paths` 不再掩盖"本次零写入"）；
+bwrap 缺失/全局锁被占/应用在跑/零写入四类错误各有标题与重试路径，启动即异步 `CheckBwrap()`（新增
+`core/envcheck.go` + i18n 文案），bwrap 缺失弹致命横幅并禁用开关/搜索，fuse 缺失只是可「了解」的降级横幅；
+保存档案与创建实例拆成两段可重试事务（失败不落半成品）；重命名持全局写锁（ADR-022）；关闭开关的整批删除
+先数运行态再删、按 deleted/running/failed 如实汇总；详情页档案读不出时显示原因页；模板-only 的档案
+`probe_method` 标 `manual`；新建控件全部登记 `Unref()`（puregotk 构造器 `g_object_ref_sink`、无 finalizer），
+页面重建与退出统一释放。
+P3 七条全部落地：回调缓存注释订正（地址恒定 ≠ 可以重建）、`CachedAuditVerdict` 返回 `reason` 让详情页区分
+四种 `unverified`（推翻第二十九轮 ③ 的「收益低于风险」判断：evidence 读不出被显示成「没结论」会把用户引向重跑而不是修文件）、搜索"结果太多"提示行不可激活、空态改用 `AdwStatusPage`、错误态标题按原因映射、
+重建顺序固定为「先摘行 → 注销处理器 → Unref」、软横幅「了解」回调随 scope 释放。
+**顺带修掉一个 schema 保真缺陷**：`ignored` 线格式用 `[]string + omitempty` 会把显式的 `ignored = []`
+（用户关掉默认噪声白名单）在保存时抹掉，重新加载变回 nil 再被默认表替换；改为指针字段区分"没写"与"空表"，
+新增 3 条 save→load 往返断言，并把规则写进 `方案设计.md` §5.5。
+证据：`gofmt -l .` 空、`go vet ./...` 干净、`go test -count=1 ./...` 全绿（新增 `core/envcheck_test.go`
+（3）、`core/merge_test.go`（3）、`core/profile_test.go`（3））、`CGO_ENABLED=0 go build ./...` 通过、
+`node design/guitest.js` 58/58；broadway + 假 HOME 实测：致命横幅禁用/恢复、160 次 `renderList` 重建存活、
+rename 持锁、删除进回收站、档案坏掉显示原因页、probe→confirm→创建→详情页落盘、`add --rediscover --profile-only`
+保留非路径字段并更新路径。
+
+**第三十一轮：GUI 复审第二轮（REJECTED）修复**（2026-11-08）。只读 subagent 对第三十轮工作树再判
+**REJECTED**（2 P1 + 3 P2 + 5 P3）。
+P1：① **列表行跨异步边界 use-after-free**——开关流程（首次配置要跑几十秒、关闭确认框可开数分钟）捕获了
+行指针，期间 2 秒轮询/环境自检重建列表会 Unref 旧行；失败回弹时 `row.SetActive` 落在已释放对象上。
+改为 `rowRef` 绑定渲染代数（`ui.listGen`），代数变了就只依赖重建后的真实状态，绝不碰旧控件。
+② **Hold/Release 只包住探测**——保存档案/创建实例期间关窗会直接结束进程，`CreateInstance` 的回滚链跑不到，
+留下"实例目录在、档案未提交"的半成品；`saveProfile` 还在 goroutine 里读 `v.done`（数据竞争）。
+改为 `hold()/release()` 覆盖探测与两段事务，creating 态**拒绝关窗**（与 Esc/返回同一条规则），
+并删掉 goroutine 里的 `v.done` 读取（事务一旦开始就跑完）。
+P2：① **CLI 有内置模板就完全不探测**（`--rediscover` 也不探测）——与 §4/§6「模板只作预填」和 GUI 的
+"一律真探测"直接冲突。`add` 改为始终 `Probe`，模板路径经新增的 `core.PrefillCandidates` 补进候选
+（分类仍走 `Classify`），`paths` 为空按派生结果判定、纯模板预填标 `manual`；GUI 的预填也改用同一份实现。
+② **version > 1 的档案被静默覆盖**：CLI `add` 吞掉 `LoadProfile` 错误继续探测，GUI `start()` 把
+version_ahead 当"没有档案"。两端都改为拒绝加载并停止（GUI 显示"档案由更新版本生成"且不给重试），
+新增 CLI 断言证明档案一个字节都没被改写。
+③ **`start()` 的既有档案错误处理**与上面同一处修复；错误态没有重试路径时不再显示点不动的「重试」。
+P3：① 导航页每次 push 泄漏整页（构造器 ref_sink、popped 后从未 Unref）——`releasePage` 在 popped 后
+延后一个 idle 释放，`design/navspike` 自驱动 40 轮 push/pop 退出码 0（证明该时机安全）；
+② `candidatesFromProfile` 把所有 unsupported 硬映射成 keyring（会改写白名单语义）——只对 `kind=keyring`
+生成候选，其余原样经合并保留；`probeUnsupported` 改用 store 形态，合并去重按 resolver 归一
+（`~/x` == `/home/u/x`）；③ 部分失败提示漏报运行中实例数——`deleted+failed+running` 必须对得上总数；
+④ GUI `buildProfile` 重复实现合并规则——改为统一调用 `core.MergeNonPathFieldsWith`，界面开关只覆盖
+`lock_files/isolate_*`；⑤ `lock_files` 冲突时改为**既有档案优先**（与函数注释和 §5.5 一致），
+只有 base 为空才用探测值。
+证据：`gofmt -l .` 空、`go vet ./...` 干净、`go test -count=1 ./...` 全绿（新增 `core/prefill_test.go` 2 条、
+`core/merge_test.go` 2 条、`cmd/appclone/add_test.go` 1 条）、`CGO_ENABLED=0 go build ./...` 通过、
+`node design/guitest.js` 58/58、`design/navspike`（`GDK_BACKEND=x11 DISPLAY=:0`）40 轮 push/pop 退出码 0、
+`design/probe-smoke.sh /tmp/appclone-cli-new` 退出码 0（改后的 `add` 走真探测 → 档案 → 实例 → 审计 → verify → 回收站全链路）。
+**本轮未能交互验证 GUI 三屏**：broadwayd 默认监听抽象 socket、GDK 客户端却找文件系统路径，
+`-u` 又会让 HTTP 端口消失，socat 桥接后协议报 `Unknown input command`；本会话的 X 会话禁止 XTEST
+注入（xdotool 指针/键盘无效）。渲染生命周期的新假设由 navspike 覆盖；三屏交互证据仍以第二十八～三十轮
+的 broadway 记录为准。
+
+**第三十二轮：第三十一轮增量复审 5 条 P3 收口**（2026-11-08）。增量复审判 **APPROVED**
+（0 P0/P1/P2），5 条 P3 全部修完再提交：
+① 两处注释仍说"导航页交给 nav 不释放"，与 `releasePage` 相反——改为"popped 后延后一个 idle Unref"，
+并注明 navspike 证据；② 开启/新建分身（复用档案）失败时仍把 `retry` 指回 `start()`——version_ahead/损坏
+档案没有可重试的动作，会得到一个永远失败的重试按钮。抽出 `showProfileRejected`，四个入口共用，
+§6.1 ③-d 补"档案拒绝加载"这一例外（「重试」按有没有可重试动作显隐）；③ GUI 复用档案时凭空补
+`DefaultIgnored()`，与 CLI 原样落盘写出不同字节——删掉这处（及探测后同一条死代码），`ignored = nil`
+的"用默认噪声表"语义由 `verify.go` 兜底；④ 删除事务没有 `Hold`，关窗会在 `gio trash` 中途带走进程——
+新增 `ui.beginBusy/endBusy`（主线程 `Hold/Release`），`confirmDisable` 与 `detail.remove` 两处包住，
+`busy > 0` 时关窗被拒并提示；⑤ `detail.remove` 删完最后一个实例无条件 `nav.Pop()`——用户已返回时
+会连带弹掉列表页。改为 `popIfVisible`（`GetVisiblePage` 比对后 `Unref`，非可见页交给 popped 收尾）。
+随后对这些修复再跑一次只读增量复审：**APPROVED**（0 P0–P2），抓出 1 条漏修并已在本轮修掉——
+⑥ ③ 的修复其实是 no-op：`ProfileFromCandidates`（`core/upper.go`）本身会给 `ignored` 填默认噪声表，
+而 `MergeNonPathFieldsWith` 在基线为 nil 时不覆盖，所以"nil 透传"的注释并不成立。改为 merge 之后
+`p.Ignored = slices.Clone(eff.Ignored)`——复用档案保持 nil、显式 `ignored = []` 保持空切片、
+探测流程仍是 probe 给的默认表（与 CLI `--rediscover` 同口径）。
+证据：`gofmt -l .` 空、`go vet ./...` 干净、`go test -count=1 ./...` 全绿、`go test -race ./core ./cmd/appclone`
+全绿、`CGO_ENABLED=0 go build ./...` 通过、`node design/guitest.js` 58/58 退出码 0。
+GUI 交互仍受本轮环境限制（见"被挡住的"），上述生命周期结论以代码纪律 + navspike 为准，不冒充像素验证。
+
 ## 下一步
 
 路线图第 1 项（`core` 探测原语）**被本机环境挡住**：`fuse-overlayfs 1.18` 与 `fusermount3 3.18.3` 已装（用户确认），
@@ -66,9 +187,11 @@ Xvfb）同一份 `CGO_ENABLED=0` 程序均跑通 SwitchRow notify→Go 回调、
 2. ~~`core` 其余部分~~ **已完成**（`BuildBwrapArgs` 纯函数 + 单测、档案 TOML、实例 CRUD、`id`/`display_name` 校验）
 3. ~~CLI MVP~~ **已完成**（`add/run/list/rm/doctor/repair-desktop/version`）
 4. `cmd/appclone-gui`（puregotk + libadwaita 三屏，控件映射见 `tech-stack.md` §4.5）。
-   **前置已清**：S0 五条 2026-11-07 全过（见 `tech-stack.md` §4.3），依赖可获取。
-   实现顺序：先列表页（SwitchRow + 运行态）→ 首次配置（NavigationView push/pop，窗口级拦截 Esc）→
-   详情/删除确认（AlertDialog），每屏配一个 GTK 冒烟；`AdwSwitchRow` 必须放进 `AdwPreferencesGroup`。
+   **v1 三屏已落地并通过两轮实现审查修复**（2026-11-08，见第二十八～三十轮；STATUS = `implemented`）。剩余：
+   ① **GTK 侧回归闸门**（broadway 不稳，考虑 Xvfb/嵌套 mutter 或纯逻辑抽测）；
+   ② GUI 与 CLI 的 setup 编排去重（内置模板→探测→零写入→校验→保存 logic 目前两份；
+      合并规则已收进 `core.MergeNonPathFields`，剩下的只是编排骨架）；
+   ③ GUI 文案进 i18n 目录（ADR-027 的退出条件），之后 `u.lang` 才能跟随 `i18n.Lang()`。
 
 ## 被挡住的
 
@@ -78,8 +201,33 @@ Xvfb）同一份 `CGO_ENABLED=0` 程序均跑通 SwitchRow notify→Go 回调、
 - **strace 降级未用真实日志校准**：直接 `strace -f /bin/true` 可用，但产品内由 Go 以 `setsid` 起的
   `strace` 在本次外层 strace 环境下报 `PTRACE_TRACEME: Operation not permitted`——需要单独确认真实
   触发条件（是否与嵌套 tracer / 沙箱有关），再把 `ParseStrace` 与真实日志对齐。
-- **GUI 侧的自动化闸门尚未存在**：`guitest.js` 只覆盖 HTML 稿。GTK 实现的回归要等 S0 之后建
-  （`broadway`/`xdotool` 驱动三屏冒烟），在那之前 GUI 无回归保护，不能标 `verified`。
+- **GUI 侧的自动化闸门尚未存在**：`guitest.js` 只覆盖 HTML 稿。GTK 实现的回归用
+  broadway + chromium/puppeteer 试过：可以截图**静态页**（列表/详情/确认页/对话框），但
+  `gtk4-broadwayd` 在 `NavigationView` push 后会以其自身断言
+  （`gdk/broadway/broadway-output.c:458 append_node_ops: !reused_node->consumed`）**自崩**，
+  `/tmp/.X11-unix` 下无 Xvfb，嵌套 `mutter --headless` 能起 Xwayland 但合成器重定向使
+  root 抓图全黑。可行方向：装/借一个 Xvfb（或 `GSK_RENDERER=cairo` + 独立 X server），
+  或在 GUI 内加 `APPCLONE_GUI_SHOT` 这类**仅测试**的 `GtkWidgetPaintable → png` 出口。
+  **本机重试的新发现**（2026-11-08，GTK 4.24.1）：`broadwayd` 不带 `-u` 时监听**抽象** socket
+  （`@/run/user/<uid>/broadway<N>.socket`），而 GDK 客户端找文件系统路径 → `Failed to open display`；
+  带 `-u` 时 HTTP 端口根本不监听（`-u` 替换了 TCP 监听）。用 socat 把文件系统 socket 桥到抽象 socket
+  能连上，但 GDK 立刻报 `Unknown input command d/w` 并 EOF（协议桥接不可靠）。另外本会话的 X 会话
+  禁止 XTEST 注入（`xdotool mousemove` 不移动指针），所以三屏交互无法在本会话脚本化。
+  可行路线：装 Xvfb（或换一台能跑 Xvfb 的机器）、在 GUI 内做 `APPCLONE_GUI_SHOT` 出口，
+  或把三屏的纯逻辑状态机从 GTK 里抽出来做无显示测试。不需要输入的 GTK 生命周期假设可用
+  `design/navspike` 这类自驱动 spike 验证（本轮已验证导航页 Unref 时机）。
+  在那之前 GUI 无自动回归保护，不能标 `verified`。
+- 复现命令（broadway 冒烟，假 HOME）：`gtk4-broadwayd -p 8095 :5` +
+  `GDK_BACKEND=broadway BROADWAY_DISPLAY=:5 HOME=<fake> AC_BASE=<fake>/xdg/appclone ./appclone-gui`，
+  浏览器打开 `http://127.0.0.1:8095/`（注意 `XDG_RUNTIME_DIR` 必须是 broadwayd 所在的那个，
+  否则客户端找不到 `broadway*.socket`；单个 broadwayd 只接一个应用实例时最稳）。
+  **本机不可直接用**：见上一条——抽象/文件系统 socket 不匹配，`-u` 又关掉 HTTP。
+
+- **（未决）GUI 启动的分身与 GUI 进程同生共死**：`core.Run` 把调用进程当常驻父进程并给 bwrap 加
+  `--die-with-parent`，用户从详情页点「启动」后关掉设置窗口，正在运行的分身会一起退出。文档没有定义
+  这是预期还是缺陷（CLI 下"关终端 = 退出分身"是合理的；GUI 下"关设置窗口 = 退出应用"未必）。
+  需要产品决策：要么 detach 成独立会话（谁当父进程/怎么回收锁），要么在启动时明确提示。
+  复审提出、本轮未改（改它会动 `run` 的生命周期契约，必须单独定案）。
 
 ## 最近完成
 

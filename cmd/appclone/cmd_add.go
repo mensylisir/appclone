@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/signal"
@@ -11,6 +12,13 @@ import (
 
 	"github.com/mensylisir/appclone/core"
 )
+
+// isProfileNotFound 区分"没有档案"与"档案读不出来"：前者是首次配置的正常
+// 起点，后者（版本超前/损坏）必须原样报错，绝不能当没档案继续写。
+func isProfileNotFound(err error) bool {
+	var ce *core.Error
+	return errors.As(err, &ce) && ce.Key == "err.profile.not_found"
+}
 
 func newAddCmd(a *app) *cobra.Command {
 	var (
@@ -74,6 +82,22 @@ func newAddCmd(a *app) *cobra.Command {
 				}
 			}
 
+			// 既有档案只读一次：它既是"可复用"的来源，也是重新配置时的非路径
+			// 字段基线。读不出来（版本超前 / 损坏）**不能**当"没档案"继续探测，
+			// 否则后面会把它覆盖掉——§5.5 要求拒绝加载并提示。
+			var old core.Profile
+			hasOld := false
+			if hasProfile {
+				op, oerr := a.env.LoadProfile(appKey)
+				if oerr != nil {
+					if !isProfileNotFound(oerr) {
+						return oerr
+					}
+				} else {
+					old, hasOld = op, true
+				}
+			}
+
 			var p core.Profile
 			needProfile := !hasProfile || !creatable || rediscover
 			if needProfile {
@@ -81,47 +105,76 @@ func newAddCmd(a *app) *cobra.Command {
 					// 档案失效：不重探就只能造出一个启动即失败的分身（§6.1 ②）。
 					fmt.Fprintln(cmd.ErrOrStderr(), a.tr("ui.add.reconfigure_note", map[string]any{"app": appKey}))
 				}
-				bundled, ok, berr := a.env.BundledProfile(appKey)
+				// 内置模板只作**预填**，不定案（§4、§6）：「有模板就不探测」会让
+				// CLI 与 GUI 对同一应用写出两份语义（manual vs overlay），也让
+				// `--rediscover` 名不副实——应用升级后路径变了，模板追不上。
+				bundled, hasBundled, berr := a.env.BundledProfile(appKey)
 				if berr != nil {
 					return berr
 				}
-				if ok {
-					p = bundled
-				} else {
-					// 没有内置模板就走探测（discover.md 的三层管线，本版本只有 L1）。
-					// 探测会**真的把应用启动一次**：用户用完关掉，会话结束才开始归因。
-					d, lerr := a.env.LoadApp(appKey)
-					if lerr != nil {
-						return lerr
-					}
-					cmdline := append([]string{d.Exec}, d.ExecArgs...)
-					fmt.Fprintf(cmd.ErrOrStderr(),
-						"正在跟踪「%s」的写入：应用会被启动两次，每次用一下再关掉。\n", appKey)
-					// L0 先扫一遍：它的锁文件线索能让探测不再"零写入"——主实例
-					// 在跑时应用会发现锁被占用、把参数转发过去然后自己退出（§3.2.2）。
-					hints := a.env.StaticHints(ctx, d)
-					res, perr := a.env.Probe(ctx, appKey, core.ProbeOptions{
-						Command:  cmdline,
-						LockFile: hints.LockFiles,
-						Stderr:   cmd.ErrOrStderr(),
-					})
-					if perr != nil {
-						return perr
-					}
-					p = res.Profile
-					// 零写入 = 给不出结论，**不生成空档案**：空 paths 的档案会让
-					// 开关亮着却什么都不隔离（§6.3）。
-					if len(p.Paths) == 0 {
-						// 只观测到缓存/共享写入时，"什么都没跟踪到"是错的说法：
-						// 用户会去查应用是不是没启动，而真正的原因是这些写入
-						// 本来就不值得隔离（§6.3）。
-						return core.NewProbeNoWrites(appKey, len(res.Candidates))
-					}
+				// 探测会**真的把应用启动一次**：用户用完关掉，会话结束才开始归因。
+				d, lerr := a.env.LoadApp(appKey)
+				if lerr != nil {
+					return lerr
 				}
-			} else {
-				if p, err = a.env.LoadProfile(appKey); err != nil {
-					return err
+				cmdline := append([]string{d.Exec}, d.ExecArgs...)
+				fmt.Fprintf(cmd.ErrOrStderr(),
+					"正在跟踪「%s」的写入：应用会被启动两次，每次用一下再关掉。\n", appKey)
+				// L0 先扫一遍：它的锁文件线索能让探测不再"零写入"——主实例
+				// 在跑时应用会发现锁被占用、把参数转发过去然后自己退出（§3.2.2）。
+				hints := a.env.StaticHints(ctx, d)
+				res, perr := a.env.Probe(ctx, appKey, core.ProbeOptions{
+					Command:  cmdline,
+					LockFile: hints.LockFiles,
+					Stderr:   cmd.ErrOrStderr(),
+				})
+				if perr != nil {
+					return perr
 				}
+				p = res.Profile
+				cands := res.Candidates
+				prefilled := 0
+				if hasBundled {
+					extra := a.env.Resolver.PrefillCandidates(bundled, cands)
+					cands = append(cands, extra...)
+					prefilled = len(extra)
+				}
+				method := p.ProbeMethod
+				if prefilled > 0 && len(p.Paths) == 0 {
+					// 本次一条路径都没跟踪到、结果全靠模板预填：来源如实标
+					// manual，不能冒充本机探测（§6.1 文案红线）。
+					method = "manual"
+				}
+				// 判定口径与 GUI 一致：看**会进档案的路径数**，不是候选数。
+				// 只有缓存/共享/凭证写入时，任何入口都不该生成空档案（§6.3）。
+				derived := a.env.Resolver.ProfileFromCandidates(appKey, method, cands)
+				if len(derived.Paths) == 0 {
+					return core.NewProbeNoWrites(appKey, len(cands))
+				}
+				if prefilled > 0 {
+					p.Paths = derived.Paths
+					p.SharedWrites = derived.SharedWrites
+					p.ProbeMethod = method
+				}
+				// 重新配置/重新探测只重定**路径**：既有档案的 env、extra_binds、
+				// isolate_*、cwd、audit、ignored、未知字段是用户的显式配置，
+				// 探测产物里没有它们（§5.5）。没有既有档案时模板是次一级基线。
+				// GUI 走同一条规则（core.MergeNonPathFieldsWith），否则同一个
+				// 应用会落出两份语义不同的档案。
+				base := core.Profile{}
+				hasBase := false
+				if hasOld {
+					base, hasBase = old, true
+				} else if hasBundled {
+					base, hasBase = bundled, true
+				}
+				if hasBase {
+					p = core.MergeNonPathFieldsWith(a.env.Resolver, p, base)
+				}
+			} else if hasOld {
+				p = old
+			} else if p, err = a.env.LoadProfile(appKey); err != nil {
+				return err
 			}
 
 			if profileOnly {

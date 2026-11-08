@@ -1,0 +1,966 @@
+package main
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"slices"
+	"strings"
+	"time"
+
+	"codeberg.org/puregotk/puregotk/v4/adw"
+	"codeberg.org/puregotk/puregotk/v4/gtk"
+
+	"github.com/mensylisir/appclone/core"
+)
+
+// setupView 是屏 3 的四态机：probing → confirm → creating → done | error。
+//
+// creating 是独立态，不是"confirm 里加个 flag"：写档案 + 建目录 + 生成
+// .desktop 是几百毫秒的事务，期间再点一次确认会建出两个实例；中途放行取消
+// 会留下半成品。
+type setupView struct {
+	u      *ui
+	appKey string
+	// mode: setup 首次配置 | reconfig 档案失效 | open 开启分身 |
+	// clone 新建分身 | rediscover 只重跑探测并保存档案
+	mode    string
+	onClose func(success bool)
+
+	page   *adw.NavigationPage
+	stack  *gtk.Stack
+	banner *adw.Banner
+	header *adw.HeaderBar
+
+	cancelBtn  *gtk.Button
+	confirmBtn *gtk.Button
+
+	spinner    *gtk.Spinner
+	countLabel *gtk.Label
+	// createSpinner 只在 creating 态转：切出去还转的 spinner 会让人以为
+	// 还有操作没结束，也白白占着每帧的重绘。
+	createSpinner *gtk.Spinner
+	// errPage 是失败态的 AdwStatusPage（§4.5）：标题按原因分类，描述带下一步。
+	errPage *adw.StatusPage
+
+	confirmPage *adw.PreferencesPage
+	rows        map[int]*adw.SwitchRow
+	lockRow     *adw.SwitchRow
+	dbusRow     *adw.SwitchRow
+	runtimeRow  *adw.SwitchRow
+
+	profile core.Profile
+	cands   []core.Candidate
+	// existing/bundled 是重定路径时**非路径字段**的来源：重配置只重新定案
+	// 路径，env / extra_binds / isolate_runtime / audit / 未知字段是用户或
+	// 维护者的显式配置，探测产物里没有它们，不能顺手抹掉。
+	existing    core.Profile
+	hasExisting bool
+	bundled     core.Profile
+	hasBundled  bool
+	// prefilled 记录内置模板预填了几条路径（0 = 没有模板或没有新增）。
+	// 只用于在确认页说明来源，不改变"探测定案"的事实。
+	prefilled int
+
+	state  string
+	cancel context.CancelFunc
+	done   bool
+	// retry 是失败态「重试」要重做的事：探测失败重探测、保存失败重保存、
+	// 创建失败重创建。一律回到 start() 会为一次保存失败白跑整场探测。
+	retry func()
+	// held 记录本页是否 Hold 了 GApplication：探测与创建/保存事务都必须活到
+	// defer/回滚链跑完，窗口关闭不能把进程从半路带走。
+	held bool
+	// success 是 finish 的结果，由 popped 收尾读出来交给 onClose。
+	success bool
+	// fixed 是 HeaderBar 两个按钮的处理器（随页面存亡，一次登记）；
+	// scope 是确认页这一轮的处理器，重建确认页时整体注销。
+	fixed *renderScope
+	scope *renderScope
+}
+
+func (u *ui) pushSetup(appKey, mode string, onClose func(bool)) bool {
+	// 同一时间只允许一个探测页：重复点开关不应该叠出两页。
+	if u.activeSetup != nil {
+		return false
+	}
+	v := &setupView{u: u, appKey: appKey, mode: mode, onClose: onClose, rows: map[int]*adw.SwitchRow{}}
+	u.activeSetup = v
+	v.build()
+	u.pushPage(v.page, v.popped)
+	v.start()
+	return true
+}
+
+// popped 是页面真正离开导航栈之后的收尾：停会话、注销处理器、把结果交给
+// 调用方。放在 popped 里而不是 Pop() 之后立刻调用，是因为在 pop 动画期间
+// 再 push 详情页会撞上导航视图的过渡态（§6.1 要求创建完落到详情页）。
+func (v *setupView) popped() {
+	if !v.done {
+		// 用户用返回按钮/返回手势取消：等同于按了「取消」。
+		v.done = true
+		if v.cancel != nil {
+			v.cancel()
+		}
+		if v.u.activeSetup == v {
+			v.u.activeSetup = nil
+		}
+	}
+	if v.scope != nil {
+		v.scope.close()
+	}
+	if v.fixed != nil {
+		v.fixed.close()
+	}
+	if v.onClose != nil {
+		v.onClose(v.success)
+	}
+	v.u.releasePage(v.page)
+}
+
+func (v *setupView) title() string {
+	name := v.appName()
+	switch v.mode {
+	case "reconfig":
+		return "重新配置 · " + name
+	case "open":
+		return "开启分身 · " + name
+	case "clone":
+		return "新建分身 · " + name
+	case "rediscover":
+		return "重新探测 · " + name
+	}
+	return "首次配置 · " + name
+}
+
+func (v *setupView) build() {
+	// fixed 随页面存亡：HeaderBar 按钮与静态控件在这里登记一次，popped 时
+	// 统一注销处理器 + Unref（构造器给每个对象 IncreaseRef，包装没有 finalizer）。
+	v.fixed = &renderScope{c: v.u.cb}
+
+	v.stack = gtk.NewStack()
+	v.stack.SetVexpand(true)
+	v.fixed.own(&v.stack.Widget)
+
+	// ---- probing ----
+	probing := gtk.NewBox(gtk.OrientationVerticalValue, 12)
+	probing.SetValign(gtk.AlignCenterValue)
+	probing.SetHalign(gtk.AlignCenterValue)
+	probing.SetMarginTop(24)
+	probing.SetMarginBottom(24)
+	probing.SetMarginStart(24)
+	probing.SetMarginEnd(24)
+	v.fixed.own(&probing.Widget)
+	v.spinner = gtk.NewSpinner()
+	v.spinner.SetSizeRequest(32, 32)
+	v.spinner.Start()
+	v.spinner.SetHalign(gtk.AlignCenterValue)
+	v.fixed.own(&v.spinner.Widget)
+	ptitle := gtk.NewLabel("正在跟踪「" + v.appName() + "」的写入…")
+	ptitle.SetWrap(true)
+	ptitle.SetHalign(gtk.AlignCenterValue)
+	v.fixed.own(&ptitle.Widget)
+	v.countLabel = gtk.NewLabel("已发现 0 个写入条目")
+	v.countLabel.AddCssClass("dim-label")
+	v.fixed.own(&v.countLabel.Widget)
+	phint := gtk.NewLabel("在应用里正常用一会儿——收发文件、改设置——然后关掉它。\n随时可以点左上角的「取消探测」。")
+	phint.SetWrap(true)
+	phint.SetJustify(gtk.JustifyCenterValue)
+	phint.SetHalign(gtk.AlignCenterValue)
+	phint.AddCssClass("dim-label")
+	v.fixed.own(&phint.Widget)
+	probing.Append(&v.spinner.Widget)
+	probing.Append(&ptitle.Widget)
+	probing.Append(&v.countLabel.Widget)
+	probing.Append(&phint.Widget)
+	v.stack.AddNamed(&probing.Widget, "probing")
+
+	// ---- error（AdwStatusPage：§4.5 要求失败是独立组件而不是两块裸标签）----
+	v.errPage = adw.NewStatusPage()
+	v.errPage.SetIconName("dialog-warning-symbolic")
+	v.errPage.SetTitle("操作没有完成")
+	v.errPage.SetDescription("")
+	v.fixed.own(&v.errPage.Widget)
+	v.stack.AddNamed(&v.errPage.Widget, "error")
+
+	// ---- creating ----
+	creating := gtk.NewBox(gtk.OrientationVerticalValue, 12)
+	creating.SetValign(gtk.AlignCenterValue)
+	creating.SetHalign(gtk.AlignCenterValue)
+	v.fixed.own(&creating.Widget)
+	cspinner := gtk.NewSpinner()
+	cspinner.SetSizeRequest(32, 32)
+	cspinner.SetHalign(gtk.AlignCenterValue)
+	v.createSpinner = cspinner
+	v.fixed.own(&cspinner.Widget)
+	clabel := gtk.NewLabel("正在创建分身…")
+	clabel.SetHalign(gtk.AlignCenterValue)
+	v.fixed.own(&clabel.Widget)
+	creating.Append(&cspinner.Widget)
+	creating.Append(&clabel.Widget)
+	v.stack.AddNamed(&creating.Widget, "creating")
+
+	// ---- confirm（内容在 renderConfirm 里重建）----
+	v.confirmPage = adw.NewPreferencesPage()
+	v.confirmPage.SetTitle("确认隔离范围")
+	v.fixed.own(&v.confirmPage.Widget)
+	v.stack.AddNamed(&v.confirmPage.Widget, "confirm")
+
+	v.banner = adw.NewBanner("")
+	v.banner.SetRevealed(false)
+	v.fixed.own(&v.banner.Widget)
+
+	v.header = adw.NewHeaderBar()
+	v.fixed.own(&v.header.Widget)
+	v.cancelBtn = gtk.NewButtonWithLabel("取消")
+	v.confirmBtn = gtk.NewButtonWithLabel("创建分身")
+	v.confirmBtn.AddCssClass("suggested-action")
+	v.fixed.own(&v.cancelBtn.Widget)
+	v.fixed.own(&v.confirmBtn.Widget)
+
+	// HeaderBar 的两个按钮活到页面结束：处理器登记一次，随 popped 注销。
+	v.fixed.button(v.cancelBtn, func() { v.finish(false) })
+	v.fixed.button(v.confirmBtn, func() { v.submit() })
+	v.header.PackStart(&v.cancelBtn.Widget)
+	v.header.PackEnd(&v.confirmBtn.Widget)
+
+	content := gtk.NewBox(gtk.OrientationVerticalValue, 0)
+	v.fixed.own(&content.Widget)
+	content.Append(&v.banner.Widget)
+	content.Append(&v.stack.Widget)
+
+	tv := adw.NewToolbarView()
+	v.fixed.own(&tv.Widget)
+	tv.AddTopBar(&v.header.Widget)
+	tv.SetContent(&content.Widget)
+	v.page = adw.NewNavigationPage(&tv.Widget, v.title())
+	// 导航页本身不进 scope：scope 在 popped 里立刻 close，而那一刻 pop 动画
+	// 可能还没走完。它的 sink 引用由 popped 末尾的 releasePage 延后一个 idle
+	// 释放，与详情页同一条规则（design/navspike 已验证；不释放则整页泄漏）。
+	v.page.SetTag("setup")
+	v.page.SetCanPop(true)
+}
+
+func (v *setupView) appName() string {
+	for _, a := range v.u.apps {
+		if a.Key == v.appKey {
+			return a.Name
+		}
+	}
+	return v.appKey
+}
+
+func (v *setupView) confirmLabel() string {
+	switch v.mode {
+	case "open":
+		return "开启分身"
+	case "rediscover":
+		return "保存档案"
+	}
+	return "创建分身"
+}
+
+func (v *setupView) setState(s string) {
+	v.state = s
+	v.stack.SetVisibleChildName(s)
+	// 创建中是事务态：返回手势也要挡住（§6.1「关闭路径统一判 creating 后拒绝」）。
+	v.page.SetCanPop(s != "creating")
+	v.confirmBtn.SetVisible(s == "confirm" || s == "error" || s == "creating")
+	v.confirmBtn.SetSensitive(true)
+	v.cancelBtn.SetSensitive(s != "creating")
+	// 按钮文案按状态重置：§6.1 只有探测中叫「取消探测」，确认态与失败态都叫「取消」。
+	// 不重置的话，探测失败后按钮还挂着「取消探测」，用户不知道它已经不再是取消会话。
+	v.cancelBtn.SetLabel("取消")
+	// 只有探测中才转圈：切到确认/失败态后后台还在转的 spinner 会让人以为
+	// 还有操作没结束（它也确实代表不了任何事）。
+	if s == "probing" {
+		v.spinner.Start()
+	} else {
+		v.spinner.Stop()
+	}
+	if s == "creating" {
+		v.createSpinner.Start()
+	} else {
+		v.createSpinner.Stop()
+	}
+	switch s {
+	case "probing":
+		v.confirmBtn.SetVisible(false)
+		v.cancelBtn.SetLabel("取消探测")
+	case "error":
+		// 「重试」恒可用：失败态只有重试与取消两条出路，留一个点不动的按钮
+		// 用户只能关窗口（§6.1 ③-d）。没有重试路径的失败（档案版本超前 /
+		// 损坏，重跑只会得到同一结果）不显示重试，只留「取消」。
+		if v.retry == nil {
+			v.confirmBtn.SetVisible(false)
+			break
+		}
+		v.confirmBtn.SetLabel("重试")
+	case "creating":
+		v.confirmBtn.SetLabel(v.creatingLabel())
+		v.confirmBtn.SetSensitive(false)
+	default: // confirm
+		v.confirmBtn.SetLabel(v.confirmLabel())
+		v.updateConfirmGate()
+	}
+}
+
+// creatingLabel 区分"在写什么"：保存档案与创建实例耗时不同，用户需要知道
+// 自己等的是哪一件事。
+func (v *setupView) creatingLabel() string {
+	if v.mode == "rediscover" {
+		return "正在保存…"
+	}
+	return "正在创建…"
+}
+
+// updateConfirmGate 只数「应用自身数据」：全不勾、只勾缓存或单例时禁用。
+// 否则会生成一个什么都不隔离的空档案（§6.1 ③-b，设计稿 guitest 有专项断言）。
+func (v *setupView) updateConfirmGate() {
+	if v.state != "confirm" {
+		return
+	}
+	n := 0
+	for i, row := range v.rows {
+		if !row.GetActive() || i >= len(v.cands) {
+			continue
+		}
+		if v.cands[i].Class == core.ClassCache {
+			continue
+		}
+		n++
+	}
+	v.confirmBtn.SetSensitive(n > 0)
+}
+
+// start 决定这一页是直接确认（open/clone）还是先探测。
+//
+// setup / reconfig / rediscover **必须探测**（§6.1 五个入口）：档案路径是本机
+// 相关的（原生/Flatpak、版本差异），内置模板只是预填来源，不定案。
+func (v *setupView) start() {
+	if v.mode == "open" || v.mode == "clone" {
+		p, err := v.u.env.LoadProfile(v.appKey)
+		if err != nil {
+			// 复用档案失败（版本超前 / 损坏）没有可重试的动作：重跑 start()
+			// 只会读到同一份档案。给「重试」等于让用户对着一个永远失败的
+			// 按钮点（P3，复审发现）。
+			v.showProfileRejected(err)
+			return
+		}
+		v.profile = p
+		v.cands = candidatesFromProfile(v.u, p)
+		v.setState("confirm")
+		v.renderConfirm()
+		return
+	}
+	// 重新配置/重新探测只重定案**路径**：既有档案的 env、extra_binds、
+	// isolate_runtime、audit、未知字段是用户的显式配置，探测产物里没有它们。
+	// 不先把它们收好，重建出来的档案会把它们整片抹掉（P1，复审发现）。
+	if p, err := v.u.env.LoadProfile(v.appKey); err == nil {
+		v.existing = p
+		v.hasExisting = true
+	} else if errorKey(err) != "err.profile.not_found" {
+		// 版本超前 / 档案损坏不是"没有档案"：继续探测会把这份档案覆盖掉
+		// （§5.5 要求拒绝加载并提示）。
+		v.showProfileRejected(err)
+		return
+	}
+	if b, ok, err := v.u.env.BundledProfile(v.appKey); err == nil && ok {
+		v.bundled = b
+		v.hasBundled = true
+	}
+	v.probe()
+}
+
+// probe 跑一次探测。闸门与探测全在后台：LoadApp 会扫 .desktop、StaticHints
+// 会起 flatpak 子进程、OpenState 可能等锁 5 秒——任何一项放主线程，窗口
+// 都会在这几秒里画不出帧。
+func (v *setupView) probe() {
+	v.setState("probing")
+	v.countLabel.SetText("已发现 0 个写入条目")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	v.cancel = cancel
+
+	// 探测期间 Hold 住 GApplication：用户直接关窗时 use count 若归零，
+	// main 会在 Probe 的 defer 之前退出——overlay 没人卸载、setsid 出来的
+	// 应用也不会收到 SIGTERM。Release 在探测返回后的 idle 里做（P1，复审发现）。
+	v.hold()
+
+	go func() {
+		fail := func(err error) {
+			v.u.goIdle(func(uintptr) bool {
+				v.release()
+				if v.done {
+					return false
+				}
+				if errors.Is(err, core.ErrCanceled) {
+					v.finish(false)
+					return false
+				}
+				v.retry = v.probe
+				v.showError(err)
+				return false
+			})
+		}
+
+		d, err := v.u.env.LoadApp(v.appKey)
+		if err != nil {
+			fail(err)
+			return
+		}
+		// 闸门 1：bwrap 缺失时探测根本没有意义，不该先启动一次会话再报
+		// "会话没能跑起来"这种看不出原因的错（§6.1 四道闸门）。
+		if err := core.CheckBwrap(); err != nil {
+			fail(err)
+			return
+		}
+		// 闸门 4：全局写锁。探测会改命名空间（挂 overlay、写 profiles.d），
+		// 必须与另一个 appclone 的 add/rm 串行；等锁超时按 err.lock.timeout
+		// 报"另一个 appclone 正在操作"，而不是一条模糊的探测失败。
+		st, err := v.u.env.OpenState(ctx, 5*time.Second)
+		if err != nil {
+			fail(err)
+			return
+		}
+		defer st.Close()
+
+		// 闸门 2/3（fuse 降级、应用在跑）由 core.Probe 判定：降级不阻断，
+		// app_running 直接失败。自检与探测各写一套判据迟早会说不到一处去。
+		hints := v.u.env.StaticHints(ctx, d)
+		cmdline := append([]string{d.Exec}, d.ExecArgs...)
+		res, perr := v.u.env.Probe(ctx, v.appKey, core.ProbeOptions{
+			Command:  cmdline,
+			LockFile: hints.LockFiles,
+			Progress: func(pp core.ProbeProgress) {
+				v.u.goIdle(func(uintptr) bool {
+					if v.done {
+						return false
+					}
+					// 降级横幅从探测中起常驻，切到确认态也不消失——用户要在
+					// 确认路径范围之前就知道这份结果不完整（§4.5）。
+					if pp.Stage == "fallback" {
+						v.showDegraded()
+						return false
+					}
+					if v.state != "probing" {
+						return false
+					}
+					v.countLabel.SetText(fmt.Sprintf("已发现 %d 个写入条目", pp.Entries))
+					return false
+				})
+			},
+		})
+		v.u.goIdle(func(uintptr) bool {
+			v.release()
+			if v.done {
+				return false
+			}
+			if perr != nil {
+				if errors.Is(perr, core.ErrCanceled) {
+					v.finish(false)
+					return false
+				}
+				v.retry = v.probe
+				v.showError(perr)
+				return false
+			}
+			v.applyProbeResult(res)
+			return false
+		})
+	}()
+}
+
+// hold 让进程在事务完成前不被"窗口关闭"结束：GUI 没有 daemon，窗口一销毁
+// GApplication 的 use count 归零，进程会在 goroutine 的 defer 之前退出。
+// 幂等——探测 → 确认 → 创建是串行事务，同一时刻只有一段在跑。
+func (v *setupView) hold() {
+	if v.held {
+		return
+	}
+	v.held = true
+	v.u.app.Hold()
+}
+
+// release 释放探测/创建事务期间 Hold 住的 GApplication（幂等）。
+func (v *setupView) release() {
+	if !v.held {
+		return
+	}
+	v.held = false
+	v.u.app.Release()
+}
+
+// applyProbeResult 把探测结果落成确认页：路径来自探测，非路径字段来自
+// 既有档案（优先）或内置模板；零写入 + 纯模板预填时按 manual 记来源。
+func (v *setupView) applyProbeResult(res core.ProbeResult) {
+	v.profile = res.Profile
+	v.cands = res.Candidates
+	v.mergeBundledPrefill()
+	v.applyBaseFields(res)
+
+	// 判定口径与 CLI 一致：看**会进档案的路径数**，不是候选数。只有缓存/
+	// 共享/凭证写入时，确认页会显示「没有可隔离的路径」且确认按钮永远禁用
+	// ——那是死路，不是确认（§6.1 ③-d）。
+	sel := make([]core.Candidate, len(v.cands))
+	copy(sel, v.cands)
+	derived := v.u.env.Resolver.ProfileFromCandidates(v.appKey, v.profile.ProbeMethod, sel)
+	if len(derived.Paths) == 0 {
+		v.retry = v.probe
+		v.showError(core.NewProbeNoWrites(v.appKey, len(v.cands)))
+		return
+	}
+	v.setState("confirm")
+	v.renderConfirm()
+}
+
+// applyBaseFields 把"探测不产生的字段"从既有档案或内置模板补进结果。
+//
+// 优先级：既有档案 > 内置模板 > 零值。既有档案是用户上次确认过的行为配置；
+// 模板是维护者校对过的起点；探测只负责路径与证据来源。合并规则在 core 里
+// （MergeNonPathFields），CLI 的 --rediscover 用同一份，两个视图不会分叉。
+func (v *setupView) applyBaseFields(res core.ProbeResult) {
+	// 证据来源如实：本次 overlay 一条路径都没跟踪到、确认页里的路径全靠
+	// 模板预填时，这份档案不是本机探测结果，不能标成 overlay（§6.1 文案红线）。
+	if v.prefilled > 0 && len(res.Profile.Paths) == 0 {
+		v.profile.ProbeMethod = "manual"
+	}
+	var base core.Profile
+	has := false
+	switch {
+	case v.hasExisting:
+		base, has = v.existing, true
+	case v.hasBundled:
+		base, has = v.bundled, true
+	}
+	if has {
+		v.profile = core.MergeNonPathFields(v.profile, base)
+	}
+	if v.profile.Env == nil {
+		v.profile.Env = map[string]string{}
+	}
+}
+
+// mergeBundledPrefill 把内置模板里的路径补进候选集。分类与"哪些类别不进
+// 候选"的规则在 core（PrefillCandidates），CLI 的 `add` 用同一份实现。
+func (v *setupView) mergeBundledPrefill() {
+	// 重试会重新合并，计数必须从零开始（否则会累加成假数字）。
+	v.prefilled = 0
+	if !v.hasBundled {
+		return
+	}
+	extra := v.u.env.Resolver.PrefillCandidates(v.bundled, v.cands)
+	v.cands = append(v.cands, extra...)
+	v.prefilled = len(extra)
+}
+
+// showDegraded 起降级横幅（看不到 fuse-overlayfs 时走 strace）。
+// 文案不承诺完整：strace 只记录实际跑到的路径。
+func (v *setupView) showDegraded() {
+	v.banner.SetTitle("这台机器缺少 fuse-overlayfs，本次改用 strace 跟踪：只记录实际跑到的路径，覆盖不完整，建议多操作一会儿再确认。")
+	v.banner.SetRevealed(true)
+}
+
+func (v *setupView) showError(err error) {
+	v.showErrorTitle(v.errorTitle(err), err)
+}
+
+// showProfileRejected 是「档案拒绝加载」这一态：版本超前 / 解析失败不是
+// 重试能解决的问题——重跑只会读到同一份档案，重新配置/重新探测若继续探测
+// 还会把它覆盖掉（§5.5）。所以这一态不挂「重试」，只留「取消」（§6.1 ③-d）。
+//
+// 四个入口同一规则：开启分身 / 新建分身（复用档案）、重新配置 / 重新探测
+// （重定路径前要读既有档案）。
+func (v *setupView) showProfileRejected(err error) {
+	v.retry = nil
+	title := "档案读不出来"
+	if errorKey(err) == "err.profile.version_ahead" {
+		title = "档案由更新版本生成"
+	}
+	v.showErrorTitle(title, err)
+}
+
+func (v *setupView) showErrorTitle(title string, err error) {
+	v.errPage.SetTitle(title)
+	v.errPage.SetDescription(v.describe(err))
+	v.setState("error")
+}
+
+// errorTitle 按 Reason 分类（§4.5：失败态按原因分套文案）：标题说"是什么"，
+// 描述（i18n）说"下一步做什么"。四种最常见的失败各有一条，其余归到通用。
+func (v *setupView) errorTitle(err error) string {
+	switch errorKey(err) {
+	case "err.probe.app_running":
+		return "应用还在运行"
+	case "err.env.bwrap_missing":
+		return "缺少 bubblewrap"
+	case "err.lock.timeout":
+		return "另一个 appclone 正在操作"
+	case "err.probe.no_writes":
+		return "没有可隔离的写入"
+	}
+	return "操作没有完成"
+}
+
+func (v *setupView) describe(err error) string {
+	var ce *core.Error
+	if errors.As(err, &ce) {
+		return v.u.tr(ce.Key, ce.Args)
+	}
+	return err.Error()
+}
+
+// renderConfirm 按候选类别分组。勾选状态只改 Candidate.Checked，
+// 落点由 ProfileFromCandidates 统一决定——GUI 不自己拼 paths。
+func (v *setupView) renderConfirm() {
+	// 先摘掉旧页再关旧 scope：close() 会 Unref 这一轮创建的 C 对象，
+	// 父容器此时还兜着一份引用，摘除与释放的顺序不能反。
+	if old := v.confirmPage; old != nil {
+		v.stack.Remove(&old.Widget)
+	}
+	if v.scope != nil {
+		v.scope.close()
+	}
+	v.scope = &renderScope{c: v.u.cb}
+
+	// 兜底：进度事件晚到或档案本身就是 strace 产物时，确认页仍要有那条横幅。
+	if v.profile.ProbeMethod == "strace" {
+		v.showDegraded()
+	}
+	// PreferencesPage 没有 clear()；重建一个内容页最省事，也避免旧行残留。
+	pg := adw.NewPreferencesPage()
+	pg.SetTitle("确认隔离范围")
+	v.scope.own(&pg.Widget)
+
+	// 换页 = 换一批行：旧行上登记的处理器与勾选状态都必须丢掉，
+	// 否则重试一次会带着上一次的行指针去算门禁。
+	v.rows = map[int]*adw.SwitchRow{}
+	v.lockRow = nil
+	v.dbusRow = nil
+	v.runtimeRow = nil
+
+	own := adw.NewPreferencesGroup()
+	v.scope.own(&own.Widget)
+	own.SetTitle("应用自身数据")
+	desc := "appclone 跟踪到该应用写入了以下路径。勾选属于「应用自身数据」的目录——它们会被隔离，其余文件与主空间保持共享。"
+	if v.mode == "open" || v.mode == "clone" {
+		desc = "这些目录会被隔离进分身，其余文件与主空间保持共享。"
+	}
+	if v.prefilled > 0 {
+		desc += fmt.Sprintf("（其中 %d 条来自内置模板预填，请确认是否仍然适用）", v.prefilled)
+	}
+	own.SetDescription(desc)
+	for i := range v.cands {
+		c := v.cands[i]
+		if c.Class == core.ClassPublic || c.Class == core.ClassShared || c.Class == core.ClassKeyring {
+			continue
+		}
+		row := adw.NewSwitchRow()
+		v.scope.own(&row.Widget)
+		row.SetTitle(v.u.allocText(c.Path))
+		d := v.u.tr(c.Why, nil)
+		if c.Observed > 0 {
+			d = fmt.Sprintf("%s · 观测到 %d 个写入条目", d, c.Observed)
+		}
+		row.SetSubtitle(d)
+		row.SetActive(c.Checked)
+		v.rows[i] = row
+		// 门禁只看「应用自身数据」的勾选数：单例行与缓存行不改变结论。
+		v.scope.switchRow(row, func() { v.updateConfirmGate() })
+		own.Add(&row.Widget)
+	}
+	if len(v.rows) == 0 {
+		row := adw.NewActionRow()
+		v.scope.own(&row.Widget)
+		row.SetTitle("没有可隔离的路径")
+		row.SetSubtitle("这次探测没有发现配置/数据目录，无法创建有意义的档案。")
+		row.SetSensitive(false)
+		own.Add(&row.Widget)
+	}
+	pg.Add(own)
+
+	// 单例处理：由检出的单例项驱动（锁文件 / 私有 DBus / 私有 runtime），
+	// 一项都没检出就不出现——不弹一个没有开关内容的分组。
+	if len(v.profile.LockFiles) > 0 || v.profile.IsolateDBus ||
+		v.profile.IsolateRuntime || len(v.profile.Sockets) > 0 {
+		sg := adw.NewPreferencesGroup()
+		v.scope.own(&sg.Widget)
+		sg.SetTitle("单例处理")
+		if len(v.profile.LockFiles) > 0 {
+			lr := adw.NewSwitchRow()
+			v.scope.own(&lr.Widget)
+			lr.SetTitle("替换锁文件")
+			lr.SetSubtitle("让分身不再把「已在运行」的主实例当成自己，避免启动请求被转发后直接退出")
+			lr.SetActive(true)
+			v.lockRow = lr
+			sg.Add(&lr.Widget)
+		}
+		if v.profile.IsolateRuntime || len(v.profile.Sockets) > 0 {
+			rr := adw.NewSwitchRow()
+			v.scope.own(&rr.Widget)
+			rr.SetTitle("隔离私有 runtime 目录")
+			rr.SetSubtitle("Telegram 这类应用靠 XDG_RUNTIME_DIR 里的 socket 判断「已经在运行」；不隔离私有 runtime，分身会被主实例转发后直接退出")
+			rr.SetActive(v.profile.IsolateRuntime)
+			v.runtimeRow = rr
+			sg.Add(&rr.Widget)
+		}
+		dr := adw.NewSwitchRow()
+		v.scope.own(&dr.Widget)
+		dr.SetTitle("隔离私有 DBus 会话总线")
+		dr.SetSubtitle("需要私有总线的应用才能双开；关闭则与主实例共用总线")
+		dr.SetActive(v.profile.IsolateDBus)
+		v.dbusRow = dr
+		sg.Add(&dr.Widget)
+		pg.Add(sg)
+	}
+
+	// 公共目录：只读，永远是"没乱来"的证据。
+	pub := adw.NewPreferencesGroup()
+	v.scope.own(&pub.Widget)
+	pub.SetTitle("公共目录（强制共享）")
+	pub.SetDescription("这些位置不进分身：两个分身看到的是同一份文件。")
+	prow := adw.NewActionRow()
+	v.scope.own(&prow.Widget)
+	prow.SetTitle("始终共享")
+	dirs := []string{}
+	for _, p := range v.u.env.Resolver.PublicDirs() {
+		dirs = append(dirs, v.u.allocText(p))
+	}
+	prow.SetSubtitle(strings.Join(dirs, " · "))
+	prow.SetSubtitleLines(0)
+	prow.SetSensitive(false)
+	pub.Add(&prow.Widget)
+	pg.Add(pub)
+
+	// 共享但可写：必须写清代价，否则用户会把"最近文件混在一起"当成坏了。
+	// 列表从**候选集**推导（而不是读档案里上次的 shared_writes）：内置模板
+	// 预填进来的路径还没进档案，按档案渲染会把它们从"必须让用户看见"的组里漏掉。
+	derived := v.u.env.Resolver.ProfileFromCandidates(v.appKey, v.profile.ProbeMethod, v.cands)
+	if len(derived.SharedWrites) > 0 {
+		sh := adw.NewPreferencesGroup()
+		v.scope.own(&sh.Widget)
+		sh.SetTitle("共享但可写（不隔离）")
+		sh.SetDescription("隔离它们会让输入法、书签等功能失效；代价是两个分身共用同一份状态。")
+		srow := adw.NewActionRow()
+		v.scope.own(&srow.Widget)
+		srow.SetTitle("共享项")
+		list := []string{}
+		for _, p := range derived.SharedWrites {
+			if abs, err := v.u.env.Resolver.Expand(p); err == nil {
+				list = append(list, v.u.allocText(abs))
+			}
+		}
+		srow.SetSubtitle(strings.Join(list, " · "))
+		srow.SetSubtitleLines(0)
+		srow.SetSensitive(false)
+		sh.Add(&srow.Widget)
+		pg.Add(sh)
+	}
+
+	// Stack 里同名子项只能有一个：新的 confirm 页在这里接上（旧页已在函数
+	// 开头摘除）。
+	v.confirmPage = pg
+	v.stack.AddNamed(&pg.Widget, "confirm")
+	v.stack.SetVisibleChildName("confirm")
+	v.state = "confirm"
+	v.updateConfirmGate()
+}
+
+// selectedCandidates 把用户在界面上的勾选回填进候选集。
+func (v *setupView) selectedCandidates() []core.Candidate {
+	out := make([]core.Candidate, len(v.cands))
+	copy(out, v.cands)
+	for i, row := range v.rows {
+		if i < len(out) {
+			out[i].Checked = row.GetActive()
+		}
+	}
+	return out
+}
+
+func (v *setupView) buildProfile() core.Profile {
+	// 界面开关先落到"生效的非路径字段"上；字段搬运与合并规则只留一份
+	// （core.MergeNonPathFieldsWith），CLI 用同一份。GUI 再写一套的话，
+	// 两边迟早对同一份既有档案落出不同的字段（P3，复审发现）。
+	eff := v.profile
+	if v.lockRow != nil && !v.lockRow.GetActive() {
+		eff.LockFiles = nil
+	}
+	if v.dbusRow != nil {
+		eff.IsolateDBus = v.dbusRow.GetActive()
+	}
+	if v.runtimeRow != nil {
+		eff.IsolateRuntime = v.runtimeRow.GetActive()
+	}
+	p := v.u.env.Resolver.ProfileFromCandidates(v.appKey, eff.ProbeMethod, v.selectedCandidates())
+	p = core.MergeNonPathFieldsWith(v.u.env.Resolver, p, eff)
+	// ProfileFromCandidates 会给 ignored 填默认噪声表；复用档案（open/clone）
+	// 时必须让 nil 透传：CLI 复用就是原样落盘（`p = old`），GUI 凭空补一份
+	// 默认清单会把"跟随未来默认表"固化成今天这份默认值，两边字节也不一致
+	// （P3，复审发现）。探测流程的 eff 自带默认表，行为不变。用 slices.Clone
+	// 而不是重新补值：nil → nil，空切片（显式 `ignored = []`）→ 空切片。
+	p.Ignored = slices.Clone(eff.Ignored)
+	if p.Env == nil {
+		p.Env = map[string]string{}
+	}
+	if len(p.Exec) == 0 {
+		if d, err := v.u.env.LoadApp(v.appKey); err == nil {
+			p.Exec, p.ExecArgs = d.Exec, d.ExecArgs
+		}
+	}
+	return p
+}
+
+func (v *setupView) submit() {
+	if v.state == "error" {
+		// 重试要重做**失败的那件事**：探测失败重探测、保存失败重保存、创建
+		// 失败重创建。一律回 start() 会为一次保存失败白跑整场探测（P3，复审发现）。
+		if v.retry != nil {
+			v.retry()
+		}
+		return
+	}
+	if v.state != "confirm" {
+		return
+	}
+	if v.mode == "rediscover" {
+		// 只保存档案，不建实例（GUI 详情页的「重新探测」）。
+		v.saveProfile(v.buildProfile())
+		return
+	}
+	v.createInstance(v.buildProfile())
+}
+
+// saveProfile 也是事务态：写档案要持全局写锁并按 creating 处理（ADR-022）。
+// 之前这条路径直接起 goroutine 写盘——双击「保存档案」会并发两次写，
+// 保存中点取消/关窗还会在页面消失之后继续写（P2，复审发现）。
+func (v *setupView) saveProfile(p core.Profile) {
+	if v.done {
+		return
+	}
+	v.setState("creating")
+	// 事务一旦开始就必须跑完：窗口关闭不能把写盘打断在半路（P2，复审发现）。
+	// 关窗本身也由 closecb 在 creating 态挡住，Hold 是第二道保险。
+	v.hold()
+	go func() {
+		err := func() error {
+			ctx := context.Background()
+			st, oerr := v.u.env.OpenState(ctx, 5*time.Second)
+			if oerr != nil {
+				return oerr
+			}
+			defer st.Close()
+			if err := core.ValidateProfile(p, v.u.env.BuildOptions()); err != nil {
+				return err
+			}
+			if err := core.ValidateCreatable(p); err != nil {
+				return err
+			}
+			return v.u.env.SaveProfile(p)
+		}()
+		v.u.goIdle(func(uintptr) bool {
+			v.release()
+			if v.done {
+				return false
+			}
+			if err != nil {
+				// 重试只重做保存（新探测一次只会得到同一份档案）。
+				v.retry = func() { v.saveProfile(p) }
+				v.showErrorTitle("保存失败", err)
+				return false
+			}
+			v.u.toastMsg("已保存「" + v.appName() + "」的隔离档案")
+			v.finish(true)
+			return false
+		})
+	}()
+}
+
+// createInstance 是创建实例的事务：持全局写锁、状态置 creating（Esc/取消/
+// 返回全部挡住），成功落到详情页。
+func (v *setupView) createInstance(p core.Profile) {
+	if v.done {
+		return
+	}
+	v.setState("creating")
+	v.hold()
+	go func() {
+		ctx := context.Background()
+		st, err := v.u.env.OpenState(ctx, 5*time.Second)
+		if err == nil {
+			defer st.Close()
+		}
+		var cerr error
+		if err == nil {
+			_, cerr = v.u.env.CreateInstance(ctx, v.appKey, p, "")
+		} else {
+			cerr = err
+		}
+		v.u.goIdle(func(uintptr) bool {
+			v.release()
+			if v.done {
+				return false
+			}
+			if cerr != nil {
+				v.retry = func() { v.createInstance(p) }
+				v.showErrorTitle("创建失败", cerr)
+				return false
+			}
+			v.u.toastMsg("已创建「" + v.appName() + "」的分身")
+			v.finish(true)
+			return false
+		})
+	}()
+}
+
+func (v *setupView) finish(success bool) {
+	if v.done {
+		return
+	}
+	v.done = true
+	v.success = success
+	if v.cancel != nil {
+		v.cancel()
+	}
+	if v.u.activeSetup == v {
+		v.u.activeSetup = nil
+	}
+	// 收尾（注销处理器、回调 onClose）在 popped 里做：这时页面已经真的
+	// 离开导航栈，onClose 里 push 详情页不会和 pop 动画打架。
+	v.u.nav.Pop()
+}
+
+// candidatesFromProfile 把已有档案（复用档案）还原成确认页的候选集。
+// 只用于展示与勾选；落盘仍走 ProfileFromCandidates，保证落点规则只有一份。
+func candidatesFromProfile(u *ui, p core.Profile) []core.Candidate {
+	var out []core.Candidate
+	for _, raw := range p.Paths {
+		abs, err := u.env.Resolver.Expand(raw)
+		if err != nil {
+			continue
+		}
+		out = append(out, core.Candidate{Path: abs, Class: core.ClassConfig, Checked: true, Why: "probe.why.config"})
+	}
+	for _, raw := range p.SharedWrites {
+		abs, err := u.env.Resolver.Expand(raw)
+		if err != nil {
+			continue
+		}
+		out = append(out, core.Candidate{Path: abs, Class: core.ClassShared, Checked: false, Why: "probe.why.shared"})
+	}
+	for _, un := range p.Unsupported {
+		// 只有 keyring 类在文件路径上（`~/.local/share/keyrings/*.keyring`）。
+		// 其它 kind（dbus/secret-service 等）不是可勾选路径；把它们硬塞进
+		// 候选会被 ProfileFromCandidates 改写成 kind=keyring，凭空改变档案
+		// 的白名单语义（P3，复审发现）。它们原样经 MergeNonPathFields 保留。
+		if un.Kind != "keyring" {
+			continue
+		}
+		abs, err := u.env.Resolver.Expand(un.Path)
+		if err != nil {
+			continue
+		}
+		out = append(out, core.Candidate{Path: abs, Class: core.ClassKeyring, Checked: false, Why: "probe.why.keyring"})
+	}
+	return out
+}

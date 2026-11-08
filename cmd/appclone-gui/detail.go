@@ -1,0 +1,630 @@
+package main
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"strings"
+	"time"
+
+	"codeberg.org/puregotk/puregotk/v4/adw"
+	"codeberg.org/puregotk/puregotk/v4/gtk"
+
+	"github.com/mensylisir/appclone/core"
+)
+
+// detailView 是屏 2：实例列表 + 只读档案信息。运行中的实例禁止启动/删除，
+// 与 CLI `rm` 的退出码 7 同源——界面不能比命令行更宽松。
+type detailView struct {
+	u       *ui
+	appKey  string
+	page    *adw.NavigationPage
+	content *adw.PreferencesPage
+	insts   []core.Instance
+	running map[string]bool
+	profile core.Profile
+	audits  []auditEntry
+	groups  []*adw.PreferencesGroup
+	scope   *renderScope
+	// fixed 持有详情页的静态控件（工具栏、内容页），popped 时统一 Unref；
+	// 导航页本身的 sink 引用由 popped 末尾的 releasePage 延后一个 idle 释放
+	// （design/navspike 验证过：popped 之后 Unref 安全，不释放则整页泄漏）。
+	fixed *renderScope
+	sig   string
+
+	// 详情页的数据全部在后台读（LoadProfile / ListInstances / IsRunning /
+	// summary.toml）。秒级轮询若在主线程做文件 IO，实例一多界面就会卡顿。
+	refreshing   bool
+	pending      bool
+	pendingForce bool
+	seq          int
+	loaded       bool
+}
+
+type auditEntry struct {
+	conclusion string
+	reason     string
+	at         string
+}
+
+type detailData struct {
+	profile    core.Profile
+	profileErr error
+	insts      []core.Instance
+	running    map[string]bool
+	audits     []auditEntry
+}
+
+func (u *ui) pushDetail(appKey string) {
+	// 详情页不叠详情页：重复点同一行的箭头只刷新，不往栈里塞第二页。
+	if v := u.activeDetail; v != nil && v.appKey == appKey {
+		v.render()
+		return
+	}
+	v := &detailView{u: u, appKey: appKey, running: map[string]bool{}}
+	v.fixed = &renderScope{c: u.cb}
+	v.content = adw.NewPreferencesPage()
+	v.content.SetTitle(u.nameOf(appKey))
+	v.fixed.own(&v.content.Widget)
+
+	hb := adw.NewHeaderBar()
+	v.fixed.own(&hb.Widget)
+	hb.SetShowTitle(true)
+
+	tv := adw.NewToolbarView()
+	v.fixed.own(&tv.Widget)
+	tv.AddTopBar(&hb.Widget)
+	tv.SetContent(&v.content.Widget)
+	v.page = adw.NewNavigationPage(&tv.Widget, u.nameOf(appKey))
+	v.page.SetTag("detail")
+	u.activeDetail = v
+	u.pushPage(v.page, v.popped)
+	v.render()
+}
+
+// popped 在详情页离开导航栈后收尾：注销处理器、清掉指针。没有这一步，
+// 后台的 rename/remove 结果回来时会往一个已经不在屏幕上的页面写。
+func (v *detailView) popped() {
+	if v.scope != nil {
+		v.scope.close()
+	}
+	if v.fixed != nil {
+		v.fixed.close()
+	}
+	if v.u.activeDetail == v {
+		v.u.activeDetail = nil
+	}
+	v.u.releasePage(v.page)
+}
+
+func (u *ui) nameOf(key string) string {
+	for _, a := range u.apps {
+		if a.Key == key {
+			return a.Name
+		}
+	}
+	return key
+}
+
+// render 重新读一遍数据并强制重建界面（用户动作之后调用）。
+func (v *detailView) render() { v.load(true) }
+
+// refresh 由列表轮询调用：数据照样在后台读，但只有状态真的变了才重建，
+// 否则每秒重建会打断用户正在点的按钮并丢焦点。
+func (v *detailView) refresh() { v.load(false) }
+
+func (v *detailView) load(force bool) {
+	if v.refreshing {
+		v.pending = true
+		v.pendingForce = v.pendingForce || force
+		return
+	}
+	v.refreshing = true
+	v.seq++
+	seq := v.seq
+	key := v.appKey
+	go func() {
+		d := detailData{}
+		d.profile, d.profileErr = v.u.env.LoadProfile(key)
+		if d.profileErr == nil {
+			d.insts, _ = v.u.env.ListInstances(key)
+			d.running = map[string]bool{}
+			for _, in := range d.insts {
+				if running, _ := v.u.env.IsRunning(key, in.ID); running {
+					d.running[in.ID] = true
+				}
+				if c, reason, at, ok := v.u.env.CachedAuditVerdict(key, in.ID); ok {
+					d.audits = append(d.audits, auditEntry{conclusion: c, reason: reason, at: at})
+				}
+			}
+		}
+		v.u.goIdle(func(uintptr) bool {
+			v.refreshing = false
+			force := force || v.pendingForce
+			v.pendingForce = false
+			if v.u.activeDetail == v && seq == v.seq {
+				v.apply(d, force)
+			}
+			if v.pending {
+				v.pending = false
+				v.load(false)
+			}
+			return false
+		})
+	}()
+}
+
+func (v *detailView) apply(d detailData, force bool) {
+	if d.profileErr != nil {
+		msg := v.u.tr(errorKey(d.profileErr), errorArgs(d.profileErr))
+		if v.loaded && v.sig == "broken:"+msg {
+			return
+		}
+		v.sig = "broken:" + msg
+		v.loaded = true
+		v.buildBroken(msg)
+		return
+	}
+	v.profile = d.profile
+	v.insts = d.insts
+	v.running = d.running
+	v.audits = d.audits
+	sig := d.sig()
+	if !force && v.loaded && sig == v.sig {
+		return
+	}
+	v.sig = sig
+	v.loaded = true
+	v.build()
+}
+
+func (d detailData) sig() string {
+	var b strings.Builder
+	for _, in := range d.insts {
+		fmt.Fprintf(&b, "%s|%s|%t;", in.ID, in.DisplayName, d.running[in.ID])
+	}
+	for _, a := range d.audits {
+		fmt.Fprintf(&b, "%s|%s|%s;", a.conclusion, a.reason, a.at)
+	}
+	fmt.Fprintf(&b, "|p:%d|r:%t|d:%t", len(d.profile.Paths), d.profile.IsolateRuntime, d.profile.IsolateDBus)
+	return b.String()
+}
+
+// reset 摘掉旧行、注销旧处理器、建新 scope。顺序固定：先 Remove 再 close，
+// close 里的 Unref 才不会踩到还挂在页上的对象。
+func (v *detailView) reset() {
+	for _, g := range v.groups {
+		v.content.Remove(g)
+	}
+	v.groups = nil
+	if v.scope != nil {
+		v.scope.close()
+	}
+	v.scope = &renderScope{c: v.u.cb}
+}
+
+// buildBroken 在档案读不出来时显示一个说清原因的页面，而不是留一张
+// "看起来正常、其实所有按钮都点不动"的死页（P2，复审发现）。
+func (v *detailView) buildBroken(msg string) {
+	v.reset()
+	sp := adw.NewStatusPage()
+	sp.SetIconName("dialog-warning-symbolic")
+	sp.SetTitle("档案读不出来")
+	sp.SetDescription(msg + "\n\n返回列表，用开关重新配置这个应用即可生成新档案。")
+	v.scope.own(&sp.Widget)
+	g := adw.NewPreferencesGroup()
+	v.scope.own(&g.Widget)
+	g.Add(&sp.Widget)
+	v.content.Add(g)
+	v.groups = append(v.groups, g)
+}
+
+func (v *detailView) build() {
+	v.reset()
+	p := v.profile
+
+	// ---- 实例 ----
+	ig := adw.NewPreferencesGroup()
+	v.scope.own(&ig.Widget)
+	ig.SetTitle("分身实例")
+	for _, in := range v.insts {
+		running := v.running[in.ID]
+		row := adw.NewActionRow()
+		v.scope.own(&row.Widget)
+		row.SetTitle(in.DisplayName)
+		sub := "已停止"
+		if running {
+			sub = "运行中"
+		}
+		if in.LastUsedAt != nil {
+			sub += " · 上次使用 " + in.LastUsedAt.Local().Format("01-02 15:04")
+		}
+		row.SetSubtitle(sub)
+
+		box := gtk.NewBox(gtk.OrientationHorizontalValue, 6)
+		v.scope.own(&box.Widget)
+		box.SetValign(gtk.AlignCenterValue)
+
+		launch := gtk.NewButtonWithLabel("启动")
+		v.scope.own(&launch.Widget)
+		launch.AddCssClass("suggested-action")
+		launch.SetSensitive(!running)
+		launch.SetTooltipText("在这个分身的沙箱里启动应用")
+
+		rename := gtk.NewButtonWithLabel("重命名")
+		v.scope.own(&rename.Widget)
+		rename.SetSensitive(!running)
+
+		del := gtk.NewButtonWithLabel("删除")
+		v.scope.own(&del.Widget)
+		del.AddCssClass("destructive-action")
+		del.SetSensitive(!running)
+		del.SetTooltipText("移到回收站（可恢复）")
+
+		inst := in
+		v.scope.button(launch, func() { v.launch(inst) })
+		v.scope.button(rename, func() { v.rename(inst) })
+		v.scope.button(del, func() { v.remove(inst) })
+
+		box.Append(&launch.Widget)
+		box.Append(&rename.Widget)
+		box.Append(&del.Widget)
+		row.AddSuffix(&box.Widget)
+		ig.Add(&row.Widget)
+	}
+	if len(v.insts) == 0 {
+		row := adw.NewActionRow()
+		v.scope.own(&row.Widget)
+		row.SetTitle("还没有分身实例")
+		row.SetSensitive(false)
+		ig.Add(&row.Widget)
+	}
+	add := adw.NewActionRow()
+	v.scope.own(&add.Widget)
+	add.SetTitle("＋ 新建分身")
+	add.SetActivatable(true)
+	v.scope.row(add, func() {
+		mode := "clone"
+		if !v.profileIsCreatable() {
+			mode = "reconfig"
+		}
+		v.u.pushSetup(v.appKey, mode, func(ok bool) {
+			if ok && v.u.activeDetail == v {
+				v.render()
+			}
+		})
+	})
+	ig.Add(&add.Widget)
+	v.content.Add(ig)
+	v.groups = append(v.groups, ig)
+
+	// ---- 档案（只读）----
+	pg := adw.NewPreferencesGroup()
+	v.scope.own(&pg.Widget)
+	pg.SetTitle("隔离设置")
+
+	paths := adw.NewActionRow()
+	v.scope.own(&paths.Widget)
+	paths.SetTitle("隔离路径")
+	paths.SetSubtitle(fmt.Sprintf("%d 个", len(p.Paths)))
+	list := make([]string, 0, len(p.Paths))
+	for _, raw := range p.Paths {
+		if abs, err := v.u.env.Resolver.Expand(raw); err == nil {
+			list = append(list, v.u.allocText(abs))
+		}
+	}
+	paths.SetSubtitleLines(0)
+	paths.SetSensitive(false)
+	pg.Add(&paths.Widget)
+	// 路径明细单独一行、排在标题行**之后**：AdwPreferencesGroup 是按 Add 顺序
+	// 排的，先加明细会让它跑到「隔离路径」上面，读起来像一行没头没尾的字。
+	if len(list) > 0 {
+		extra := adw.NewActionRow()
+		v.scope.own(&extra.Widget)
+		extra.SetTitle("")
+		extra.SetSubtitle(strings.Join(list, " · "))
+		extra.SetSubtitleLines(0)
+		extra.SetSensitive(false)
+		pg.Add(&extra.Widget)
+	}
+
+	conf := adw.NewActionRow()
+	v.scope.own(&conf.Widget)
+	conf.SetTitle("探测方式")
+	if p.ProbeMethod == "strace" {
+		conf.SetSubtitle("strace 跟踪 · 覆盖率低（只记录实际跑到的路径，建议多操作一会儿后重跑一次）")
+	} else if p.ProbeMethod == "manual" || p.ProbeMethod == "bundled" {
+		conf.SetSubtitle("内置模板 · 由维护者校对过的路径，不包含本机差异")
+	} else {
+		conf.SetSubtitle("overlay-diff 跟踪 · 覆盖本次会话实际发生的写入（没走到的功能分支查不到）")
+	}
+	conf.SetSensitive(false)
+	pg.Add(&conf.Widget)
+
+	if len(p.SharedWrites) > 0 {
+		sh := adw.NewActionRow()
+		v.scope.own(&sh.Widget)
+		sh.SetTitle("共享但可写")
+		sl := []string{}
+		for _, raw := range p.SharedWrites {
+			if abs, err := v.u.env.Resolver.Expand(raw); err == nil {
+				sl = append(sl, v.u.allocText(abs))
+			}
+		}
+		sh.SetSubtitle(strings.Join(sl, " · ") + " — 不隔离，两个分身共用同一份状态")
+		sh.SetSubtitleLines(0)
+		sh.SetSensitive(false)
+		pg.Add(&sh.Widget)
+	}
+
+	single := adw.NewActionRow()
+	v.scope.own(&single.Widget)
+	single.SetTitle("单例处理")
+	var parts []string
+	if len(p.LockFiles) > 0 {
+		parts = append(parts, "锁文件已替换")
+	}
+	if p.IsolateRuntime {
+		parts = append(parts, "私有 runtime 已启用")
+	} else {
+		parts = append(parts, "runtime 共享")
+	}
+	if p.IsolateDBus {
+		parts = append(parts, "私有 DBus 总线已启用")
+	} else {
+		parts = append(parts, "DBus 会话共享")
+	}
+	single.SetSubtitle(strings.Join(parts, " · "))
+	single.SetSensitive(false)
+	pg.Add(&single.Widget)
+
+	audit := adw.NewActionRow()
+	v.scope.own(&audit.Widget)
+	audit.SetTitle("最近审计")
+	if e, ok := v.latestAudit(); ok {
+		audit.SetSubtitle(auditText(e))
+	} else {
+		audit.SetSubtitle("没有审计证据 — 无法判定隔离是否有效（打开运行期审计后才有结论）")
+	}
+	audit.SetSensitive(false)
+	pg.Add(&audit.Widget)
+
+	rootRow := adw.NewActionRow()
+	v.scope.own(&rootRow.Widget)
+	rootRow.SetTitle("实例根目录")
+	if len(v.insts) > 0 {
+		rootRow.SetSubtitle(v.u.allocText(v.insts[0].Root))
+	} else {
+		rootRow.SetSubtitle("—")
+	}
+	rootRow.SetSensitive(false)
+	pg.Add(&rootRow.Widget)
+
+	v.content.Add(pg)
+	v.groups = append(v.groups, pg)
+
+	// 重新探测：只更新档案，不建实例（GUI 与 CLI --profile-only 同口径）。
+	rg := adw.NewPreferencesGroup()
+	v.scope.own(&rg.Widget)
+	redisc := adw.NewActionRow()
+	v.scope.own(&redisc.Widget)
+	redisc.SetTitle("重新探测")
+	redisc.SetSubtitle("应用更新后数据目录可能变了；重新跟踪一次，校正隔离路径")
+	redisc.SetActivatable(true)
+	v.scope.row(redisc, func() {
+		v.u.pushSetup(v.appKey, "rediscover", func(ok bool) {
+			if ok && v.u.activeDetail == v {
+				v.render()
+			}
+		})
+	})
+	rg.Add(&redisc.Widget)
+	v.content.Add(rg)
+	v.groups = append(v.groups, rg)
+}
+
+// latestAudit 取该应用所有实例里最新的一份已存审计结论。
+// 只读 summary，不触发 finalize——详情页看一眼证据不该把证据消费掉。
+func (v *detailView) latestAudit() (auditEntry, bool) {
+	var best auditEntry
+	ok := false
+	for _, e := range v.audits {
+		if !ok || e.at > best.at {
+			best, ok = e, true
+		}
+	}
+	return best, ok
+}
+
+// auditText 按 conclusion + reason 说人话。
+//
+// `unverified` 不是一种状态而是四种：没开审计 / 证据没写完 / 确实没观测到
+// 写入 / 证据读不出来。只显示"没有给出结论"会把"证据坏了"藏成"没结论"，
+// 用户据此会去重跑，而不是去修文件。
+func auditText(e auditEntry) string {
+	var text string
+	switch e.conclusion {
+	case core.VerdictVerified:
+		text = "verified（上次审计的写入都在声明范围内）"
+	case core.VerdictLeak:
+		text = "leak-detected（上次审计发现越界写入）"
+	case core.VerdictUnverified:
+		switch e.reason {
+		case "audit_not_enabled":
+			text = "unverified（还没有做过运行期审计）"
+		case "audit_incomplete":
+			text = "unverified（上次审计没有跑完，证据不完整）"
+		case "no_writes":
+			text = "unverified（上次审计没有观测到写入）"
+		case "audit_unreadable":
+			text = "unverified（审计摘要读不出来，证据可能已损坏）"
+		case "extract_failed":
+			text = "unverified（审计层的公共目录摘出没有生效，本次审计作废）"
+		default:
+			text = "unverified（上次审计没有给出结论）"
+		}
+	default:
+		text = "已存结论"
+	}
+	if e.at != "" {
+		text += " · " + e.at
+	}
+	return text
+}
+
+func (v *detailView) profileIsCreatable() bool {
+	has, creatable, err := v.u.env.ProfileState(v.appKey)
+	return err == nil && has && creatable
+}
+
+func (v *detailView) launch(in core.Instance) {
+	go func() {
+		_, err := v.u.env.Run(context.Background(), v.appKey, in.ID, core.RunOptions{})
+		v.u.goIdle(func(uintptr) bool {
+			if err != nil {
+				v.u.toastMsg(v.u.tr(errorKey(err), errorArgs(err)))
+			} else {
+				v.u.toastMsg("「" + in.DisplayName + "」已退出")
+			}
+			if v.u.activeDetail == v {
+				v.render()
+			}
+			v.u.reload()
+			return false
+		})
+	}()
+}
+
+func (v *detailView) rename(in core.Instance) {
+	entry := gtk.NewEntry()
+	entry.SetText(in.DisplayName)
+	d := adw.NewAlertDialog("重命名分身", "显示名只影响你看到的名称；id 与数据目录不变。")
+	d.SetExtraChild(&entry.Widget)
+	d.AddResponse("cancel", "取消")
+	d.AddResponse("rename", "保存")
+	d.SetDefaultResponse("cancel")
+	d.SetResponseAppearance("rename", adw.ResponseSuggestedValue)
+	v.u.cb.onDialog(d, func(resp string) {
+		if resp != "rename" {
+			return
+		}
+		name := strings.TrimSpace(entry.GetText())
+		if name == "" || name == in.DisplayName {
+			return
+		}
+		go func() {
+			// 重命名写 instance.toml，是命名空间变更：与 CLI 的 add/rm 一样
+			// 必须持全局写锁（ADR-022），否则可能与并发的创建/删除互相覆盖。
+			err := func() error {
+				ctx := context.Background()
+				st, oerr := v.u.env.OpenState(ctx, 5*time.Second)
+				if oerr != nil {
+					return oerr
+				}
+				defer st.Close()
+				return v.u.env.RenameInstance(v.appKey, in.ID, name)
+			}()
+			v.u.goIdle(func(uintptr) bool {
+				if err != nil {
+					v.u.toastMsg(v.u.tr(errorKey(err), errorArgs(err)))
+					return false
+				}
+				v.u.toastMsg("已重命名为「" + name + "」")
+				// 详情页可能已经被 pop 掉：此时只刷新列表，不往旧页面写。
+				if v.u.activeDetail == v {
+					v.render()
+				}
+				v.u.reload()
+				return false
+			})
+		}()
+	})
+	d.Choose(&v.u.win.Widget, nil, nil, 0)
+}
+
+func (v *detailView) remove(in core.Instance) {
+	// 删除一律走回收站；默认响应是「取消」——回车不能完成破坏性操作。
+	d := adw.NewAlertDialog("删除「"+in.DisplayName+"」？", "分身的全部数据会移到回收站，可从回收站恢复。")
+	d.AddResponse("cancel", "取消")
+	d.AddResponse("trash", "移到回收站")
+	d.SetDefaultResponse("cancel")
+	d.SetResponseAppearance("trash", adw.ResponseDestructiveValue)
+	v.u.cb.onDialog(d, func(resp string) {
+		if resp != "trash" {
+			return
+		}
+		// 删除是事务：Hold 住进程并挡住关窗，别把 gio trash 打断在半路。
+		v.u.beginBusy()
+		go func() {
+			ctx := context.Background()
+			st, err := v.u.env.OpenState(ctx, 5*time.Second)
+			if err == nil {
+				defer st.Close()
+			}
+			var derr error
+			if err == nil {
+				derr = v.u.env.DeleteInstance(ctx, v.appKey, in.ID)
+			} else {
+				derr = err
+			}
+			v.u.goIdle(func(uintptr) bool {
+				v.u.endBusy()
+				if derr != nil {
+					v.u.toastMsg(v.u.tr(errorKey(derr), errorArgs(derr)))
+					v.u.reload()
+					return false
+				}
+				v.u.toastMsg("已把「" + in.DisplayName + "」移入回收站")
+				// 页面可能已经不在栈顶（用户返回了）：只在仍是当前详情页时才动它。
+				if v.u.activeDetail == v {
+					if len(v.insts) <= 1 {
+						// 最后一个实例没了：回列表，详情页指向的东西已经不存在。
+						v.popIfVisible()
+					} else {
+						v.render()
+					}
+				}
+				v.u.reload()
+				return false
+			})
+		}()
+	})
+	d.Choose(&v.u.win.Widget, nil, nil, 0)
+}
+
+// popIfVisible 只在详情页确实是屏幕上那一页时才 pop。
+//
+// 删除事务在后台跑，期间用户可能已经用返回按钮离开（页面正在 pop 动画里，
+// 但 activeDetail 还没在 popped 里清掉）。此时无条件 nav.Pop() 会连带把
+// 列表页弹掉——用户看到的是窗口突然空了一屏（P3，复审发现）。
+// GetVisiblePage 是 transfer full（puregotk 已 IncreaseRef），查完必须 Unref。
+func (v *detailView) popIfVisible() {
+	vis := v.u.nav.GetVisiblePage()
+	if vis == nil {
+		return
+	}
+	ptr := vis.GoPointer()
+	vis.Unref()
+	if ptr == v.page.GoPointer() {
+		v.u.nav.Pop()
+	}
+	// 已经不是可见页：页面正在离开导航栈，popped 会照常收尾；往它上面
+	// 重画只会给一张即将销毁的页写数据。
+}
+
+// errorKey/errorArgs 从 core.Error 提取 i18n 键；非 core 错误落到通用文案。
+func errorKey(err error) string {
+	var ce *core.Error
+	if errors.As(err, &ce) {
+		return ce.Key
+	}
+	return "err.internal.unknown"
+}
+
+func errorArgs(err error) map[string]any {
+	var ce *core.Error
+	if errors.As(err, &ce) {
+		return ce.Args
+	}
+	return map[string]any{"message": err.Error()}
+}

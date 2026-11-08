@@ -4,7 +4,9 @@ import (
 	"context"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -159,5 +161,29 @@ func TestProbeStraceBuildsProfile(t *testing.T) {
 	}
 	if r.calls != 1 {
 		t.Fatalf("Rounds=1 时只该跑一轮，实际 %d", r.calls)
+	}
+}
+
+// 降级不是实现细节：界面要靠这条事件起常驻横幅，否则用户拿到的是一份
+// 低置信度档案却看不出来（tech-stack §4.5 探测页）。
+func TestProbeReportsFallbackToGUI(t *testing.T) {
+	if _, err := exec.LookPath("strace"); err != nil {
+		t.Skip("没有 strace，降级路径不可达")
+	}
+	e := probeEnv(t)
+	r := &logRunner{body: ""}
+	var stages []string
+	_, err := e.Probe(context.Background(), "testapp", ProbeOptions{
+		Command:  []string{"/nonexistent/zz-probe-test-app"},
+		Mounter:  &fakeMounter{failOn: "available"},
+		Runner:   r,
+		Rounds:   1,
+		Progress: func(p ProbeProgress) { stages = append(stages, p.Stage) },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Contains(stages, "fallback") {
+		t.Fatalf("降级必须上报 fallback 事件，实际事件：%v", stages)
 	}
 }
