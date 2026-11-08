@@ -531,7 +531,9 @@ GTK 闸门补结构断言：无实例时 `GetVisibleChildName()=="all"`、创建
   顺带给两个 GTK step 加 `GSK_RENDERER=cairo`（容器里非 root 跑 Xvfb 时 GLX 报过 `BadAccess`；
   闸门不需要 GL 渲染）。证据：宿主机（GTK 4.24 / libadwaita 1.10）重跑 **18/18 PASS**、退出码 0。
   同一最终树再跑 `design/probe-smoke.sh`：退出码 0（探测 → 档案 → 实例 → 审计 → verify → 回收站，
-  公共目录哨兵保留、无残留挂载/写层）。针对四条 findings 的修复经只读复审 **APPROVED**（0 P0/P1）。**记录不修**：遍历中未命中的
+  公共目录哨兵保留、无残留挂载/写层）。另从**干净 clone**（只含已提交文件）重跑
+  `CGO_ENABLED=0 go build ./...`、`go test ./core/... ./cmd/appclone` 与 nfpm 出 deb，全部通过，
+  排除「本机能过是因为有未提交文件」的可能。针对四条 findings 的修复经只读复审 **APPROVED**（0 P0/P1）。**记录不修**：遍历中未命中的
   兄弟控件与 `GtkListBox` 包装仍不 `Unref`（与 `findWidgets` 既有约定一致，测试进程内引用、
   退出即回收；puregotk 无 finalizer）；`9411453` 提交正文的「这两个版本」措辞应读作「1.8 之前」，
   已推送的历史不改写。
