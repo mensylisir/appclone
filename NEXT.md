@@ -558,7 +558,7 @@ dbus-daemon 加 `Pdeathsig: SIGTERM`（GUI 被信号打死时私有总线跟着�
 4. `cmd/appclone-gui`（puregotk + libadwaita 三屏，控件映射见 `tech-stack.md` §4.5）。
    **v1 三屏已落地并通过两轮实现审查修复**（2026-11-08，见第二十八～三十轮；STATUS = `implemented`）。剩余：
    ① ~~**GTK 侧回归闸门**~~ **已落地（2026-11-08，第三十七轮补齐三屏四态 + 横幅/致命态）**：
-      `design/guitest-gtk.sh` + `cmd/appclone-gui/screens_test.go`（2026-11-08 第四十轮起 15 条用例）。
+      `design/guitest-gtk.sh` + `cmd/appclone-gui/screens_test.go`（2026-11-08 第四十轮起 16 条用例）。
       剩余：删除/重命名/关闭开关对话框、探测中取消之外的输入注入（需要可编程对话框响应
       或真实指针/键盘事件）；
    ② ~~GUI 与 CLI 的 setup 编排去重~~ **已完成**（2026-11-08，`core.FinalizeProbe`，见第三十三轮）；
@@ -611,7 +611,7 @@ dbus-daemon 加 `Pdeathsig: SIGTERM`（GUI 被信号打死时私有总线跟着�
 - 2026-11-08 **第四十轮：GUI 克隆起步入口 + 无图标首字母头像**：确认页「数据来源」开关
   （默认关、rediscover 隐藏）把 `--fork` 接进 GUI；无图标应用退 `AdwAvatar` 首字母色块
   （列表 32px / 探测中 64px），不再用 `application-x-executable`。HTML 基线 62/62、
-  GTK 闸门 15/15（新增开关持久化与图标回退判定）。证据见第四十轮。
+  GTK 闸门 16/16（新增开关持久化、降级禁用与图标回退判定）。证据见第四十轮。
 - 2026-11-08 **第三十九轮：克隆起步 `add --fork`（ADR-029）+ 窗口默认 880×720**：
   运行期 per-path `fuse-overlayfs`（lower=宿主数据、upper=实例 root、merged bind 给 bwrap），
   空/缺失路径跳过、失败降级不阻断启动、SIGKILL 残留按 mountinfo 先卸后删；真机冒烟证明
