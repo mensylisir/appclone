@@ -110,7 +110,7 @@ jobs:
             cp "dist/bin/$arch/appclone" "dist/bin/$arch/appclone-gui" \
               packaging/io.github.mensylisir.Appclone.desktop \
               packaging/io.github.mensylisir.Appclone.svg \
-              packaging/bwrap.apparmor "$stage/"
+              packaging/bwrap.apparmor LICENSE THIRD_PARTY_NOTICES "$stage/"
             tar -C "$stage" -czf "dist/tar/appclone_${VERSION}_linux_${arch}.tar.gz" .
           done
           (cd dist/pkg && sha256sum ./* > ../checksums.txt)

@@ -449,7 +449,8 @@ GTK 闸门补结构断言：无实例时 `GetVisibleChildName()=="all"`、创建
   ⑦ release 硬化：tag 只接受 `vX.Y.Z`（nfpm 会把 `1.0.0-rc1` 在 Arch `.PKGINFO` 写成 `1.0.0`，等于
      把预发布当正式版发出去）；发版前重跑 gofmt/vet/test；nfpm tarball 加 sha256 校验；
      GUI 补 `main.version` 并用 `GApplication.SetVersion` 暴露。
-  **记录不修**：license 字段/`LICENSE` 是用户/法务决策（tech-stack 建议 GPL-3.0-or-later，未获确认前不写）；
+  **记录不修**：license 字段/`LICENSE` 是用户/法务决策（tech-stack 建议 GPL-3.0-or-later，未获确认前不写；
+  **后续：2026-11-08 用户已定 GPL-3.0-or-later，见 ADR-030**）；
   `ubuntu-24.04-arm` hosted runner 是否在当前账号套餐内无法从本机验证，CI 保持必需 job 而不是静默跳过；
   actions 仍钉 tag 未钉 SHA（供应链硬化留到发版流程稳定后）；卸载时清理 AppArmor profile 未做
   （删除 `/etc` 文件比留着更危险，交给发行版/用户）。
@@ -664,12 +665,14 @@ dbus-daemon 加 `Pdeathsig: SIGTERM`（GUI 被信号打死时私有总线跟着�
 `AdwNavigationView` 的 pop-on-escape 抢在窗口级 key controller 之前**（对抗复审指出：
 闸门从不发 Esc；创建态有 `SetCanPop(false)` 兜底，但普通页的「Esc=取消」语义仍需
 一条真实按键用例才能钉住）。
+**许可证已定**（2026-11-08，GPL-3.0-or-later，ADR-030）：`LICENSE` 入仓、nfpm 写 SPDX 标识符、
+三格式包随附许可证文本；AUR 与发行版官方仓库的许可证前置条件不再缺失（AUR 提交本身仍未做）。
 
 ## 下一步
 
 功能面已收口：探测（overlay + strace 兜底）→ 档案 → CLI → GUI 三屏 → 克隆起步 → deb/rpm/Arch 包
-→ CI/发版流程都已落地，最终树的真机冒烟（`design/probe-smoke.sh`）与三套闸门（Go / HTML 62 / GTK 18）
-全绿。剩下的不是新功能，而是**外部验证与用户决策**，按依赖顺序：
+→ CI/发版流程 → 许可证都已落地，最终树的真机冒烟（`design/probe-smoke.sh`）与三套闸门（Go / HTML 62 / GTK 18）
+全绿。剩下的不是新功能，而是**外部验证**，按依赖顺序：
 
 1. **等首次 CI 实跑**：`b41f8fa` 起每次 push 都会触发 `ci.yml` 的 go/packages/html/gtk/gtk-arm。
    本机没有 `gh` CLI 与 GitHub 凭据、未认证请求读不到（仓库返回 404），只能在 GitHub 页面看：
@@ -681,9 +684,9 @@ dbus-daemon 加 `Pdeathsig: SIGTERM`（GUI 被信号打死时私有总线跟着�
 
 2. **CI 绿之后的发版硬化**（不急，等稳定性证据）：actions 从 tag 改钉 commit SHA；
    评估卸载时是否清理 `/etc/apparmor.d/bwrap`（删除比保留更有风险，需要单独设计）；
-   AUR 源码包（取决于 LICENSE）。
+   AUR 源码包与 `appclone-bin`（许可证已定，只差 AUR 账号与提交）。
 
-3. 仍被挡住的条目见下节：arm64 真机、LICENSE 决策、CI 首次实跑。strace 降级已于 2026-11-08
+3. 仍被挡住的条目见下节：arm64 真机、CI 首次实跑。strace 降级已于 2026-11-08
    用真实日志校准（见"最近完成"）。
 
 ## 被挡住的
@@ -695,8 +698,12 @@ dbus-daemon 加 `Pdeathsig: SIGTERM`（GUI 被信号打死时私有总线跟着�
   go/packages/html/gtk/gtk-arm 五个 job；本机没有 `gh` CLI 与 GitHub 凭据，未认证请求读不到
   （仓库返回 404），所以打包能力仍是 `implemented`。到 GitHub UI 看首次结果，全绿后再升 `verified`；
   红了就把失败 job 的日志带回来修，不要凭"YAML 解析通过"当运行证据。
-- **`LICENSE` 未定**：用户/法务决策（tech-stack 建议 GPL-3.0-or-later）。未确认前 nfpm 不写 license 字段、
-  仓库不放 `LICENSE`；这不阻塞 deb/rpm/Arch 出包，但会阻塞进发行版官方仓库与 AUR 正式包。
+- ~~**`LICENSE` 未定**~~ **已解除（2026-11-08）**：用户拍板 **GPL-3.0-or-later**（ADR-030）。仓库根
+  新增 `LICENSE`（GPLv3 全文，sha256 `3972dc…`，与 automake/R 的 GPL-3 副本逐字节一致）、
+  `packaging/copyright`（DEP-5）与 `THIRD_PARTY_NOTICES`；nfpm `license: GPL-3.0-or-later`，
+  deb 落 `/usr/share/doc/appclone/{copyright,THIRD_PARTY_NOTICES}`、rpm/Arch 落
+  `/usr/share/licenses/appclone/{LICENSE,THIRD_PARTY_NOTICES}`；本地重出三格式包核对通过。
+  剩余的是 AUR 提交（需要 AUR 账号），不再是许可证问题。
 - ~~**strace 降级未用真实日志校准**~~ **已解除（2026-11-08）**：把 `PATH` 去掉 `fuse-overlayfs`
   （保留 `strace`）后在假 HOME 跑 `appclone add stracedemo`，退出码 0；两轮真实日志产出
   `paths = ["~/.config/StraceDemo"]`、`probe_method = "strace"`，写入只落在假 HOME 该目录。
@@ -736,6 +743,21 @@ dbus-daemon 加 `Pdeathsig: SIGTERM`（GUI 被信号打死时私有总线跟着�
 
 ## 最近完成
 
+- 2026-11-08 **许可证定为 GPL-3.0-or-later（ADR-030）**：仓库根新增 `LICENSE`（GNU GPLv3 全文，
+  取自 gnu.org，与本机 `/usr/share/automake-1.19/COPYING`、`/usr/share/R/licenses/GPL-3` **逐字节一致**，
+  sha256 `3972dc…`；与 SPDX 副本只差 `(C)`/`©` 与 why-not-lgpl 链接写法）；另增 `packaging/copyright`
+  （DEP-5：版权人 + "either version 3 … or any later version"）与 `THIRD_PARTY_NOTICES`（7 个静态链接
+  第三方模块 + Go 标准库/运行时的许可证与专利授权全文；sha256 `e9218b9e…`）。`packaging/nfpm.yaml` 写 `license: GPL-3.0-or-later` 并按格式放置：
+  deb → `/usr/share/doc/appclone/{copyright,THIRD_PARTY_NOTICES}`，rpm/Arch →
+  `/usr/share/licenses/appclone/{LICENSE,THIRD_PARTY_NOTICES}`；`.tar.gz` 也带 `LICENSE` 与
+  `THIRD_PARTY_NOTICES`。本地重出三包核对：deb control 有 `License:`、data 有 copyright/notices 且无
+  `/usr/share/licenses/`，Arch `.PKGINFO` 有 `license =`、包内两份文件，rpm 载荷同 Arch（头字段由 CI 用
+  `rpm -qp` 断言，本机无 rpm CLI）；SSOT 文件在三格式包内 sha256 与仓库一致。CI 的 packages job 扩展为
+  逐格式断言（含 deb 负断言）。README 增加版权与许可证段，tech-stack §6/ADR 索引同步。
+  这解除了 AUR 与发行版官方仓库的许可证前置条件（提交 AUR 仍需账号，未做）。
+  **记录不修**：`appclone version` 与 GUI 不额外展示许可证——GPLv3 未强制要求，FSF 的交互式
+  声明只是建议；源码文件也不逐一加 SPDX 头（GPLv3 不要求，README/包元数据已表达许可与 or-later）；
+  deb 的 `THIRD_PARTY_NOTICES` 不 gzip——Policy 12.3 是 should 级，33KB 的声明保持可读更实用。
 - 2026-11-08 **第四十轮：GUI 克隆起步入口 + 无图标首字母头像**：确认页「数据来源」开关
   （默认关、rediscover 隐藏）把 `--fork` 接进 GUI；无图标应用退 `AdwAvatar` 首字母色块
   （列表 32px / 探测中 64px），不再用 `application-x-executable`。HTML 基线 62/62、

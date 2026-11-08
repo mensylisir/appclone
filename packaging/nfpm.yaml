@@ -11,6 +11,9 @@ priority: optional
 maintainer: mensylisir <710080675@qq.com>
 vendor: mensylisir
 homepage: https://github.com/mensylisir/appclone
+# SPDX 标识符；deb/rpm/Arch 的元数据分别落到 control 的 License 字段、
+# rpm 的 License: 标签与 .PKGINFO 的 license=。
+license: GPL-3.0-or-later
 description: |
   为任意 Linux 应用再开一个分身（只隔离它自己的数据）。
   bubblewrap 实现 per-app 沙箱；公共文件与桌面会话照常共享；GUI 与 CLI 共用同一份
@@ -68,6 +71,27 @@ contents:
     dst: /usr/share/icons/hicolor/scalable/apps/io.github.mensylisir.Appclone.svg
   - src: packaging/bwrap.apparmor
     dst: /usr/share/appclone/bwrap.apparmor
+  # 许可证文本随包分发：rpm/Arch 用 /usr/share/licenses/<name>/（各自惯例），
+  # deb 按 Debian Policy §12.5 放 /usr/share/doc/<name>/copyright（DEP-5，含版权人
+  # 与 "or later" 声明）；第三方模块的许可证全文单独成文件。
+  - src: THIRD_PARTY_NOTICES
+    dst: /usr/share/licenses/appclone/THIRD_PARTY_NOTICES
+    packager: rpm
+  - src: THIRD_PARTY_NOTICES
+    dst: /usr/share/licenses/appclone/THIRD_PARTY_NOTICES
+    packager: archlinux
+  - src: THIRD_PARTY_NOTICES
+    dst: /usr/share/doc/appclone/THIRD_PARTY_NOTICES
+    packager: deb
+  - src: LICENSE
+    dst: /usr/share/licenses/appclone/LICENSE
+    packager: rpm
+  - src: LICENSE
+    dst: /usr/share/licenses/appclone/LICENSE
+    packager: archlinux
+  - src: packaging/copyright
+    dst: /usr/share/doc/appclone/copyright
+    packager: deb
 
 scripts:
   postinstall: packaging/postinstall.sh

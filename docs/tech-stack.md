@@ -400,7 +400,7 @@ activated / response / idle，地址恒定、注册一次后不再重新赋值�
     **Arch 的 arm64 走另一条路**：Arch Linux ARM 是独立项目、官方仓库只发 x86_64，所以 arm64 用户用 AUR 的
     源码包 `appclone`（本地编译，零 cgo 不需要装 GTK 开发包）或 `.tar.gz`——这条要写进 README，别让 arm64 用户去装
     `appclone-bin` 然后拿到一个跑不起来的 x86_64 二进制；
-  - `.tar.gz`（裸二进制 + `.desktop` + 图标，同上清单）→ 兜底，覆盖其他 glibc 发行版，README 写清运行期依赖。
+  - `.tar.gz`（裸二进制 + `.desktop` + 图标 + `bwrap.apparmor` + `LICENSE` + `THIRD_PARTY_NOTICES`，同上清单）→ 兜底，覆盖其他 glibc 发行版，README 写清运行期依赖。
     **命名必须带架构**：`appclone_<version>_linux_<goarch>.tar.gz`（如 `appclone_1.0.0_linux_arm64.tar.gz`）——
     两个架构同名会在 Releases 里撞车，arm64 用户也无从辨认；
   - 每个 release 附 `checksums.txt`；GPG 签名在 v1 可选。
@@ -459,8 +459,13 @@ activated / response / idle，地址恒定、注册一次后不再重新赋值�
   两个 job 的断言相同：能起、三屏能切换、**删除实例弹出 `AdwAlertDialog` 确认且可取消**（§4.6 要求补的那条），
   不做像素比对。GTK step 固定 `GSK_RENDERER=cairo`：无 GPU 的 Xvfb 上 GLX 上下文可能被 X 拒绝（BadAccess），
   闸门验的是交互语义与控件树，不是渲染路径，不因此降低真实性。
-- **许可证**：建议 GPL-3.0-or-later（与 GTK/libadwaita 生态一致性最好；puregotk 为 MIT，兼容；
-  core 为 MIT 亦可接受，若希望被第三方嵌入）。
+- **许可证**：**GPL-3.0-or-later**（ADR-030，2026-11-08 用户拍板）。与 GTK/libadwaita 生态一致
+  （puregotk 为 MIT、libadwaita 为 LGPL，均兼容）；仓库根 `LICENSE` 存放 GPLv3 全文，nfpm
+  `license` 字段写 SPDX 标识符。deb 按 Policy §12.5 用 `packaging/copyright`（DEP-5，含版权人与
+  "either version 3 … or any later version"），rpm/Arch 落 `/usr/share/licenses/appclone/LICENSE`；
+  静态链接的第三方模块（cobra/pflag/toml/x-sys/x-text/puregotk/purego）与 Go 标准库/运行时的
+  许可证全文在 `THIRD_PARTY_NOTICES`，随包与 `.tar.gz` 分发。此前「core 可 MIT 以便嵌入」的选项作废——本产品是
+  桌面应用而非库，copyleft 更符合其定位，也满足 AUR 与发行版对许可证声明的硬性要求。
 
 ## 7. 决策记录（ADR 索引）
 
@@ -495,3 +500,4 @@ activated / response / idle，地址恒定、注册一次后不再重新赋值�
 | 027 | **GUI 文案本地化分期**（ADR-025 的落地节奏）：v1 先以 zh_CN 单语交付、`u.lang` 固定 `zh_CN`，退出条件 = GTK 闸门**走遍三屏四态**后三屏文案按 `ui.*` 入表、补 en 译文，`u.lang` 改回 `i18n.Lang()`。**已于 2026-11-08 退场**：闸门新增 `TestGtkSetupStates`（probing 取消 / 降级横幅「了解」）、`TestGtkErrorState`（error 无重试）、`TestGtkRetryableError`（重试接线）、`TestGtkRapidRepush`（导航页唯一 tag，守着 pop 过渡中再次 push 的竞态）与 `TestGtkFatalBanner`（致命态横幅、搜索、开关联动），加上生命周期用例的 confirm→creating 与详情页（共 9 条），列表/配置/详情 × probing/confirm/creating/error 全覆盖；三屏约 150 条 `ui.*` 文案（160 处 `tr()` 调用）全部进 `core/i18n`（zh_CN + en），`newUI` 统一用 `i18n.Lang()`。保障手段：`core/i18n/i18n_test.go` 钉住两语言键一一对应、占位符一致、en 表无中文、切片参数分隔符随语言，并扫描 `core/*.go` 的字面量 `err.*` 键（落地时抓出 `err.profile.exec_field_code` / `err.profile.extra_bind_missing` 只有 en、中文界面会回落英文的真实缺陷，以及三个 core 缺失键），`TestGtkEnglishStrings` 在 `LC_ALL=en_US.UTF-8` 下断言 en 界面文案。**仍禁止中英混排**：动态文案（reason、core 错误）与静态文案继续共用同一张表 | 已定（2026-11-08 退场完成） |
 | 028 | **GUI 启动的分身与设置窗口解耦**（2026-11-08）：GUI 点「启动」时以**自身二进制 fork 一个会话首进程**（runner，`APPCLONE_GUI_DETACH_*` 环境变量标识），runner 复用 `core.Run`——与 CLI 完全同一条生命周期实现（ADR-020）。关掉设置窗口不再结束正在运行的分身；详情页在运行中把「启动」换成「停止」，停止 = 向 runner 发 `SIGTERM`，由 `core.Run` 的进程组终止链收尾。**不引入 daemon/IPC**（ADR-004 不变）：runner 是一次性进程，不监听、不提供 API；运行态判定仍只看 `run.lock`（ADR-023 不变），新增的 `run.pid`（pid + `/proc/<pid>/stat` 启动时刻）只用于"给正在跑的 runner 发信号"，发送前校验启动时刻防 PID 复用、`run.lock` 拿得到时按 stale 清理。CLI 增 `appclone stop <app> <id>` 共用同一实现 | 已定 |
 | 029 | **「克隆起步」在 run 期做 per-path overlay，不在 add 期复制**（2026-11-08）：`add --fork` 只写 `instance.toml` 的 `fork = true`；每次 `run` 由 `core` 对归一封顶后的每个 `paths` 条目挂一层 `fuse-overlayfs`（lower=宿主真实目录，upper=`<inst>/root/<原路径>`，work/merged 在 `<inst>/.fork/<hash>/`，`hash = sha256(clean abs)[:8]`），merged 只作 bwrap ⑤ 的 bind 源；`shared_writes` 仍排在其后 bind 真实文件。**只对存在、是目录、且非空的 lower 挂载**，空/缺失路径退回普通实例目录。**失败不阻断启动**：fuse 不可用、挂载失败、残留卸不掉都只降级该路径并写 stderr，安全语义（只隔离 `paths`）不变。**残留回收只能按 mountinfo 判断，不能 `stat`**：fuse daemon 已死时 `stat` 返回 `ENOTCONN` 会被误判成"未挂载"，随后 `RemoveAll` 会穿过挂载点遍历 lower、删掉主实例真实数据；顺序固定为"先卸、后删"，卸载失败则保留 `.fork/` 等下轮；mountinfo 的路径是八进制转义过的（空格 = `\040`），比对必须先解码再整串相等，否则 `HOME`/`AC_BASE` 带空格时会漏判 stale。mountinfo 记录的是软链解析后的 d_path，比对还必须同时接受词法路径与 `EvalSymlinks` 结果（挂载点已死时退到最近可解析祖先）；`mounted()` 同步改成 mountinfo-only，探测链路也因此不再在带空格/软链的路径上挂载超时，而挂载轮询另用 `mountLive`（mountinfo + stat）避免把 fuse crash 后的死挂载判成成功。挂载报错但挂载点已生效时不得 `RemoveAll` 工作目录；`resetForkBase` 逐条卸载并在删除前用 `mountUnder` 兜底；删除实例前先做同一清理（失败返回 `err.instance.fork_cleanup` 并拒绝删除）；`upper` 落在 lower 之内时跳过（否则 overlay 递归）；`forkMounts` 每路径前检查停止信号。**语义边界**：lower 是实时数据不是快照；分身与主实例**不得同时使用**同一份应用数据（overlay 对挂载期间 lower 的并发修改不做可见性保证），需要冻结起点须先复制数据（§方案设计 8.1 已写明）。无 root、无 daemon、无特权 | 已定 |
+| 030 | **许可证 = GPL-3.0-or-later**（2026-11-08 用户拍板）：仓库根 `LICENSE` 存 GPLv3 全文，nfpm `license` 字段写 SPDX 标识符；deb 用 DEP-5 `packaging/copyright`（版权人 + or-later），rpm/Arch 用 `/usr/share/licenses/appclone/LICENSE`；`THIRD_PARTY_NOTICES` 汇总静态链接依赖的许可证全文并随包分发。理由：与 GTK/libadwaita 生态一致（puregotk 默认 MIT、libadwaita LGPL，均兼容）；本产品是桌面应用而非嵌入式库，copyleft 更贴合定位；发行版官方仓库与 AUR 要求明确的许可证声明。「core 用 MIT 便于第三方嵌入」的方案作废 | 已定 |

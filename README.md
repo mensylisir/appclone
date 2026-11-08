@@ -99,3 +99,13 @@ design/guitest-gtk.sh                             # 真实 GTK 闸门（需显�
 
 设计契约在 `docs/方案设计.md`，技术选型与 ADR 在 `docs/tech-stack.md`，已验证状态在
 `docs/STATUS.md`；`NEXT.md` 记录当前进度。打包配置在 `packaging/`。
+
+## 许可证
+
+Copyright (C) 2026 mensylisir <710080675@qq.com>
+
+[GPL-3.0-or-later](LICENSE)：本程序以 GPLv3 或（由你选择）任何更高版本发布。分发本程序的
+二进制（无论是否修改）时，须按 GPLv3 向接收者提供对应源码（或有效的源码获取方式）并附许可证文本；
+分发修改后的版本同样如此。`.rpm` / Arch 包与 `.tar.gz` 附 GPL 全文；deb 附 DEP-5 `copyright`
+（含许可证声明与 Debian 系统 GPL-3 文本指引）；静态链接的第三方组件声明见
+[THIRD_PARTY_NOTICES](THIRD_PARTY_NOTICES)。

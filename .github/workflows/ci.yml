@@ -85,6 +85,10 @@ jobs:
             https://github.com/goreleaser/nfpm/releases/download/v2.41.0/nfpm_2.41.0_Linux_x86_64.tar.gz
           echo "2fec509cc508fd7688b03f1426747725e93e024ff3c94a7f02022a50ddaa6c04  /tmp/nfpm.tar.gz" | sha256sum -c -
           sudo tar -xzf /tmp/nfpm.tar.gz -C /usr/local/bin nfpm
+      - name: 安装包检查工具（rpm 头字段 + bsdtar 读 Arch 载荷）
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends rpm libarchive-tools
       - name: 构建 amd64 二进制并出包
         env:
           CGO_ENABLED: "0"
@@ -101,6 +105,7 @@ jobs:
           ls -l dist/pkg
           ar p dist/pkg/appclone_0.0.0_amd64.deb control.tar.gz | tar -xzO ./control > /tmp/control
           grep -qx 'Architecture: amd64' /tmp/control
+          grep -qx 'License: GPL-3.0-or-later' /tmp/control
           grep -q '^Depends: .*bubblewrap' /tmp/control
           grep -q '^Depends: .*desktop-file-utils' /tmp/control
           grep -q '^Depends: .*libglib2.0-bin' /tmp/control
@@ -108,10 +113,31 @@ jobs:
           grep -q '^Recommends: .*strace' /tmp/control
           ar p dist/pkg/appclone_0.0.0_amd64.deb data.tar.gz | tar -tzf - > /tmp/data
           for p in ./usr/bin/appclone ./usr/bin/appclone-gui \
+                   ./usr/share/doc/appclone/copyright \
+                   ./usr/share/doc/appclone/THIRD_PARTY_NOTICES \
                    ./usr/share/applications/io.github.mensylisir.Appclone.desktop \
                    ./usr/share/icons/hicolor/scalable/apps/io.github.mensylisir.Appclone.svg; do
             grep -qx "$p" /tmp/data || { echo "::error::deb 缺少 $p"; exit 1; }
           done
+          # deb 按 Debian Policy §12.5 用 DEP-5 copyright（版权人 + or-later 声明），
+          # 不重复装 /usr/share/licenses/LICENSE；其余格式走 /usr/share/licenses/。
+          ar p dist/pkg/appclone_0.0.0_amd64.deb data.tar.gz | tar -xzf - -O ./usr/share/doc/appclone/copyright > /tmp/copyright
+          grep -qx 'Copyright: 2026 mensylisir <710080675@qq.com>' /tmp/copyright
+          grep -qx 'License: GPL-3+' /tmp/copyright
+          grep -q 'either version 3 of the License, or' /tmp/copyright
+          if grep -q '^\./usr/share/licenses/' /tmp/data; then
+            echo "::error::deb 不应包含 /usr/share/licenses/ 下的文件"; grep '^\./usr/share/licenses/' /tmp/data; exit 1
+          fi
+          # Arch：许可证文件与 .PKGINFO 的 license 字段
+          arch_pkg=dist/pkg/appclone-0.0.0-1-x86_64.pkg.tar.zst
+          bsdtar -xOf "$arch_pkg" .PKGINFO | grep -qx 'license = GPL-3.0-or-later'
+          bsdtar -tf "$arch_pkg" | grep -qx 'usr/share/licenses/appclone/LICENSE'
+          bsdtar -tf "$arch_pkg" | grep -qx 'usr/share/licenses/appclone/THIRD_PARTY_NOTICES'
+          # rpm：头里的 License 标签与载荷文件
+          rpm_pkg=dist/pkg/appclone-0.0.0-1.x86_64.rpm
+          rpm -qp --qf '%{LICENSE}\n' "$rpm_pkg" | grep -qx 'GPL-3.0-or-later'
+          rpm -qlp "$rpm_pkg" | grep -qx '/usr/share/licenses/appclone/LICENSE'
+          rpm -qlp "$rpm_pkg" | grep -qx '/usr/share/licenses/appclone/THIRD_PARTY_NOTICES'
 
   html:
     name: GUI 设计稿交互回归（62 项）
