@@ -477,6 +477,16 @@ GTK 闸门补结构断言：无实例时 `GetVisibleChildName()=="all"`、创建
   不在 `libglib2.0-0t64`），删除功能会因此不可用；deb 加 `libglib2.0-bin`、rpm/Arch 加 `glib2` 后
   重装复测 `doctor` 的 gio 项从 ✗ 变 ✓。容器内 `/dev/fuse` 打不开、无 D-Bus 会话属容器限制，
   不作为产品结论。
+- **Fedora 41 容器实装**（2026-11-08）：`dnf install ./appclone-1.0.0-1.x86_64.rpm` 成功
+  （136 个依赖，`--setopt=install_weak_deps=False` 避免容器镜像无关包）；落点与权限正确，
+  `desktop-file-validate` 退出 0；以 uid 1000 非 root 运行 `appclone version` → `1.0.0`，
+  `doctor` 判定 GTK 4.16.13 / libadwaita 1.6.1 / `gio` 正常（关闭弱依赖时 fuse/strace 缺失按预期 fail）。
+  **顺带硬化**：手动测试时曾把 arm64 二进制装进标着 x86_64 的包（nfpm 不校验 payload 架构）。
+  发布流程在 stage 后新增 `file` 架构断言（`x86-64` / `ARM aarch64`），Arch 包也单独断言 amd64。
+- **Arch 容器实装**（2026-11-08）：`pacman -U appclone-1.0.0-1-x86_64.pkg.tar.zst` 成功，
+  `pacman -Ql` 落点正确；非 root `appclone version` → `1.0.0`，`doctor` 判定 GTK 4.24.1 / gio /
+  bubblewrap 0.13.1 正常。fuse/strace 未装属预期（Arch 无 `optdepends`，README 与 doctor 已提示）。
+  三个发行版族的包至此都在真实发行版容器里装过并跑过 CLI/GUI 冒烟中的对应部分。
 
 **第三十八轮：GUI 分身生命周期解耦（ADR-028）**（2026-11-08）。用户拍板：**分离运行 + 停止按钮**。
 - GUI 点「启动」不再在自己的进程里跑 `core.Run`，而是以自身二进制 fork 一个会话首进程（runner，

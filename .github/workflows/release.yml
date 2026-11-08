@@ -79,6 +79,12 @@ jobs:
           for arch in amd64 arm64; do
             rm -rf dist/stage && mkdir -p dist/stage
             cp "dist/bin/$arch/appclone" "dist/bin/$arch/appclone-gui" dist/stage/
+            # nfpm 不校验 payload 架构：stage 串了架构会做出"标着 x86_64 的 arm64 包"。
+            case "$arch" in
+              amd64) want="x86-64" ;;
+              arm64) want="ARM aarch64" ;;
+            esac
+            file dist/stage/* | grep -q "$want" || { echo "::error::dist/stage 的二进制架构不是 $arch"; file dist/stage/*; exit 1; }
             for fmt in deb rpm; do
               GOARCH="$arch" VERSION="$VERSION" \
                 nfpm pkg --config packaging/nfpm.yaml --packager "$fmt" --target dist/pkg/
@@ -87,6 +93,7 @@ jobs:
           # Arch 官方仓库只有 x86_64；arm64 用户走 .tar.gz 或 AUR 源码包。
           rm -rf dist/stage && mkdir -p dist/stage
           cp dist/bin/amd64/appclone dist/bin/amd64/appclone-gui dist/stage/
+          file dist/stage/* | grep -q "x86-64" || { echo "::error::Arch 包只能用 amd64 二进制"; exit 1; }
           GOARCH=amd64 VERSION="$VERSION" \
             nfpm pkg --config packaging/nfpm.yaml --packager archlinux --target dist/pkg/
 
