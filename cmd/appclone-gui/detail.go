@@ -652,6 +652,9 @@ func (v *detailView) stop(in core.Instance) {
 			})
 		}()
 	})
+	if dialogHook != nil {
+		dialogHook(d)
+	}
 	d.Choose(&v.u.win.Widget, nil, nil, 0)
 }
 
@@ -699,6 +702,9 @@ func (v *detailView) rename(in core.Instance) {
 			})
 		}()
 	})
+	if dialogHook != nil {
+		dialogHook(d)
+	}
 	d.Choose(&v.u.win.Widget, nil, nil, 0)
 }
 
@@ -749,6 +755,9 @@ func (v *detailView) remove(in core.Instance) {
 			})
 		}()
 	})
+	if dialogHook != nil {
+		dialogHook(d)
+	}
 	d.Choose(&v.u.win.Widget, nil, nil, 0)
 }
 

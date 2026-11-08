@@ -30,6 +30,10 @@ const (
 	searchDebounceMs = 120
 )
 
+// dialogHook 仅 GTK 闸门使用：对话框 Choose 之前把对象交给测试，让测试能
+// 走真实 response 回调（本会话无法注入指针事件）。生产进程里恒为 nil。
+var dialogHook func(*adw.AlertDialog)
+
 type ui struct {
 	app  *adw.Application
 	env  *core.Env
@@ -990,6 +994,9 @@ func (u *ui) confirmDisable(a core.App, ref rowRef) {
 			u.pending[a.Key] = false
 			u.revert(ref, a.Key, true)
 		})
+		if dialogHook != nil {
+			dialogHook(d)
+		}
 		d.Choose(&u.win.Widget, nil, nil, 0)
 		return
 	}
@@ -1045,6 +1052,9 @@ func (u *ui) confirmDisable(a core.App, ref rowRef) {
 			})
 		}()
 	})
+	if dialogHook != nil {
+		dialogHook(d)
+	}
 	d.Choose(&u.win.Widget, nil, nil, 0)
 }
 
