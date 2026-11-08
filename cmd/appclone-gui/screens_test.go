@@ -16,6 +16,7 @@ package main
 // 直调的是按钮 clicked 绑定的同一个 submit 处理函数。这是直调回调，不是
 // 合成点击，不需要指针事件。
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -1310,4 +1311,246 @@ func visibleIsPage(u *ui, page *adw.NavigationPage) bool {
 	ok := vis.GoPointer() == page.GoPointer()
 	vis.Unref()
 	return ok
+}
+
+// findWidgets 深度优先遍历控件树。按钮没有稳定 id，回归靠 tooltip 认出
+// "启动/停止"——tooltip 是产品给用户看的文案，改了它本来就该触发断言。
+// GetFirstChild/GetNextSibling 都是 transfer none，不 Unref。
+func findWidgets(root *gtk.Widget, pred func(*gtk.Widget) bool) []*gtk.Widget {
+	var out []*gtk.Widget
+	var walk func(*gtk.Widget)
+	walk = func(w *gtk.Widget) {
+		if w == nil {
+			return
+		}
+		if pred(w) {
+			out = append(out, w)
+		}
+		for c := w.GetFirstChild(); c != nil; c = c.GetNextSibling() {
+			walk(c)
+		}
+	}
+	walk(root)
+	return out
+}
+
+// TestGtkDetailShowsStopWhenRunning（ADR-028）：运行中的实例行必须显示
+// 「停止」而不是禁用「启动」。去掉运行态分支（永远显示启动）会让这条
+// 用例立即变红。
+func TestGtkDetailShowsStopWhenRunning(t *testing.T) {
+	env, appsDir := gtkTestEnv(t, "stopbtn")
+	if err := os.WriteFile(filepath.Join(appsDir, "demo.desktop"),
+		[]byte("[Desktop Entry]\nType=Application\nName=Demo\nExec=/usr/bin/true\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	profile := core.Profile{
+		App: "demo", Version: core.ProfileVersion, Exec: "/usr/bin/true",
+		Paths: []string{"~/.config/Demo"}, ProbeMethod: "overlay",
+		Ignored: core.DefaultIgnored(), Env: map[string]string{},
+	}
+	if _, err := env.CreateInstance(context.Background(), "demo", profile, "main"); err != nil {
+		t.Fatal(err)
+	}
+	// 让 IsRunning 看到"在跑"：flock 对同进程的不同 fd 也会冲突。
+	lock, err := env.HoldRunLock("demo", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lock.Close()
+
+	app := adw.NewApplication("io.github.mensylisir.Appclone.GtkStop",
+		gio.GApplicationNonUniqueValue)
+	defer app.Unref()
+
+	u := &ui{app: app, env: env, lang: "zh_CN"}
+	var runErr error
+	activated := false
+	fail := func(format string, a ...any) {
+		if runErr == nil {
+			runErr = fmt.Errorf(format, a...)
+		}
+		app.Quit()
+	}
+	pushed := false
+	actcb := func(_ gio.Application) {
+		if u.win != nil {
+			return
+		}
+		activated = true
+		u.buildWindow()
+		deadline := time.Now().Add(20 * time.Second)
+		var tick glib.SourceFunc
+		tick = func(uintptr) bool {
+			if time.Now().After(deadline) {
+				fail("等详情页运行态超时")
+				return false
+			}
+			if !u.loaded {
+				return true
+			}
+			if !pushed {
+				pushed = true
+				u.pushDetail("demo")
+				return true
+			}
+			v := u.activeDetail
+			if v == nil || !v.loaded {
+				return true
+			}
+			stops := findWidgets(&v.content.Widget, func(w *gtk.Widget) bool {
+				return w.GetTooltipText() == u.tr("ui.instance.stop.tooltip", nil)
+			})
+			if len(stops) != 1 {
+				fail("运行中的实例行应恰好有一个「停止」按钮，得到 %d", len(stops))
+				return false
+			}
+			if !stops[0].GetSensitive() {
+				fail("「停止」按钮不可点")
+				return false
+			}
+			starts := findWidgets(&v.content.Widget, func(w *gtk.Widget) bool {
+				return w.GetTooltipText() == u.tr("ui.instance.launch.tooltip", nil)
+			})
+			if len(starts) != 0 {
+				fail("运行中不应同时显示「启动」按钮，得到 %d", len(starts))
+				return false
+			}
+			app.Quit()
+			return false
+		}
+		glib.TimeoutAdd(50, &tick, 0)
+	}
+	app.ConnectActivate(&actcb)
+	u.hold(&actcb)
+
+	if code := app.Run(1, os.Args[:1]); code != 0 {
+		t.Fatalf("GTK 主循环退出码 %d", code)
+	}
+	if runErr != nil {
+		t.Fatal(runErr)
+	}
+	if !activated {
+		t.Fatal("activate 没有执行")
+	}
+}
+
+// TestDetachedRunnerSpawn（ADR-028）：验证 GUI 起 runner 的方式本身——
+// 标记环境变量真的传下去、进程真的在独立会话里（Setsid）、父进程会收尸。
+// 把 runner 换成脚本，避免在闸门里真的启动 bwrap。
+func TestDetachedRunnerSpawn(t *testing.T) {
+	env, appsDir := gtkTestEnv(t, "detach")
+	if err := os.WriteFile(filepath.Join(appsDir, "demo.desktop"),
+		[]byte("[Desktop Entry]\nType=Application\nName=Demo\nExec=/usr/bin/true\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	app := "demo"
+	profile := core.Profile{
+		App: app, Version: core.ProfileVersion, Exec: "/usr/bin/true",
+		Paths: []string{"~/.config/Demo"}, ProbeMethod: "manual",
+		Ignored: core.DefaultIgnored(), Env: map[string]string{},
+	}
+	if err := env.SaveProfile(profile); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := env.CreateInstance(context.Background(), app, profile, "main"); err != nil {
+		t.Fatal(err)
+	}
+
+	dir := t.TempDir()
+	marker := filepath.Join(dir, "marker")
+	script := filepath.Join(dir, "runner.sh")
+	body := fmt.Sprintf(`#!/bin/sh
+sid=$(awk '{print $6}' /proc/$$/stat)
+printf 'APP=%%s ID=%%s PID=%%s SID=%%s\n' "$APPCLONE_GUI_DETACH_APP" "$APPCLONE_GUI_DETACH_ID" "$$" "$sid" > %q
+exit 7
+`, marker)
+	if err := os.WriteFile(script, []byte(body), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	old := detachedExecutable
+	detachedExecutable = func() (string, error) { return script, nil }
+	defer func() { detachedExecutable = old }()
+
+	wait, logPath, _, err := startDetached(env, app, "main")
+	if err != nil {
+		t.Fatalf("起 runner 失败：%v", err)
+	}
+	if werr := wait(); werr == nil {
+		t.Fatal("脚本以 7 退出，wait 必须返回非 nil（GUI 靠这个判启动失败）")
+	}
+	b, err := os.ReadFile(marker)
+	if err != nil {
+		t.Fatalf("runner 没有执行：%v（log=%s）", err, logPath)
+	}
+	got := string(b)
+	for _, want := range []string{"APP=demo", "ID=main"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("环境标记没有传给 runner：想要 %q，得到 %q", want, got)
+		}
+	}
+	var pid, sid int
+	if _, err := fmt.Sscanf(got[strings.Index(got, "PID="):], "PID=%d", &pid); err != nil {
+		t.Fatalf("解析 PID 失败：%q", got)
+	}
+	if _, err := fmt.Sscanf(got[strings.Index(got, "SID="):], "SID=%d", &sid); err != nil {
+		t.Fatalf("解析 SID 失败：%q", got)
+	}
+	if pid != sid {
+		t.Fatalf("runner 必须是会话首进程（Setsid）：pid=%d sid=%d", pid, sid)
+	}
+}
+
+// TestDetachLogHelpers：run.log 是长跑应用的输出落点，必须既封顶又不把
+// 非法字节塞进 GTK 字符串（ADR-028 对抗复审 P2-2）。
+func TestDetachLogHelpers(t *testing.T) {
+	// cappedWriter 截断超出部分，但必须对调用方报告"全写完了"，
+	// 否则 exec 的 copier 会以 ErrShortWrite 提前失败。
+	var buf bytes.Buffer
+	cw := &cappedWriter{w: &buf, left: 4}
+	if n, err := cw.Write([]byte("abcdef")); err != nil || n != 6 {
+		t.Fatalf("超限写入应报告写完：n=%d err=%v", n, err)
+	}
+	if n, err := cw.Write([]byte("gh")); err != nil || n != 2 {
+		t.Fatalf("用尽配额后的写入应被静默接纳：n=%d err=%v", n, err)
+	}
+	if got := buf.String(); got != "abcd" {
+		t.Fatalf("只应落盘前 4 字节，得到 %q", got)
+	}
+
+	p := filepath.Join(t.TempDir(), "run.log")
+	body := "appclone: 第一行\n\nappclone-gui: 启动失败\x00\x01\xff\xfe end\n"
+	if err := os.WriteFile(p, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := lastLogLine(p, 0), "启动失败 end"; got != want {
+		t.Fatalf("lastLogLine 应去前缀并清掉非法/控制字节：want %q got %q", want, got)
+	}
+
+	// 追加模式下不能把上一轮的最后一行当成这一轮的失败原因。
+	old := "上次运行的旧原因\n"
+	if err := os.WriteFile(p, []byte(old+"本次失败\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := lastLogLine(p, int64(len(old))), "本次失败"; got != want {
+		t.Fatalf("只应看到 offset 之后的输出：want %q got %q", want, got)
+	}
+}
+
+// TestDetachedTargetEnv：runner 标记只在两个变量都非空时才分流；普通
+// GUI 启动必须走 GTK。拼错一个变量名就会让每次启动都变 runner。
+func TestDetachedTargetEnv(t *testing.T) {
+	t.Setenv(detachAppEnv, "")
+	t.Setenv(detachIDEnv, "")
+	if _, _, ok := detachedTarget(); ok {
+		t.Fatal("没有标记时不应分流")
+	}
+	t.Setenv(detachAppEnv, "demo")
+	if _, _, ok := detachedTarget(); ok {
+		t.Fatal("只有 app 没有 id 时不应分流")
+	}
+	t.Setenv(detachIDEnv, "main")
+	app, id, ok := detachedTarget()
+	if !ok || app != "demo" || id != "main" {
+		t.Fatalf("标记齐全时应分流：ok=%v app=%q id=%q", ok, app, id)
+	}
 }

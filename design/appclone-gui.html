@@ -554,7 +554,7 @@
     </div>
   </div>
 
-  <!-- ═══════════ AdwAlertDialog · 破坏性确认（删除实例 / 关闭开关） ═══════════ -->
+  <!-- ═══════════ AdwAlertDialog · 破坏性确认（停止分身 / 删除实例 / 关闭开关） ═══════════ -->
   <div class="overlay" id="alertOverlay">
     <div class="alert" role="alertdialog" aria-modal="true" aria-labelledby="alertTitle">
       <div class="alert-body">
@@ -596,8 +596,8 @@
   <div class="annot" id="annot2">
     <h4>屏2 · 应用详情 — 组件映射与状态</h4>
     <table>
-      <tr><td>实例行</td><td><span class="w">AdwActionRow</span> + 尾部按钮组：启动（suggested）/ 删除（destructive-flat）；<b>运行中两个都禁用</b>（rm 对运行中实例一律拒绝，退出码 7，界面不能比 CLI 宽松）</td></tr>
-      <tr><td>运行状态</td><td>读 <span class="w">instances/&lt;app&gt;/&lt;id&gt;/run.lock</span> 的 flock（拿不到锁 = 在跑），<b>不用 pgrep、不用 PID 文件</b>（方案设计 §4.3）</td></tr>
+      <tr><td>实例行</td><td><span class="w">AdwActionRow</span> + 尾部按钮组：启动（suggested）/ 停止（destructive）/ 删除（destructive-flat）；<b>运行中「启动」换成「停止」，「删除」禁用</b>（rm 对运行中实例一律拒绝，退出码 7，界面不能比 CLI 宽松）。停止走二次确认（未保存内容可能丢失，默认「取消」）</td></tr>
+      <tr><td>运行状态</td><td>读 <span class="w">instances/&lt;app&gt;/&lt;id&gt;/run.lock</span> 的 flock（拿不到锁 = 在跑），<b>不用 pgrep</b>；运行态判定不读 PID 文件。stopping 用的 <span class="w">run.pid</span> 只记录信号目标（ADR-028）</td></tr>
       <tr><td>重命名</td><td><span class="w">AdwEntryRow</span>（GNOME 原生表单模式；本稿为演示用 contenteditable，原生不用它）。只改 <span class="w">display_name</span>，<span class="w">id</span> 创建后不可变</td></tr>
       <tr><td>新建入口</td><td><span class="w">AdwActionRow（activatable）</span>→ 屏3（新建分身，沿用现有档案、跳过探测）</td></tr>
       <tr><td>档案组</td><td><span class="w">AdwPreferencesGroup</span> 只读行：隔离路径数、<b>探测方式与置信度</b>（只说证据来源与覆盖范围，<b>不写"结果完整"/"全部已捕获"</b>）、单例处理、<b>共享但可写</b>（`shared_writes`，说清"两个分身的最近文件会混"这种代价）、<b>最近一次审计结论</b>、实例根目录</td></tr>
@@ -876,9 +876,11 @@ function renderDetail() {
         </div>
         <div class="row-sub">${inst.size} · 上次使用 ${inst.last}</div>
       </div>
-      <button class="btn small suggested" data-launch="${i}" ${inst.running ? 'disabled' : ''}>启动</button>
+      ${inst.running
+        ? `<button class="btn small destructive" data-stop="${i}" title="停止这个分身里正在运行的应用">停止</button>`
+        : `<button class="btn small suggested" data-launch="${i}">启动</button>`}
       <button class="btn small destructive" data-del="${i}" ${inst.running ? 'disabled' : ''}
-              title="${inst.running ? '这个分身正在运行，请先在应用里退出它' : '移到回收站'}">删除</button>
+              title="${inst.running ? '这个分身正在运行，请先停止它' : '移到回收站'}">删除</button>
     </div>`).join('');
   $('#instBox').innerHTML = rows ||
     `<div class="row"><div class="row-sub">还没有分身实例 — 点击下方「新建分身」开始</div></div>`;
@@ -1154,7 +1156,7 @@ function closeDialog(force) {
   renderList();
 }
 
-/* ---- AdwAlertDialog：唯一用于破坏性确认的组件（删除实例 / 关闭开关） ---- */
+/* ---- AdwAlertDialog：唯一用于破坏性确认的组件（停止分身 / 删除实例 / 关闭开关） ---- */
 let alertAction = null, alertCancelAction = null;
 function openAlert({ title, body, okText, onOk, onCancel, destructive = true }) {
   $('#alertTitle').textContent = title;
@@ -1233,6 +1235,22 @@ document.addEventListener('click', e => {
     /* 用户可见文案里不能出现内部 id 与引擎名（work / bwrap）：id 是目录名，用户只认显示名 */
     const inst = currentApp.instances[l.dataset.launch];
     toast(`正在启动「${currentApp.name} · ${inst.display_name || inst.id}」…`);
+    return;
+  }
+  const st = t.closest('[data-stop]');
+  if (st) {
+    /* 停止会结束应用：未保存的内容可能丢，必须二次确认，默认「取消」（ADR-028） */
+    const inst = currentApp.instances[st.dataset.stop];
+    openAlert({
+      title: `停止「${inst.display_name || inst.id}」？`,
+      body: '正在运行的应用会退出；未保存的内容可能丢失。',
+      okText: '停止',
+      onOk: () => {
+        inst.running = false;
+        renderDetail(); renderList();
+        toast(`已停止「${inst.display_name || inst.id}」`);
+      },
+    });
     return;
   }
   const d = t.closest('[data-del]');

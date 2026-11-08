@@ -14,6 +14,13 @@ import (
 )
 
 func main() {
+	// ADR-028：启动分身时 GUI 以自身二进制 fork 一个 runner；它在
+	// GTK/GApplication 初始化之前分流，不建窗口、不进主循环。注意
+	// puregotk 的包 init 仍会 dlopen libgtk，所以 runner 依旧需要 GTK
+	// 运行库（只是不需要显示）。
+	if appKey, id, ok := detachedTarget(); ok {
+		os.Exit(runDetached(appKey, id))
+	}
 	env, err := core.NewEnv()
 	if err != nil {
 		// errorArgs 不能省：err.env.ac_home_relative 这类模板带 {path}，

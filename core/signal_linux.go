@@ -11,8 +11,11 @@ import (
 
 // notifyRunSignals 订阅会终止 run 的三个信号。SIGHUP 也要接：
 // 用户关掉终端时默认行为是直接没，那就留下一个看不见的实例占着 run.lock。
-func notifyRunSignals(ch chan<- os.Signal) {
+//
+// 返回的函数用于撤销订阅（run 返回前必须调；测试里同一进程反复 run 时尤其重要）。
+func notifyRunSignals(ch chan<- os.Signal) func() {
 	signal.Notify(ch, syscall.SIGTERM, syscall.SIGINT, syscall.SIGHUP)
+	return func() { signal.Stop(ch) }
 }
 
 // terminateGroup 对整个进程组发 SIGTERM，3 秒后 SIGKILL。

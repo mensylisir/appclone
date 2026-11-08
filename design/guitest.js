@@ -1,13 +1,13 @@
-// 交互回归（58 项）：三屏 + 探测四态（probing/confirm/creating/error）+ 五入口 + 两处破坏性确认
-//                    + 门禁 + 搜索 + 横幅语义 + 空态可达性 + 运行状态
-// 运行：node design/guitest.js        （退出码 0 = 58/58，非 0 = 设计基线被破坏）
+// 交互回归（60 项）：三屏 + 探测四态（probing/confirm/creating/error）+ 五入口 + 三处破坏性确认
+//                    + 门禁 + 搜索 + 横幅语义 + 空态可达性 + 运行/停止状态
+// 运行：node design/guitest.js        （退出码 0 = 60/60，非 0 = 设计基线被破坏）
 // 依赖：任一本机 Chromium + puppeteer-core；路径可用环境变量覆盖：
 //   CHROMIUM=/path/to/chromium  PUPPETEER_CORE=/path/to/puppeteer-core
 const path = require('path');
 const fs = require('fs');
 const { pathToFileURL } = require('url');
 
-const EXPECTED = 58;   // 断言总数；改动断言必须同步改这里（否则退出码永远是 1）
+const EXPECTED = 60;   // 断言总数；改动断言必须同步改这里（否则退出码永远是 1）
 
 function loadPuppeteer() {
   const cands = [
@@ -427,11 +427,36 @@ const pp = loadPuppeteer();
     await confirmAndWait();
     return ev(() => { const s=document.querySelector('[data-sw="slack"]'); return s.checked
       && s.closest('.row').querySelector('[data-sub]').textContent.includes('1 个分身'); }); });
-  await t('运行中实例：启动与删除都禁用(Telegram)', async () => {
+  /* 运行中「启动」换成「停止」（ADR-028）：隐藏一个点不动的按钮，同时让
+     "能做什么"保持可见；删除仍禁用（rm 对运行中实例一律拒绝） */
+  await t('运行中实例：显示「停止」，隐藏「启动」，删除禁用(Telegram)', async () => {
     await click('[data-app="telegram"]');
     return ev(() => !!document.querySelector('#instBox .runbadge')
-              && document.querySelector('[data-launch="0"]').disabled
+              && !!document.querySelector('[data-stop="0"]')
+              && !document.querySelector('[data-launch="0"]')
               && document.querySelector('[data-del="0"]').disabled); });
+  /* 停止会结束应用，未保存内容可能丢：二次确认，默认是「取消」 */
+  await t('停止分身 → 弹确认且默认「取消」，取消后仍在运行', async () => {
+    await click('[data-stop="0"]');
+    const ok = await ev(() => document.querySelector('#alertOverlay').classList.contains('open')
+      && document.querySelector('#alertOk').textContent === '停止'
+      && document.querySelector('#alertBody').textContent.includes('未保存')
+      && document.querySelector('#alertCancel').dataset.default === '1');
+    await click('#alertCancel');
+    return (ok && await ev(() => !document.querySelector('#alertOverlay').classList.contains('open')
+              && !!document.querySelector('#instBox .runbadge')))
+      || '停止确认的默认响应不对，或取消后运行态被改动';
+  });
+  await t('停止确认 → 运行标记消失、启动按钮回来', async () => {
+    await click('[data-stop="0"]'); await click('#alertOk');
+    const cleaned = await ev(() => !document.querySelector('#instBox .runbadge')
+      && !!document.querySelector('[data-launch="0"]')
+      && !document.querySelector('[data-stop="0"]'));
+    /* 后面的「关运行中实例的开关」还要用 Telegram 的运行态，还原演示数据 */
+    await ev(() => { apps.find(a => a.id === 'telegram').instances[0].running = true;
+                     renderDetail(); renderList(); });
+    return cleaned || '停止后界面没有回到「启动」状态';
+  });
   /* 运行数必须数出来，不能写死「1 个」：两个分身同时开着时说"1 个运行中"，
      用户会以为另一个挂了。断言走完整的 renderList 路径，而不是只测 subOf 这个辅助函数 */
   await t('副标题的运行数按实际计数（不是硬编码 1）', async () => {

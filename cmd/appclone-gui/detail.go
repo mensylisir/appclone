@@ -22,9 +22,12 @@ type detailView struct {
 	content *adw.PreferencesPage
 	insts   []core.Instance
 	running map[string]bool
-	profile core.Profile
-	audits  []auditEntry
-	groups  []*adw.PreferencesGroup
+	// stopping 记录"用户已经点过停止"的实例：runner 收尾时 launch 的 wait
+	// goroutine 也会回来，此时不该再报一条「已退出」把「已停止」顶掉。
+	stopping map[string]bool
+	profile  core.Profile
+	audits   []auditEntry
+	groups   []*adw.PreferencesGroup
 	// title 是 HeaderBar 里的两行标题（应用名 + 实例数），随 build 更新。
 	title *adw.WindowTitle
 	scope *renderScope
@@ -71,7 +74,11 @@ func (u *ui) pushDetail(appKey string) {
 			}
 		}
 	}
-	v := &detailView{u: u, appKey: appKey, running: map[string]bool{}}
+	v := &detailView{
+		u: u, appKey: appKey,
+		running:  map[string]bool{},
+		stopping: map[string]bool{},
+	}
 	v.fixed = &renderScope{c: u.cb}
 	v.content = adw.NewPreferencesPage()
 	v.content.SetTitle(u.nameOf(appKey))
@@ -298,12 +305,26 @@ func (v *detailView) build() {
 		v.scope.own(&box.Widget)
 		box.SetValign(gtk.AlignCenterValue)
 
-		launch, launchC := v.u.iconButton("media-playback-start-symbolic", v.u.tr("ui.instance.launch", nil))
-		v.scope.own(&launch.Widget)
-		v.scope.own(&launchC.Widget)
-		launch.AddCssClass("suggested-action")
-		launch.SetSensitive(!running)
-		launch.SetTooltipText(v.u.tr("ui.instance.launch.tooltip", nil))
+		inst := in
+		// 运行中把「启动」换成「停止」：隐藏一个点不动的按钮比换动作更诚实，
+		// 同时保留"这个分身能做什么"的可见性（ADR-028）。
+		if running {
+			stop, stopC := v.u.iconButton("media-playback-stop-symbolic", v.u.tr("ui.instance.stop", nil))
+			v.scope.own(&stop.Widget)
+			v.scope.own(&stopC.Widget)
+			stop.AddCssClass("destructive-action")
+			stop.SetTooltipText(v.u.tr("ui.instance.stop.tooltip", nil))
+			v.scope.button(stop, func() { v.stop(inst) })
+			box.Append(&stop.Widget)
+		} else {
+			launch, launchC := v.u.iconButton("media-playback-start-symbolic", v.u.tr("ui.instance.launch", nil))
+			v.scope.own(&launch.Widget)
+			v.scope.own(&launchC.Widget)
+			launch.AddCssClass("suggested-action")
+			launch.SetTooltipText(v.u.tr("ui.instance.launch.tooltip", nil))
+			v.scope.button(launch, func() { v.launch(inst) })
+			box.Append(&launch.Widget)
+		}
 
 		rename, renameC := v.u.iconButton("document-edit-symbolic", v.u.tr("ui.instance.rename", nil))
 		v.scope.own(&rename.Widget)
@@ -315,14 +336,16 @@ func (v *detailView) build() {
 		v.scope.own(&delC.Widget)
 		del.AddCssClass("destructive-action")
 		del.SetSensitive(!running)
-		del.SetTooltipText(v.u.tr("ui.instance.delete.tooltip", nil))
+		if running {
+			// 按钮不可点时提示要解释"为什么"，否则用户会以为删除坏了。
+			del.SetTooltipText(v.u.tr("ui.instance.delete.tooltip.running", nil))
+		} else {
+			del.SetTooltipText(v.u.tr("ui.instance.delete.tooltip", nil))
+		}
 
-		inst := in
-		v.scope.button(launch, func() { v.launch(inst) })
 		v.scope.button(rename, func() { v.rename(inst) })
 		v.scope.button(del, func() { v.remove(inst) })
 
-		box.Append(&launch.Widget)
 		box.Append(&rename.Widget)
 		box.Append(&del.Widget)
 		row.AddSuffix(&box.Widget)
@@ -546,21 +569,90 @@ func (v *detailView) profileIsCreatable() bool {
 }
 
 func (v *detailView) launch(in core.Instance) {
+	// ADR-028：不在 GUI 进程里跑 run，而是 detached runner；关窗口不再
+	// 连带结束应用。run.log 是启动失败时唯一的线索。
+	wait, logPath, logOffset, err := startDetached(v.u.env, v.appKey, in.ID)
+	if err != nil {
+		// 底层错误（权限、ENOENT）对普通用户没有行动价值，不进 toast。
+		v.u.toastMsg(v.u.tr("ui.toast.launch_failed", map[string]any{
+			"reason": v.u.tr("ui.toast.launch_failed.start", nil),
+		}))
+		return
+	}
+	v.u.toastMsg(v.u.tr("ui.toast.launching", map[string]any{"name": in.DisplayName}))
 	go func() {
-		_, err := v.u.env.Run(context.Background(), v.appKey, in.ID, core.RunOptions{})
-		v.u.goIdle(func(uintptr) bool {
-			if err != nil {
-				v.u.toastMsg(v.u.tr(errorKey(err), errorArgs(err)))
-			} else {
-				v.u.toastMsg(v.u.tr("ui.toast.instance_exited", map[string]any{"name": in.DisplayName}))
-			}
-			if v.u.activeDetail == v {
-				v.render()
-			}
-			v.u.reload()
-			return false
-		})
+		start := time.Now()
+		werr := wait()
+		// 2 秒内就退出的 runner 几乎一定是启动失败（bwrap 缺失、实例已在
+		// 运行、档案坏了）；跑起来的应用不会这么快退出，晚退出的报"已退出"。
+		v.notifyRunEnded(in, werr, time.Since(start) < 2*time.Second, logPath, logOffset)
 	}()
+}
+
+// notifyRunEnded 只在主循环里改界面：runner 的退出可能发生在页面已经
+// pop 掉之后，此时只刷新列表，不往旧页面写。
+func (v *detailView) notifyRunEnded(in core.Instance, werr error, early bool, logPath string, logOffset int64) {
+	v.u.goIdle(func(uintptr) bool {
+		if v.stopping[in.ID] {
+			// 用户点的停止：结果由 stop() 自己报（成功「已停止」/失败错误），
+			// 这里再报「已退出」既与交互基线不符，也会把真正的通知顶掉。
+			delete(v.stopping, in.ID)
+		} else if werr != nil && early {
+			reason := lastLogLine(logPath, logOffset)
+			if reason == "" {
+				reason = v.u.tr("ui.toast.launch_failed.generic", nil)
+			}
+			v.u.toastMsg(v.u.tr("ui.toast.launch_failed", map[string]any{"reason": reason}))
+		} else {
+			v.u.toastMsg(v.u.tr("ui.toast.instance_exited", map[string]any{"name": in.DisplayName}))
+		}
+		v.u.reload()
+		if v.u.activeDetail == v {
+			v.render()
+		}
+		return false
+	})
+}
+
+func (v *detailView) stop(in core.Instance) {
+	// 停止会结束应用：未保存的内容可能丢，必须二次确认，默认「取消」。
+	d := adw.NewAlertDialog(
+		v.u.tr("ui.dialog.stop.title", map[string]any{"name": in.DisplayName}),
+		v.u.tr("ui.dialog.stop.body", nil))
+	d.AddResponse("cancel", v.u.tr("ui.dialog.cancel", nil))
+	d.AddResponse("stop", v.u.tr("ui.dialog.stop.action", nil))
+	d.SetDefaultResponse("cancel")
+	d.SetResponseAppearance("stop", adw.ResponseDestructiveValue)
+	v.u.cb.onDialog(d, func(resp string) {
+		if resp != "stop" {
+			return
+		}
+		// 先记账再发信号：runner 可能比 StopRun 的轮询更快退出，wait
+		// goroutine 回来时要知道这条「已退出」是用户自己点出来的。
+		v.stopping[in.ID] = true
+		v.u.toastMsg(v.u.tr("ui.toast.stopping", map[string]any{"name": in.DisplayName}))
+		go func() {
+			// 6 秒的组终止链 + 收尾余量；StopRun 自己也有 6 秒上限。
+			ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+			defer cancel()
+			err := v.u.env.StopRun(ctx, v.appKey, in.ID)
+			v.u.goIdle(func(uintptr) bool {
+				if err != nil {
+					// 停止没成功：清掉记账，下一次真正的退出仍要告诉用户。
+					delete(v.stopping, in.ID)
+					v.u.toastMsg(v.u.tr(errorKey(err), errorArgs(err)))
+				} else {
+					v.u.toastMsg(v.u.tr("ui.toast.stopped", map[string]any{"name": in.DisplayName}))
+				}
+				v.u.reload()
+				if v.u.activeDetail == v {
+					v.render()
+				}
+				return false
+			})
+		}()
+	})
+	d.Choose(&v.u.win.Widget, nil, nil, 0)
 }
 
 func (v *detailView) rename(in core.Instance) {

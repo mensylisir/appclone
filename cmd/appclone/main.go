@@ -49,6 +49,7 @@ func main() {
 	root.AddCommand(
 		newAddCmd(a),
 		newRunCmd(a),
+		newStopCmd(a),
 		newListCmd(a),
 		newRmCmd(a),
 		newDoctorCmd(a),

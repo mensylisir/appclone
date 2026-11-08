@@ -295,6 +295,52 @@ GTK 闸门补结构断言：无实例时 `GetVisibleChildName()=="all"`、创建
 `design/guitest-gtk.sh` **3/3 PASS**；`DISPLAY=:0` 真机截图核对了「分身」（含运行实例、角标）
 与「所有应用」两屏。
 
+**第三十八轮：GUI 分身生命周期解耦（ADR-028）**（2026-11-08）。用户拍板：**分离运行 + 停止按钮**。
+- GUI 点「启动」不再在自己的进程里跑 `core.Run`，而是以自身二进制 fork 一个会话首进程（runner，
+  `APPCLONE_GUI_DETACH_APP/ID` + `Setsid`）；runner 在 GTK 初始化前分流，复用与 CLI 同一条
+  `core.Run`。关掉设置窗口只结束 GUI，正在运行的分身继续跑。runner 是一次性进程，不监听、
+  不提供 API——**不是 daemon，也不引入 IPC**（ADR-004 不变）。
+- `core.Run` 拿锁后写 `<inst>/run.pid`（`pid` + `/proc/<pid>/stat` 启动时刻，tmp+rename 原子替换），
+  退出时**先删记录再放锁**；运行态判定仍只看 `run.lock`（ADR-023 不变），pid 文件只用于定位
+  停止信号的目标。
+- 新增 `core.StopRun` 与 CLI `appclone stop <app> <id>`：先用 `run.lock` 证明实例在跑，再校验
+  启动时刻防 PID 复用，最后 SIGTERM 给 runner（由 `core.Run` 的整组 `SIGTERM`→3s→`SIGKILL`
+  收尾）。锁拿得到按 stale 清理，且清记录在**持锁状态下**做，避免误删刚启动的新 run；
+  runner 在注册信号处理器之前就被默认 SIGTERM 打死时，锁是否可拿是唯一可靠判据（残留记录一并清）。
+  未运行/无法确认目标 ⇒ 退出 7，绝不盲杀 PID。
+- GUI 详情页运行中把「启动」换成「停止」，二次确认默认「取消」（未保存内容可能丢）；
+  停止成功/失败走 toast；runner 始终 `Wait` 收尸。启动输出追加到 `run.log`（**每次封顶 1 MiB**，
+  超限静默丢弃；启动失败只把**尾部一行**清掉前缀/非法 UTF-8/控制字符后进 toast，不把日志路径
+  或原始 OS 错误甩给用户；2 秒内退出的 runner 才判「启动失败」，否则报「已退出」）。
+  删除按钮在运行中禁用，tooltip 明说「先停止才能删除」。
+- 交互基线同步：HTML 稿运行中显示「停止」、第三次破坏性确认，`guitest.js` **58 → 60**；
+  GTK 闸门新增 `TestGtkDetailShowsStopWhenRunning`、`TestDetachedRunnerSpawn`（env 传递 +
+  Setsid + 收尸）、`TestDetachLogHelpers`（封顶不短写 + 日志清洗）、`TestDetachedTargetEnv`（标记分流），共 **13 条**。
+- **对抗复审修复（P2-1/P2-2）**：① 信号处理器提前到 `Run` 入口（`stopping` atomic +
+  缓冲 pgid），启动窗口内收到 SIGTERM 不再走默认处置——不再残留 `run.pid`、不再留孤儿
+  `dbus-daemon`；私有 dbus 加 `Pdeathsig`；写入 `run.pid` 失败降级为警告并继续启动（只是
+  本次不可 stop）。② `run.log` 封顶 1 MiB + UTF-8/控制字符清洗，GUI 侧不再传原始错误与路径。
+  顺带修：stop 的 ENOENT 分支在持锁状态下清 stale 记录（避免误删刚启动的新 run）、
+  pidfd + 二次启动时刻校验（收口 check→kill TOCTOU）、core 测试补锁占无 PID 与
+  「进程死了但收尾没跑」两条。
+证据：`gofmt -l .` 空、`go vet ./...` / `go vet -tags gtk_e2e` 干净、`go test -count=1 ./...`
+全绿（`go test -race ./core/... ./cmd/appclone` 亦绿）、`CGO_ENABLED=0 go build ./...` 通过、
+`node design/guitest.js` **60/60**、`design/guitest-gtk.sh` **13/13 PASS**（4.32s）；假 HOME 真机冒烟：
+GUI 二进制 runner 模式启动 sleep 分身 → `appclone stop` **0.2s** 返回 0、runner 退出、`run.pid`
+清除、running=false、无孤儿进程；CLI `run`+`stop` 同链路通过，二次 `stop` 退出 7。
+**启动窗口压力冒烟**：1500 条 paths 把「启动→应用起来」拉到 733ms，在 150–650ms 六个时点各杀
+两次（12 次中 10 次应用尚未启动、2 次已启动）——零残留 `run.pid`、零占锁、零 dbus/bwrap 孤儿，
+早到信号下 runner 以 0 退出且应用不再被拉起。
+**delta 对抗复审：APPROVED（0 P1/P2，9 条 P3）**。已收口：私有 DBus 地址读取加 2 秒上限
+（`err.env.dbus_timeout`，假 daemon 回归 `TestPrivateDBusAddressTimeout`，堵住"setup 卡死→stop
+也停不掉"的残留窗口）；`run.log` 按本次启动 offset 读尾部（不再把上一轮最后一行当本次原因）；
+用户主动停止后抑制多余的「已退出」toast；文档修正 `run.log` 安全表述与 §6.1 详情页布局；
+ESRCH 快速返回不持锁删 `run.pid`（防止误删新 run 记录）的注释固化；GUI runner 注释改为
+"GTK 初始化前分流，但 puregotk init 仍 dlopen libgtk"；补 `TestDetachedTargetEnv`。
+**记录不修**：停止确认对话框的响应路径仍未自动化（与删除/重命名/关闭开关同一已知缺口，
+需要可编程对话框响应）；`cappedWriter` 保留头部 + toast 读尾部的组合在"应用先灌满 1 MiB
+再失败"时只能给 best-effort 原因（已在注释与 STATUS 写明）。
+
 **第三十七轮：GTK 闸门补四态 + GUI 文案入 i18n（ADR-027 退场）**（2026-11-08）。
 闸门新增五条用例，凑齐三屏四态（列表/配置/详情 × probing/confirm/creating/error）：
 - `TestGtkSetupStates`：拨开关进入首次配置 → 同步落在 `probing`（确认按钮隐藏、取消按钮叫
@@ -440,13 +486,19 @@ dbus-daemon 加 `Pdeathsig: SIGTERM`（GUI 被信号打死时私有总线跟着�
   否则客户端找不到 `broadway*.socket`；单个 broadwayd 只接一个应用实例时最稳）。
   **本机不可直接用**：见上一条——抽象/文件系统 socket 不匹配，`-u` 又关掉 HTTP。
 
-- **（未决）GUI 启动的分身与 GUI 进程同生共死**：`core.Run` 把调用进程当常驻父进程并给 bwrap 加
-  `--die-with-parent`，用户从详情页点「启动」后关掉设置窗口，正在运行的分身会一起退出。文档没有定义
-  这是预期还是缺陷（CLI 下"关终端 = 退出分身"是合理的；GUI 下"关设置窗口 = 退出应用"未必）。
-  需要产品决策：要么 detach 成独立会话（谁当父进程/怎么回收锁），要么在启动时明确提示。
-  复审提出、本轮未改（改它会动 `run` 的生命周期契约，必须单独定案）。
+- ~~**（未决）GUI 启动的分身与 GUI 进程同生共死**~~ **已决并落地（2026-11-08，ADR-028）**：
+  GUI 以自身二进制 fork 会话首进程 runner 跑 `core.Run`，关设置窗口不再结束分身；详情页运行中
+  提供「停止」（CLI 同步新增 `appclone stop`），停止链路与 CLI 共用 `core.StopRun`。
+  证据见第三十八轮。
 
 ## 最近完成
+
+- 2026-11-08 **第三十八轮：GUI 分身生命周期解耦（ADR-028）**：detached runner（GUI 自身二进制
+  以 `Setsid` fork，复用 `core.Run`）+ `run.pid` 信号目标 + `core.StopRun` + CLI `appclone stop`；
+  详情页运行中「启动」换「停止」（二次确认默认取消）；HTML 基线 58 → 60，GTK 闸门 9 → 13
+  （新增停止按钮状态、runner 启动方式、run.log 封顶与清洗）。假 HOME 真机冒烟：停止 0.2s、
+  无孤儿、二次 stop 退 7；启动窗口 12 次 SIGTERM 压测零残留（含 10 次应用尚未启动）。
+  证据见上文第三十八轮。
 
 - 2026-11-08 **第三十七轮：GTK 闸门补齐三屏四态 + GUI 文案入 i18n（ADR-027 退场）**：
   新增 `TestGtkSetupStates`（probing 取消、降级横幅「了解」）、`TestGtkErrorState`（error 态无重试）、

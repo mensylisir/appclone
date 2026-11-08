@@ -462,7 +462,8 @@ func (e *Env) DeleteInstance(ctx context.Context, app, id string) error {
 }
 
 // IsRunning 用 flock 试探运行态：拿到 = 没在跑（立刻释放），拿不到 = 在跑。
-// 没有 PID 文件，也没有 stale 状态——内核持有锁，进程怎么死都会释放（§4.3）。
+// 判据里没有 PID 文件，也没有 stale 状态——内核持有锁，进程怎么死都会释放
+// （§4.3）。run.pid 只给 StopRun 当信号目标，绝不参与这里的判断（ADR-028）。
 func (e *Env) IsRunning(app, id string) (bool, error) {
 	path := filepath.Join(e.InstancePath(app, id), "run.lock")
 	// 不带 O_CREATE：`list` 是只读命令，它不该在实例目录里创建文件（§4 写入白名单）。

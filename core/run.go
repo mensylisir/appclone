@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 )
@@ -41,6 +42,30 @@ func (e *Env) Run(ctx context.Context, app, id string, opt RunOptions) (RunResul
 	if err := CheckNotRoot(); err != nil {
 		return RunResult{}, err
 	}
+	// 信号处理器必须在任何耗时步骤之前注册：否则 stop 在启动窗口内送达
+	// SIGTERM 会走默认处置，core.Run 的 defer 全不执行——run.pid 残留，
+	// 私有 dbus-daemon 变孤儿（ADR-028 对抗复审 P2-1）。信号先缓存，
+	// pgid 确定后再整组终止；启动前收到就标记 stopping，不再拉起应用。
+	stop := make(chan os.Signal, 1)
+	unnotify := notifyRunSignals(stop)
+	defer unnotify()
+	var stopping atomic.Bool
+	pgidCh := make(chan int, 1)
+	done := make(chan struct{})
+	go func() {
+		select {
+		case <-stop:
+			stopping.Store(true)
+			select {
+			case pgid := <-pgidCh:
+				terminateGroup(pgid)
+			case <-done:
+			}
+		case <-done:
+		}
+	}()
+	defer close(done)
+
 	in, err := e.GetInstance(app, id)
 	if err != nil {
 		return RunResult{}, err
@@ -66,6 +91,20 @@ func (e *Env) Run(ctx context.Context, app, id string, opt RunOptions) (RunResul
 		}
 	}
 	defer lock.Close()
+	// run.pid 供 stop 定位本进程（ADR-028）：defer 顺序是"先删记录、再放锁"，
+	// 这样 stop 看到记录消失时，锁一定还没释放，不会把新的 run 当成旧的杀。
+	// 运行态判定仍只看 run.lock（ADR-023）。
+	instDir := e.InstancePath(app, id)
+	if err := writeRunPID(instDir, os.Getpid()); err != nil {
+		// 拿不到 stop 的目标记录不影响应用启动（磁盘满/实例目录只读时，
+		// 让应用照常跑比拦下来更重要）；明确告知本次不支持停止。
+		if opt.Stderr != nil {
+			_, _ = io.WriteString(opt.Stderr,
+				"appclone: 无法记录运行进程，本次运行将无法用 stop 停止（启动继续）\n")
+		}
+	} else {
+		defer clearRunPID(instDir)
+	}
 
 	p, err := e.LoadProfile(app)
 	if err != nil {
@@ -160,30 +199,27 @@ func (e *Env) Run(ctx context.Context, app, id string, opt RunOptions) (RunResul
 	if cmd.Stderr == nil {
 		cmd.Stderr = os.Stderr
 	}
+	// 启动前收到过停止信号：不为一次注定要杀的运行把应用拉起来。
+	if stopping.Load() {
+		return RunResult{}, ErrCanceled
+	}
 	if err := cmd.Start(); err != nil {
 		return RunResult{}, errEnv("err.run.start_failed", map[string]any{"exec": p.Exec}, err)
 	}
 	started = true
 	pgid := cmd.Process.Pid
-
-	// 信号 → 进程组。run 自身被杀时也要把应用带走，否则用户关掉终端
-	// 会留下一个看不见的实例占着锁，下次 run 报"已在运行"。
-	stop := make(chan os.Signal, 1)
-	notifyRunSignals(stop)
-	done := make(chan struct{})
-	go func() {
-		select {
-		case <-stop:
-			terminateGroup(pgid)
-		case <-done:
-		}
-	}()
+	pgidCh <- pgid // 早到的 SIGTERM 在这里拿到目标，整组终止
 
 	waitErr := cmd.Wait()
-	close(done)
 
 	// 应用退出后，它 fork 出去的子进程仍可能活着：补一次组终止。
 	terminateGroup(pgid)
+	// 收掉早到信号仍留在缓冲里的目标：否则 Run 返回后信号 goroutine 才取到
+	// pgid，会对一个已经收尸的进程组再发一遍 SIGTERM——PID 复用时就是误杀。
+	select {
+	case <-pgidCh:
+	default:
+	}
 
 	res := RunResult{}
 	// 审计会话在这里落账：写 run.toml、保留 upper（证据交给 verify 消费）。
@@ -234,6 +270,8 @@ func (e *Env) startPrivateDBus(in Instance) (addr string, stop func(), err error
 	// 上一轮被 kill 留下的 socket 文件会让 dbus-daemon 直接失败。
 	_ = os.Remove(sock)
 	cmd := exec.Command(daemon, "--session", "--nofork", "--address=unix:path="+sock, "--print-address")
+	// 与探测期一致：run 被信号打死、来不及跑 stopFn 时，内核把私有总线收掉。
+	cmd.SysProcAttr = &syscall.SysProcAttr{Pdeathsig: syscall.SIGTERM}
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		return "", nil, errEnv("err.env.no_dbus_daemon", nil, err)
@@ -241,14 +279,44 @@ func (e *Env) startPrivateDBus(in Instance) (addr string, stop func(), err error
 	if err := cmd.Start(); err != nil {
 		return "", nil, errEnv("err.env.no_dbus_daemon", nil, err)
 	}
-	line, err := bufio.NewReader(stdout).ReadString('\n')
-	if err != nil || strings.TrimSpace(line) == "" {
-		_ = cmd.Process.Kill()
-		return "", nil, errEnv("err.env.no_dbus_daemon", nil, err)
+	// 读地址必须有界：daemon 被换成一个只 sleep 不输出的程序时，无超时的
+	// ReadString 会让整个 run 卡在 setup，信号泵也拿不到 pgid，分身变成
+	// "停不掉也起不来"（AGENTS.md「禁止死等」）。
+	type readResult struct {
+		line string
+		err  error
 	}
+	readCh := make(chan readResult, 1)
+	go func() {
+		line, rerr := bufio.NewReader(stdout).ReadString('\n')
+		readCh <- readResult{line: line, err: rerr}
+	}()
+	var line string
+	select {
+	case r := <-readCh:
+		if r.err != nil || strings.TrimSpace(r.line) == "" {
+			_ = cmd.Process.Kill()
+			_ = cmd.Wait()
+			_ = stdout.Close()
+			return "", nil, errEnv("err.env.no_dbus_daemon", nil, r.err)
+		}
+		line = r.line
+	case <-time.After(2 * time.Second):
+		_ = cmd.Process.Kill()
+		// 先关读端：假 daemon 若把 stdout 继承给了子进程，光 Kill 它不会
+		// 让 ReadString 返回；关掉读端才能保证读 goroutine 一定退出。
+		_ = stdout.Close()
+		select {
+		case <-readCh:
+		case <-time.After(time.Second):
+		}
+		_ = cmd.Wait()
+		return "", nil, errEnv("err.env.dbus_timeout", map[string]any{"s": 2}, nil)
+	}
+	_ = stdout.Close() // 地址已经拿到，daemon 之后不再往 stdout 写
 	stopFn := func() {
 		_ = cmd.Process.Kill()
-		_, _ = cmd.Process.Wait()
+		_ = cmd.Wait()
 		_ = os.Remove(sock)
 	}
 	// 地址用 --print-address 的原文，不自己拼 unix:path=（地址格式是 dbus 的实现细节）。

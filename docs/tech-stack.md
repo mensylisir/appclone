@@ -165,7 +165,7 @@ puregotk 自称 experimental，所以**不允许"边写产品边试"**。第一�
   无 `init` 符号缺失 panic；**未覆盖三屏本身**——S0 验的是"绑定在 1.5 上可用"。
   三屏 v1 已落地（`cmd/appclone-gui/`，2026-11-08），在 1.5 上的控件子集未再加测；
   GTK 侧回归闸门已建立（`design/guitest-gtk.sh`：列表 → 确认 → 创建 → 详情 → 返回，
-  以及首屏落点、空态映射、探测中取消/失败/可重试错误态、快速重推竞态、降级/致命横幅、en 文案九条用例），
+  以及首屏落点、空态映射、探测中取消/失败/可重试错误态、快速重推竞态、降级/致命横幅、en 文案、运行中停止按钮、detached runner 派生、run.log 封顶与清洗、runner 标记分流十三条用例），
   删除/重命名/关闭开关对话框与真实指针/键盘注入仍无自动化（见 `STATUS.md` 与 `NEXT.md` "被挡住的"）。
 
 ### 4.4 版本门槛与一条必须承认的边界
@@ -200,11 +200,11 @@ puregotk 自称 experimental，所以**不允许"边写产品边试"**。第一�
 | 屏 | 承载结构 | 细节 |
 |---|---|---|
 | ① 应用列表 | `AdwNavigationView` 根页 = `AdwToolbarView{ AdwHeaderBar, AdwViewStack }`，栈内两页（`on` / `all`）各一个 `AdwPreferencesPage` | 标题栏标题位放 `AdwViewSwitcher`（宽策略：图标 + 文字）：**两个平级视图「分身」/「所有应用」，各自独立滚动**——上下一体、两组同页的结构会让用户在同一条滚动里跨两个语义区（2026-11-08 按用户反馈改）。首屏落点按状态：已有实例 → `on`，一个都没有 → `all`（点亮开关是唯一能做的事），只决定首屏一次，后续 `renderList` 不弹走用户；创建成功后切回 `on`（返回时刚建出的实例就在眼前）。`AdwViewStackPage.SetBadgeNumber` 给「分身」页挂数量角标（libadwaita 1.10 实测**当前页也显示**，0 时隐藏；早先"只在非当前页显示"的判断是误读截图，已更正）。致命横幅（bwrap 缺失）下**整页只读**：开关、行点击、搜索全部停用（任何操作最终都要 bwrap，允许进详情只会让用户在一屏点不动的界面里迷路），但**视图切换仍可用**。搜索 `GtkSearchEntry` 只属于 `all` 视图（397 个应用必须有搜索，见 ADR-024）；`on` 视图分组「已开启分身」+ 底部 `AdwActionRow`「添加应用分身」（`list-add-symbolic`，切到 `all`）。两个视图用同一套 `AdwSwitchRow`（title=应用名，subtitle=`App.InstanceN` + `App.RunningN` 拼出「N 个分身」/「N 个分身 · M 个运行中」/「未开启 · 已有隔离档案」/「尚未生成隔离档案」/「档案已失效」，行首 `GtkImage` 应用图标 32px——`Icon` 主题名/绝对路径都认，取不到退 `application-x-executable`）；只有已开启行带行尾 `GtkButton` + `AdwButtonContent`（icon `go-next-symbolic`，`.flat`）进详情——未开启的应用没有实例可管，不进详情；libadwaita 没有 `AdwButton` 类型 |
-| ② 应用详情 | `AdwPreferencesPage` | `AdwPreferencesGroup("分身实例")`，每行 `AdwActionRow`（实例名 + 运行状态）+ 尾部「启动」「删除」（**运行中两者都禁用**——`rm` 对运行中实例拒绝，退出码 7，界面不能更宽松）；`AdwPreferencesGroup("档案")` 只读行：隔离路径数、探测方式与置信度（**只说证据来源与覆盖范围，禁写"结果完整"**）、**共享但可写（`shared_writes`，含代价说明）**、单例处理、最近审计结论、实例根目录；重命名用 `AdwEntryRow`（GNOME 原生表单模式，不用行内 contenteditable） |
+| ② 应用详情 | `AdwPreferencesPage` | `AdwPreferencesGroup("分身实例")`，每行 `AdwActionRow`（实例名 + 运行状态）+ 尾部动作：**已停止**显示「启动」；**运行中**把「启动」换成「停止」（`destructive-action`），点了先弹确认；「重命名」在运行中禁用，「删除」在运行中禁用且 tooltip 说明"先停止才能删除"——`rm` 对运行中实例拒绝，退出码 7，界面不能更宽松（ADR-028）；`AdwPreferencesGroup("档案")` 只读行：隔离路径数、探测方式与置信度（**只说证据来源与覆盖范围，禁写"结果完整"**）、**共享但可写（`shared_writes`，含代价说明）**、单例处理、最近审计结论、实例根目录；重命名用 `AdwEntryRow`（GNOME 原生表单模式，不用行内 contenteditable） |
 | ③ 探测页（**四态**） | `AdwPreferencesPage` + `AdwBanner` | **探测中**：`GtkSpinner` + 「正在跟踪「X」的写入…」+ **已发现 N 个写入条目**（流式；措辞不是"命中次数"）+ HeaderBar「取消探测」；**确认**：①「应用自身数据」可勾 `AdwSwitchRow`（含缓存项）②「单例处理」可勾（**由检出的单例项驱动，没检出就不出现**）③「公共目录（强制共享）」只读 ④**「共享但可写（不隔离）」只读且写明代价** + suggested-action「创建分身」（open 为「开启分身」、reconfig 为「创建分身」、rediscover 为「保存档案」）；**创建中**：「正在创建…」+ 确认与取消**都** disabled（第二次提交会建出两个实例，中途取消会留半成品）；**失败**：`AdwStatusPage` 按 `Reason` 分四套文案 + 「重试」（**恒可用**，不沿用上一态的 disabled）。降级时**同一 `AdwBanner` 从探测中起常驻、切到确认态不消失**，且列表页那条被「了解」收起后这里仍在（push 页盖住了窗口顶部横幅） |
 | 反馈 | `AdwToastOverlay`（包住 NavigationView） | 创建/删除/重命名结果——**不用模态弹窗报成功**。`AdwToastOverlay` 一次只显示一条、新的顶掉旧的（不是队列），所以 toast 只承载"刚才那步成了"这种一次性确认，**关键结果必须同时体现在行内** |
 | 空态 | `AdwStatusPage` **取代「分身」视图的列表** | **不取代另一个视图**：「所有应用」照常可达，空态里另有 suggested-action「选择应用」切过去——两者都断了才是首启死路（首启用户看不到任何开关）。**StatusPage 不能放进 `AdwPreferencesGroup`**：`AdwPreferencesPage.Add` 只收 Group，Group 又只收 `AdwPreferencesRow`，硬塞会被裁成半截图标（只剩一个灰色半圆）；实现直接挂在 `on` 视图的 `GtkBox` 里（`vexpand` 居中），`renderList` 只切 visible |
-| 危险确认 | `AdwAlertDialog` | 两处：删除单个实例、关闭应用开关（会连带删除该应用全部实例）。**`default response` 必须是「取消」**——把 `destructive` 响应设成默认，回车即删，而对话框存在的意义正是"不要一键删"；纯提示型对话框（"还有分身正在运行"）才把「知道了」设为默认 |
+| 危险确认 | `AdwAlertDialog` | 三处：停止运行中的分身（应用里未保存的内容可能丢）、删除单个实例、关闭应用开关（会连带删除该应用全部实例）。**`default response` 必须是「取消」**——把 `destructive` 响应设成默认，回车即删，而对话框存在的意义正是"不要一键删"；纯提示型对话框（"还有分身正在运行"）才把「知道了」设为默认 |
 
 ### 4.6 与 `design/appclone-gui.html` 的裁决规则（冲突时以原生为准）
 
@@ -216,7 +216,7 @@ HTML 稿是**交互行为基线，不是视觉基线**。它不是 GTK 渲染的
 | 顶部「深色主题」切换按钮 | **删除**，跟随系统（`AdwStyleManager`） | GNOME 应用不自带主题开关，这是稿子为了演示加的 |
 | 自定义 CSS 配色/圆角/阴影 | libadwaita 内置样式类（`.dim-label`/`.monospace`/`.pill`） | 保持与系统设置页完全一致 |
 | 屏3 做成窗口内遮罩对话框 | 改成 `AdwNavigationView` 的 **push 页** | 多步配置用导航页而不是模态（GNOME HIG），且对话框里套一长串勾选项很难滚动；探测中的"取消"也需要 HeaderBar 位置 |
-| 自绘遮罩 + 对话框 | `AdwAlertDialog` | 仅用于**破坏性确认**（删除实例、关闭开关）；它自带正确的键盘与无障碍行为 |
+| 自绘遮罩 + 对话框 | `AdwAlertDialog` | 仅用于**破坏性确认**（停止分身、删除实例、关闭开关）；它自带正确的键盘与无障碍行为 |
 | 底部 toast 条 | `AdwToast` | 同上 |
 
 **稿子已补齐的交互缺口（2026-11-06，与本文同步修）**——这些不是"原生比稿子多"，而是稿子原本漏了、现在两边都有：
@@ -228,7 +228,7 @@ HTML 稿是**交互行为基线，不是视觉基线**。它不是 GTK 渲染的
 | 列表页无搜索（397 个应用只能翻） | 稿子加 `GtkSearchEntry` 行为（按名称过滤） | 规模问题是产品问题，不是实现细节（ADR-024） |
 | 屏3 只有"确认"一态（无探测中、无失败） | 稿子加 `probing` / `confirm` / `creating` / `error` 四态 | 探测十秒到一分钟，"点完开关一片空白"会被当成坏了 |
 | 屏3 无「公共目录」只读组（公共目录混在候选里带锁标记） | 稿子改为独立只读组 | 方案设计 §6.1 第三条 UI 约束：用户必须看见"哪些被排除了" |
-| 运行中实例可被删除（启动禁用了、删除没有） | 稿子改为两个按钮同时禁用 | 与 `rm` 的退出码 7 同源；界面比 CLI 宽松等于把契约撕开一个口子 |
+| 运行中实例可被删除（启动禁用了、删除没有） | 稿子与原生同改为：删除在运行中禁用并说明原因；「启动」位换成「停止」（ADR-028） | 与 `rm` 的退出码 7 同源；界面比 CLI 宽松等于把契约撕开一个口子；运行中把「启动」藏掉则用户无处停止 |
 | 「已开启分身」组按"有没有档案"分组（关掉开关后应用不回「所有应用」） | 稿子改为按"有没有实例"分组 | `supported` 只是"曾经配过"，`instances.length` 才是"已开启"；两者混用会让组名与行内状态自相矛盾 |
 | **空态把整块列表藏掉**（`#listState` 整个 `display:none`） | 稿子改为：空态只取代「已开启分身」组，搜索与「所有应用」照常（2026-11-08 起落点改为「分身」视图，见下一行；不变式不变） | 引导语让用户"在下方「所有应用」里点亮开关"，列表藏掉了就指向一个不存在的区域——首启用户无路可走，这是产品首启唯一路径 |
 | **「已开启」与「所有应用」同页上下叠**（一条滚动跨两个语义区；用户反馈里被点名） | 稿子与原生同改为：`AdwViewStack` 两个平级视图 + 标题栏 `AdwViewSwitcher`，各自滚动；空态只取代「分身」视图，另一个视图与切换器**始终可达**（空态里另有「选择应用」） | 两个列表语义不同（管理既有 / 挑选新增），同页会让用户在滚动中越过边界；但"空态可达性"这条不变式不能因拆视图而丢——首启仍必须有一条看得见的路去点亮第一个开关 |
@@ -474,3 +474,4 @@ activated / response / idle，地址恒定、注册一次后不再重新赋值�
 | 025 | **i18n 走 `core/i18n` 的 Go 消息表**（zh_CN + en，`LANG` 前缀匹配，其他语言回落英文），**不用 gettext**（与零 cgo 单二进制一致，且 `.mo` 文件还要装到 `/usr/share/locale`，与"单二进制 + 包依赖"的分发形态不匹配）。界面字符串不得硬编码在 GUI 代码（**落地节奏见 ADR-027**）；用户数据（实例显示名、应用名）不翻译；`.desktop` 的 `Name[zh_CN]`/`Name[en]` 同源 | 已定 |
 | 026 | **私有 runtime / 私有 DBus 的生命周期**：`runtime/` 随实例复用（启动前清残留 socket）；`dbus-daemon --session --nofork --print-address` 由 `run` 起子进程（`--nofork` 必须带，否则父进程先退拿不到地址），与 bwrap 同生共死，结束后杀 daemon 删 socket；缺 `dbus-daemon` 时**降级为共享并明确告知**（"可能无法双开"），不静默 | 已定 |
 | 027 | **GUI 文案本地化分期**（ADR-025 的落地节奏）：v1 先以 zh_CN 单语交付、`u.lang` 固定 `zh_CN`，退出条件 = GTK 闸门**走遍三屏四态**后三屏文案按 `ui.*` 入表、补 en 译文，`u.lang` 改回 `i18n.Lang()`。**已于 2026-11-08 退场**：闸门新增 `TestGtkSetupStates`（probing 取消 / 降级横幅「了解」）、`TestGtkErrorState`（error 无重试）、`TestGtkRetryableError`（重试接线）、`TestGtkRapidRepush`（导航页唯一 tag，守着 pop 过渡中再次 push 的竞态）与 `TestGtkFatalBanner`（致命态横幅、搜索、开关联动），加上生命周期用例的 confirm→creating 与详情页（共 9 条），列表/配置/详情 × probing/confirm/creating/error 全覆盖；三屏约 150 条 `ui.*` 文案（160 处 `tr()` 调用）全部进 `core/i18n`（zh_CN + en），`newUI` 统一用 `i18n.Lang()`。保障手段：`core/i18n/i18n_test.go` 钉住两语言键一一对应、占位符一致、en 表无中文、切片参数分隔符随语言，并扫描 `core/*.go` 的字面量 `err.*` 键（落地时抓出 `err.profile.exec_field_code` / `err.profile.extra_bind_missing` 只有 en、中文界面会回落英文的真实缺陷，以及三个 core 缺失键），`TestGtkEnglishStrings` 在 `LC_ALL=en_US.UTF-8` 下断言 en 界面文案。**仍禁止中英混排**：动态文案（reason、core 错误）与静态文案继续共用同一张表 | 已定（2026-11-08 退场完成） |
+| 028 | **GUI 启动的分身与设置窗口解耦**（2026-11-08）：GUI 点「启动」时以**自身二进制 fork 一个会话首进程**（runner，`APPCLONE_GUI_DETACH_*` 环境变量标识），runner 复用 `core.Run`——与 CLI 完全同一条生命周期实现（ADR-020）。关掉设置窗口不再结束正在运行的分身；详情页在运行中把「启动」换成「停止」，停止 = 向 runner 发 `SIGTERM`，由 `core.Run` 的进程组终止链收尾。**不引入 daemon/IPC**（ADR-004 不变）：runner 是一次性进程，不监听、不提供 API；运行态判定仍只看 `run.lock`（ADR-023 不变），新增的 `run.pid`（pid + `/proc/<pid>/stat` 启动时刻）只用于"给正在跑的 runner 发信号"，发送前校验启动时刻防 PID 复用、`run.lock` 拿得到时按 stale 清理。CLI 增 `appclone stop <app> <id>` 共用同一实现 | 已定 |
