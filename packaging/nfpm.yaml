@@ -25,6 +25,8 @@ overrides:
       - libadwaita-1-0 (>= 1.5)
       - bubblewrap
       - desktop-file-utils
+      # 删除进回收站依赖 /usr/bin/gio；它不在 libglib2.0-0t64 里。
+      - libglib2.0-bin
     recommends:
       - fuse-overlayfs
       - strace
@@ -37,6 +39,7 @@ overrides:
       - libadwaita >= 1.5
       - bubblewrap
       - desktop-file-utils
+      - glib2
     recommends:
       - fuse-overlayfs
       - strace
@@ -48,6 +51,7 @@ overrides:
       - libadwaita>=1.5
       - bubblewrap
       - desktop-file-utils
+      - glib2
 
 contents:
   - src: dist/stage/appclone

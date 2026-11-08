@@ -469,6 +469,14 @@ GTK 闸门补结构断言：无实例时 `GetVisibleChildName()=="all"`、创建
   ⑥ AppArmor 安装再硬化：临时文件改为 `/etc/apparmor.d/.appclone-bwrap.new`（AppArmor 不扫描隐藏名），
      `apparmor_parser` 失败时删除目标以便下次安装重试；`doctor` 在文件存在但找不到 parser 时给 warn。
   ⑦ README 修正"两者都缺不能新建"的过强表述：已有合法档案仍可建普通分身，只是不能首次探测新应用。
+- **Ubuntu 24.04 容器实装验证**（2026-11-08）：用 podman 起 `ubuntu:24.04`，`apt install ./appclone_1.0.0_amd64.deb`
+  成功；核对 `/usr/bin/{appclone,appclone-gui}`、`.desktop`、SVG、`bwrap.apparmor` 落点与权限；
+  `desktop-file-validate` 退出 0；非 root `appclone version` → `1.0.0`；`doctor` 判定 GTK 4.14.5 /
+  libadwaita 1.5.0 正常；装包后的 GUI 在 `xvfb-run` 下运行到 8 秒超时（124，非崩溃）。
+  **抓到并修掉一个真实缺依赖**：最小 Ubuntu 安装没有 `/usr/bin/gio`（它在 `libglib2.0-bin`，
+  不在 `libglib2.0-0t64`），删除功能会因此不可用；deb 加 `libglib2.0-bin`、rpm/Arch 加 `glib2` 后
+  重装复测 `doctor` 的 gio 项从 ✗ 变 ✓。容器内 `/dev/fuse` 打不开、无 D-Bus 会话属容器限制，
+  不作为产品结论。
 
 **第三十八轮：GUI 分身生命周期解耦（ADR-028）**（2026-11-08）。用户拍板：**分离运行 + 停止按钮**。
 - GUI 点「启动」不再在自己的进程里跑 `core.Run`，而是以自身二进制 fork 一个会话首进程（runner，

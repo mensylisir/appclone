@@ -386,15 +386,15 @@ activated / response / idle，地址恒定、注册一次后不再重新赋值�
   三种包格式由 CI 用 **nfpm** 从同一份 `nfpm.yaml` 产出；`.tar.gz` 不走 nfpm——nfpm 没有 tarball packager，
   由 CI 另起一步按同一份 `contents` 清单打 tar。
   - `.deb` → Ubuntu 24.04+ / Debian 13+；`Depends: libgtk-4-1 (>= 4.14), libadwaita-1-0 (>= 1.5), bubblewrap,
-    desktop-file-utils`，`Recommends: fuse-overlayfs, strace, libgtk-4-bin`（最后一项供图标缓存更新器，
+    desktop-file-utils, libglib2.0-bin`（`gio` 用于回收站删除），`Recommends: fuse-overlayfs, strace, libgtk-4-bin`（最后一项供图标缓存更新器，
     缺失只影响缓存，不影响 SVG 按路径加载）；
   - `.rpm` → Fedora 41+ / CentOS Stream 10 / RHEL 10；
-    `Requires: gtk4 >= 4.14, libadwaita >= 1.5, bubblewrap, desktop-file-utils`，
+    `Requires: gtk4 >= 4.14, libadwaita >= 1.5, bubblewrap, desktop-file-utils, glib2`，
     `Recommends: fuse-overlayfs, strace`；
     **openSUSE 不在 v1 承诺内**：Tumbleweed 的 GTK4/libadwaita 运行库包名与 Fedora 不同，单份 rpm 的 `Requires`
     只能命中一套，要支持得另建 spec——留待社区走 OBS，不写进承诺。
   - `.pkg.tar.zst` → Arch / Manjaro（**仅 x86_64**）；`depends=(gtk4>=4.14 libadwaita>=1.5 bubblewrap
-    desktop-file-utils)`；**nfpm v2.41 不支持表达 Arch 的 `optdepends`**，`fuse-overlayfs`/`strace`
+    desktop-file-utils glib2)`；**nfpm v2.41 不支持表达 Arch 的 `optdepends`**，`fuse-overlayfs`/`strace`
     只在 README 与 `doctor` 里提示（缺 fuse 走 strace，两者都缺则无法探测、但分身仍可运行）；
     同时提交 AUR `appclone-bin`（预编译，只含 x86_64；**尚未提交**，README 不把它写成现成路径）。
     **Arch 的 arm64 走另一条路**：Arch Linux ARM 是独立项目、官方仓库只发 x86_64，所以 arm64 用户用 AUR 的

@@ -17,6 +17,7 @@
 |---|---|
 | glibc 系统 | CLI 是静态链接的 Go 程序；GUI 也零 cgo，但通过 `dlopen` 在运行期加载宿主 libc/GTK，因此要求 glibc；musl/Alpine 不在支持范围 |
 | bubblewrap | 隔离引擎（必需） |
+| glib2（`gio`） | 删除实例移入回收站（必需；deb/rpm/Arch 包会自动装） |
 | GTK ≥ 4.14 + libadwaita ≥ 1.5 | 仅 GUI 需要（运行库，不需要开发包） |
 | fuse-overlayfs | 推荐；缺失时路径探测降级为 `strace`，启动不受影响 |
 | strace | 推荐（与 fuse-overlayfs 二选一即可探测）；两者都缺时不能首次探测新应用，已有合法档案仍可建普通分身（克隆起步会降级） |
