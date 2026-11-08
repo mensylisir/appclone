@@ -218,7 +218,9 @@ func (u *ui) buildWindow() {
 
 	u.win = adw.NewApplicationWindow(&u.app.Application)
 	u.win.SetTitle(u.tr("ui.window.title", nil))
-	u.win.SetDefaultSize(560, 760)
+	// 与设计稿的 880px 对齐：560 宽在桌面窗口管理器里就是一根竖条，列表行
+	// 的副标题、切换器与行尾动作会挤成一团。
+	u.win.SetDefaultSize(880, 720)
 
 	u.nav = adw.NewNavigationView()
 

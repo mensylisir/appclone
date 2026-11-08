@@ -97,7 +97,7 @@ func (fuseOverlayMounter) Mount(lower, upper, work, merged string) (func() error
 	go func() { _ = cmd.Wait(); close(waited) }()
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
-		if mounted(merged) {
+		if mountLive(merged) {
 			return func() error {
 				err := umount(merged)
 				_ = cmd.Process.Kill()
@@ -154,15 +154,21 @@ func umount(merged string) error {
 }
 
 // mounted 判挂载点是否已经生效（不是"目录存在"，而是它真的在 mountinfo 里）。
-func mounted(path string) bool {
-	if _, err := os.Stat(path); err != nil {
+// mounted 只认 mountinfo，不做 os.Stat：fuse daemon 已死时 stat 返回
+// ENOTCONN，会把仍在 mountinfo 里的挂载判成"没挂载"；而 mountinfo 对
+// 空格等字符做八进制转义，路径必须解码后整串比对（mountInfoHas），否则
+// HOME/AC_BASE 带空格时永远判不中。清理路径（stale 回收）用这个语义。
+func mounted(path string) bool { return mountPointIn(path) }
+
+// mountLive 要求挂载既在 mountinfo 里、又能访问（stat 成功）。挂载轮询必须
+// 用它：fuse-overlayfs 挂上后立刻 crash 时 mountinfo 仍有条目，mounted 会
+// 把死挂载判成成功，应用随后在数据目录上直接 ENOTCONN 退出。
+func mountLive(path string) bool {
+	if !mounted(path) {
 		return false
 	}
-	data, err := os.ReadFile("/proc/self/mountinfo")
-	if err != nil {
-		return false
-	}
-	return strings.Contains(string(data), " "+path+" ")
+	_, err := os.Stat(path)
+	return err == nil
 }
 
 // syncBuffer 是并发安全的 stderr 收集器（进程 stderr 在另一个 goroutine 里写）。

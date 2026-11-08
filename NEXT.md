@@ -295,6 +295,75 @@ GTK 闸门补结构断言：无实例时 `GetVisibleChildName()=="all"`、创建
 `design/guitest-gtk.sh` **3/3 PASS**；`DISPLAY=:0` 真机截图核对了「分身」（含运行实例、角标）
 与「所有应用」两屏。
 
+**第三十九轮：克隆起步 `add --fork`（ADR-029）+ GUI 默认窗口加宽**（2026-11-08）。
+路线图第 6 项落地：分身可以从主实例现有数据「克隆起步」，不复制文件。
+- 语义是**运行期 per-path overlay**，不是 add 期拷贝：`add --fork` 只写 `instance.toml` 的
+  `fork = true`；每次 `run` 对归一封顶后的每个 `paths` 条目挂一层 `fuse-overlayfs`
+  （lower=宿主真实目录，upper=`<inst>/root/<原路径>`，`work`/`merged` 在
+  `<inst>/.fork/<sha256(clean abs)[:8]>/`），merged 只作 bwrap ⑤ 的 bind 源。
+  `shared_writes` 仍排在 ⑤ 之后 bind 真实文件——共享语义未被克隆改写。
+- 只对**存在、是目录、非空**的 lower 挂载；空/缺失路径退回普通实例目录。fuse 不可用、
+  单个路径挂载失败、残留卸不掉都只降级该路径并写 stderr，不阻断启动（安全语义仍由
+  `paths` 白名单保证，代价只是少继承数据）。
+- **stale 挂载回收的坑**：上一轮被 SIGKILL 时 `.fork/<hash>/merged` 会留在 mountinfo。
+  不能用 `mounted()`/`os.Stat` 判断——fuse daemon 已死时 stat 返回 `ENOTCONN`，
+  会被判成"没挂载"，接着 `RemoveAll` 穿过挂载点遍历 lower，**删的是主实例真实数据**。
+  改为只查 `/proc/self/mountinfo`，顺序固定「先卸后删」；卸载失败保留 `.fork/`，
+  等占用进程退出后的下一轮再清。smoke 时这两点各踩中一次，均已回归。
+- **同一个坑的第二种形态（带空格路径）**：mountinfo 把空格转义成 `\040`，原先
+  用 `strings.Contains(" "+path+" ")` 比对，`AC_BASE`/`HOME` 含空格时永远判不中。
+  `fork.go` 的 stale 判断会漏（随后 `RemoveAll` 穿过挂载点），而探测链路的
+  `mounted()` 同缺陷更直接——挂载其实成功了，轮询 5 秒后误判失败并卸载。
+  抽出 `mountInfoHas`：按行取第 5 字段、解码 `\040/\011/\012/\134` 后整串相等，
+  `mounted()` 也改为 mountinfo-only；回归 `TestMountInfoHasEscapedPaths`。
+  带空格真机冒烟：`/tmp/ac fork space.*` 下两次 run 正常（`SEEN=main` → `clone`），
+  SIGKILL 制造 stale 后下一轮自动卸载并继承，无降级警告。
+- `--profile-only --fork` 是用法错误（退出 2）：不建实例就没有 upper 可落地，
+  静默忽略会让用户以为克隆已生效。
+- **语义边界如实写进 §8.1**：lower 是实时数据不是时间点快照；overlay 不保证分身运行
+  期间主实例同时修改同一份数据的可见性，因此两者**不要同时使用**同一份应用数据，
+  需要冻结起点须先复制。分身写过（copy-up）之后只读自己的 upper。
+- **GUI 默认窗口加宽到 880×720**（用户反馈"打开一个竖条条"）：`SetDefaultSize(880, 720)`，
+  与设计稿 880px 宽对齐；GTK 生命周期用例加断言（默认尺寸 < 800×600 即红，变异回
+  560×760 实测立即变红），防止以后改回窄条。
+- 文档同步：`方案设计.md` §8.1 重写为已实现契约（布局/寿命/降级/残留/语义边界，
+  `.tmp-work`/`.tmp-merged` 旧路径清除），§4 白名单与权限矩阵改 `.fork/`，
+  `instance.toml` 示例补 `fork`，§6 `add` 行补 `--fork`；`tech-stack.md` 新增 ADR-029。
+- 证据：`gofmt -l .` 空、`go vet ./...` 与 `go vet -tags gtk_e2e` 干净、
+  `go test -count=1 ./...` 全绿（新增 `core/fork_test.go`、`TestBuildBwrapArgsForkSources`、
+  `TestAddForkFlagPersists`、`TestMountInfoHasEscapedPaths`）、`go test -race ./core/... ./cmd/appclone` 绿、
+  `CGO_ENABLED=0 go build ./...` 通过、`node design/guitest.js` **60/60**、
+  `design/guitest-gtk.sh` **13/13 PASS**（退出码 0）；假 HOME 真机 fuse 冒烟：
+  第一次 `SEEN=main` → 分身写 `clone`、宿主仍 `main` → 第二次 `SEEN=clone`，
+  结束后 `.fork/` 删除、挂载数 0；SIGKILL 制造 stale 挂载后下一轮自动卸载并正常继承。
+- **对抗复审 REJECTED 的修复（2026-11-08）**：主路径语义（shared_writes 顺序、
+  `--fork`/`--profile-only` 组合、Fork 持久化）被确认无问题，但安全不变量在两条路径上
+  有洞，均已修：
+  ① **软链路径别名**：mountinfo 记录 d_path（软链已解析），调用方拿词法路径；只比一种
+     形态会让挂载轮询超时、stale 漏判、`RemoveAll` 穿过挂载点。新增 `pathForms`
+     （词法 + `realPathBestEffort`，挂载点已死时退到最近可解析祖先）。
+  ② **`Mount` 报错但挂载点已生效**：原先无条件 `RemoveAll(wd)`；改为先查 mountinfo，
+     挂着就把卸载交给 cleanup，卸不掉保留 `.fork/` 等下一轮。
+  ③ **mountinfo 分词**：`strings.Fields` 按 Unicode 空白切分会把 U+3000/NBSP 当分隔符；
+     改为 ASCII 单空格 `SplitN`，四种内核转义解码后整串比较。
+  ④ **`upper` 落在 lower 内**（AC_BASE 位于档案路径之下）：跳过该路径并告警，避免
+     overlay 递归；`resetForkBase` 逐条卸载并加 `mountUnder` 兜底，仍挂着就拒绝删除。
+  ⑤ **死挂载判活**：`mounted()` 拆成清理用（mountinfo-only）与轮询用 `mountLive`
+     （mountinfo + stat），fuse crash 后不再把死挂载当成功。
+  ⑥ **删除实例**：先卸 `.fork` 残留，失败返回 `err.instance.fork_cleanup` 并拒绝删除。
+  ⑦ **停止响应**：`forkMounts` 每路径前检查 ctx/stopping，不再 N×5 秒后才响应。
+  回归补 6 条（软链、Unicode 空白、reset 拒绝删除、Mount 报错保留现场、upper 在 lower
+  内跳过、删除遇残留挂载拒绝）；带空格与软链 `AC_BASE/HOME` 的真机冒烟均通过。
+  **复审 APPROVED 后的 P3 硬化**：递归防护改成两种路径形态都比；`realPathBestEffort`
+  只解析父目录、不再对 merged 本身 `EvalSymlinks`（fuse 卡死时不会阻塞）；cleanup 的
+  `RemoveAll` 也加 `mountUnder` 兜底；`.fork` 被应用建成普通文件时按 ENOTDIR 放行删除；
+  `doctor --json` 补 `"fork": true`。
+  **记录不修**：32 位哈希碰撞、`instance.toml` 未知字段重写丢弃（既有行为）、fuse `-o`
+  逗号/冒号限制（探测/审计同源）、GUI 无 fork 入口（下一轮）。
+- **剩余**：GUI 还没有 `--fork` 入口（新建分身仍建空实例）。接线要先改
+  `design/appclone-gui.html` 的确认页（加"继承现有数据"开关）+ `guitest.js` + GTK 用例，
+  工作包比 core 大，留到下一轮；`STATUS` 已按"CLI 已验证、GUI 未覆盖"如实标注。
+
 **第三十八轮：GUI 分身生命周期解耦（ADR-028）**（2026-11-08）。用户拍板：**分离运行 + 停止按钮**。
 - GUI 点「启动」不再在自己的进程里跑 `core.Run`，而是以自身二进制 fork 一个会话首进程（runner，
   `APPCLONE_GUI_DETACH_APP/ID` + `Setsid`）；runner 在 GTK 初始化前分流，复用与 CLI 同一条
@@ -440,6 +509,8 @@ dbus-daemon 加 `Pdeathsig: SIGTERM`（GUI 被信号打死时私有总线跟着�
 1. `core` 探测原语（1a + 1b）
 2. ~~`core` 其余部分~~ **已完成**（`BuildBwrapArgs` 纯函数 + 单测、档案 TOML、实例 CRUD、`id`/`display_name` 校验）
 3. ~~CLI MVP~~ **已完成**（`add/run/list/rm/doctor/repair-desktop/version`）
+   ~~路线图 6：`add --fork`~~ **已完成（2026-11-08，第三十九轮，ADR-029）**：CLI 侧
+   `add --fork` + 运行期 per-path overlay + stale 挂载回收已真机验证；GUI 入口待接。
 4. `cmd/appclone-gui`（puregotk + libadwaita 三屏，控件映射见 `tech-stack.md` §4.5）。
    **v1 三屏已落地并通过两轮实现审查修复**（2026-11-08，见第二十八～三十轮；STATUS = `implemented`）。剩余：
    ① ~~**GTK 侧回归闸门**~~ **已落地（2026-11-08，第三十七轮补齐三屏四态 + 横幅/致命态）**：
@@ -493,6 +564,11 @@ dbus-daemon 加 `Pdeathsig: SIGTERM`（GUI 被信号打死时私有总线跟着�
 
 ## 最近完成
 
+- 2026-11-08 **第三十九轮：克隆起步 `add --fork`（ADR-029）+ 窗口默认 880×720**：
+  运行期 per-path `fuse-overlayfs`（lower=宿主数据、upper=实例 root、merged bind 给 bwrap），
+  空/缺失路径跳过、失败降级不阻断启动、SIGKILL 残留按 mountinfo 先卸后删；真机冒烟证明
+  首次继承 `SEEN=main`、分身写后宿主不变、二次 `SEEN=clone`，stale 挂载下一轮自愈。
+  GTK 用例钉住默认窗口 ≥800×600。证据见第三十九轮；GUI 的 fork 开关留待下一轮。
 - 2026-11-08 **第三十八轮：GUI 分身生命周期解耦（ADR-028）**：detached runner（GUI 自身二进制
   以 `Setsid` fork，复用 `core.Run`）+ `run.pid` 信号目标 + `core.StopRun` + CLI `appclone stop`；
   详情页运行中「启动」换「停止」（二次确认默认取消）；HTML 基线 58 → 60，GTK 闸门 9 → 13
@@ -854,8 +930,8 @@ dbus-daemon 加 `Pdeathsig: SIGTERM`（GUI 被信号打死时私有总线跟着�
 - 2026-11-06 **第二轮交叉审查后收口**（12 条 findings 全部修复）：
   - 实例 `id` 与显示名分离：新增 `instances/<app>/<id>/instance.toml`（`display_name`/`created_at`/`probe_method`）；
     重命名只改 `display_name`，`id` 创建后不可变；`.desktop` 的 `Name=` 用显示名、路径用 `id`。
-  - `add --fork` 目录寿命写清：`root/<原路径>/` 是持久 upper 层，`.tmp-work/`、`.tmp-merged/` 才可删——
-    此前文档把它们混成"临时区"，照做会删掉用户数据。
+  - `add --fork` 目录寿命写清：`root/<原路径>/` 是持久 upper 层，overlay 的 work/merged
+    （现为 `.fork/<hash>/`，见第三十九轮）才可删——此前文档把它们混成"临时区"，照做会删掉用户数据。
   - `probe_run` 加 `trap ... EXIT INT TERM` 统一卸载与清理，与"临时区残留即 bug"的约定对齐。
   - keyring 从 `shared_writes` 移出、单列 `unsupported`（`shared_writes` 是 `doctor --verify` 的预期共享白名单，混进去会让校验口径失真）。
   - 设计稿里"单例 sock → 空文件覆盖"的**错误文案**改为 `isolate_runtime`（原写法会 ENOTSOCK，分身起不来）。

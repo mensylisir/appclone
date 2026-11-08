@@ -24,6 +24,7 @@ func newAddCmd(a *app) *cobra.Command {
 	var (
 		rediscover  bool
 		profileOnly bool
+		fork        bool
 	)
 	c := &cobra.Command{
 		Use:   "add <app> [id]",
@@ -35,7 +36,9 @@ func newAddCmd(a *app) *cobra.Command {
   add <app> --rediscover           重跑探测并建实例
   add <app> --rediscover --profile-only
                                    只重跑探测并保存档案，不建实例（= GUI「重新探测」）
-  add <app> --profile-only         只保存档案`,
+  add <app> --profile-only         只保存档案
+  add <app> --fork                 新分身从主实例现有数据克隆起步（写时复制，
+                                   不收主实例数据副本；run 时挂 overlay，无 root）`,
 		Args: cobra.RangeArgs(1, 2),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if err := a.applyOverrides(cmd); err != nil {
@@ -58,6 +61,10 @@ func newAddCmd(a *app) *cobra.Command {
 			if profileOnly && id != "" {
 				// 只保存档案却给了实例 id：静默忽略会让人以为实例建了。
 				return core.NewUsage("--profile-only 不创建实例，不要再给 <id>")
+			}
+			if profileOnly && fork {
+				// --fork 描述的是实例的数据层来源；没有实例时它无处落地。
+				return core.NewUsage("--fork 需要创建实例，不能与 --profile-only 同用")
 			}
 			// 探测会把应用跑起来，用户随时可能 Ctrl-C：信号要能传到 context，
 			// 否则 defer 全部跳过、/var/tmp 下留下挂载点与写层（§3.2.3）。
@@ -180,22 +187,26 @@ func newAddCmd(a *app) *cobra.Command {
 				return nil
 			}
 
-			in, err := a.env.CreateInstance(ctx, appKey, p, id)
+			in, err := a.env.CreateInstanceWith(ctx, appKey, p, id, core.CreateOptions{Fork: fork})
 			if err != nil {
 				return err
 			}
 			a.ok(map[string]any{
 				"app": in.App, "id": in.ID, "display_name": in.DisplayName,
-				"created_at": in.CreatedAt, "probe_method": in.ProbeMethod,
+				"created_at": in.CreatedAt, "probe_method": in.ProbeMethod, "fork": in.Fork,
 			}, func() {
 				fmt.Printf("已创建「%s（分身 %s）」\n", appKey, in.DisplayName)
 				fmt.Printf("  桌面入口：%s\n", a.env.LauncherPath(in.App, in.ID))
 				fmt.Printf("  数据目录：%s\n", in.Root)
+				if in.Fork {
+					fmt.Println("  首次启动会继承主实例现有数据（需要 fuse-overlayfs）；之后的修改只写入这个分身。")
+				}
 			})
 			return nil
 		},
 	}
 	c.Flags().BoolVar(&rediscover, "rediscover", false, "强制重新探测（会建实例）")
 	c.Flags().BoolVar(&profileOnly, "profile-only", false, "只更新档案，不创建实例")
+	c.Flags().BoolVar(&fork, "fork", false, "新分身从主实例现有数据克隆起步（写时复制）")
 	return c
 }

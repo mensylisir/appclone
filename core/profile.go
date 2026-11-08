@@ -67,6 +67,10 @@ type Instance struct {
 	LastUsedAt  *time.Time
 	ProbeMethod string
 	Root        string // instances/<app>/<id>/root 的绝对路径
+	// Fork 表示这个分身"克隆起步"：run 时把主实例的真实数据目录作为只读
+	// lower，实例 root 作为持久 upper（§8.1）。创建后不可切换——它描述的是
+	// 数据层从哪来，不是每次运行的开关。
+	Fork bool
 }
 
 // Dir 返回实例目录的绝对路径。
@@ -111,6 +115,7 @@ type instanceWire struct {
 	CreatedAt   string `toml:"created_at"`
 	LastUsedAt  string `toml:"last_used_at,omitempty"`
 	ProbeMethod string `toml:"probe_method,omitempty"`
+	Fork        bool   `toml:"fork,omitempty"`
 }
 
 // knownProfileKeys 是 v1 认识的全部顶层键。新增字段时必须同步这里，
@@ -371,6 +376,7 @@ func (e *Env) loadInstance(app, id string) (Instance, error) {
 		DisplayName: w.DisplayName,
 		ProbeMethod: w.ProbeMethod,
 		Root:        filepath.Join(dir, "root"),
+		Fork:        w.Fork,
 	}
 	if in.App == "" {
 		in.App = app
@@ -399,6 +405,7 @@ func (e *Env) saveInstance(in Instance) error {
 		DisplayName: in.DisplayName,
 		CreatedAt:   formatTime(in.CreatedAt),
 		ProbeMethod: in.ProbeMethod,
+		Fork:        in.Fork,
 	}
 	if in.LastUsedAt != nil {
 		w.LastUsedAt = formatTime(*in.LastUsedAt)

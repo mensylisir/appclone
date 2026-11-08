@@ -185,6 +185,36 @@ func TestBuildBwrapArgsDBusImpliesRuntime(t *testing.T) {
 	}
 }
 
+// fork 实例的 bind 源换成 overlay 挂载点；未挂载成功的路径仍退回实例目录。
+func TestBuildBwrapArgsForkSources(t *testing.T) {
+	e := testEnv(t)
+	o := e.opts()
+	p := Profile{
+		App: "x", Version: ProfileVersion, Exec: "/bin/true",
+		Paths: []string{"~/.config/X", "~/.local/share/X"},
+	}
+	in := Instance{App: "x", ID: "main", Root: e.InstancePath("x", "main") + "/root"}
+	forkAbs := o.Home + "/.config/X"
+	plainAbs := o.Home + "/.local/share/X"
+	merged := e.InstancePath("x", "main") + "/.fork/abcd1234/merged"
+	o.ForkSources = map[string]string{forkAbs: merged}
+
+	got, err := BuildBwrapArgs(p, in, o)
+	if err != nil {
+		t.Fatal(err)
+	}
+	joined := strings.Join(got, " ")
+	if !strings.Contains(joined, "--bind "+merged+" "+forkAbs) {
+		t.Fatalf("fork 路径必须绑定 overlay 挂载点，argv=%v", got)
+	}
+	if strings.Contains(joined, "--bind "+instSrc(in.Root, forkAbs)+" "+forkAbs) {
+		t.Fatalf("fork 路径不应再绑定裸实例目录，argv=%v", got)
+	}
+	if !strings.Contains(joined, "--bind "+instSrc(in.Root, plainAbs)+" "+plainAbs) {
+		t.Fatalf("未覆盖的路径应保持原语义，argv=%v", got)
+	}
+}
+
 func TestInstanceChildNeverEscapes(t *testing.T) {
 	root := "/base/instances/app/main/root"
 	got, err := instanceChild(root, "/home/u/.config/App")

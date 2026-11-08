@@ -180,6 +180,14 @@ func TestGtkScreensLifecycle(t *testing.T) {
 					fail("首轮扫描落地后视图栈仍不可见")
 					return false
 				}
+				// 默认窗口尺寸：三屏内容（列表 + 详情）是按宽窗口排的，退回
+				// 窄竖条会让行内动作挤成两行。回归只钉下限，不钉具体像素。
+				var dw, dh int32
+				u.win.GetDefaultSize(&dw, &dh)
+				if dw < 800 || dh < 600 {
+					fail("窗口默认尺寸过窄：%dx%d（应至少 800x600）", dw, dh)
+					return false
+				}
 				if !u.stack.GetMapped() {
 					return true // 等窗口映射完再判定；一直不映射会由总超时判红
 				}

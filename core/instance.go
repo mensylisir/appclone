@@ -16,7 +16,18 @@ import (
 //
 // 事务顺序（§11）不能改：中途崩溃会留下"有实例无档案""有入口无实例"三类半成品，
 // 而三类半成品在 GUI 上表现为"开关是开的，点进去什么都没有"。
+// CreateOptions 是建实例时的一次性选择（不进档案：它们描述"这个实例怎么来的"）。
+type CreateOptions struct {
+	// Fork 让新实例从主实例现有数据克隆起步（§8.1）：run 时以宿主真实数据为
+	// 只读 lower、实例 root 为持久 upper。数据层在创建时定死，之后不可切换。
+	Fork bool
+}
+
 func (e *Env) CreateInstance(ctx context.Context, app string, p Profile, id string) (Instance, error) {
+	return e.CreateInstanceWith(ctx, app, p, id, CreateOptions{})
+}
+
+func (e *Env) CreateInstanceWith(ctx context.Context, app string, p Profile, id string, opt CreateOptions) (Instance, error) {
 	if err := ValidateAppKey(app); err != nil {
 		return Instance{}, err
 	}
@@ -65,6 +76,7 @@ func (e *Env) CreateInstance(ctx context.Context, app string, p Profile, id stri
 		CreatedAt:   now,
 		ProbeMethod: p.ProbeMethod,
 		Root:        filepath.Join(e.InstancePath(app, id), "root"),
+		Fork:        opt.Fork,
 	}
 
 	// 2. 档案写到临时文件，先不 rename（提交点是两个 rename，各原子）。
@@ -432,7 +444,8 @@ func (e *Env) RenameInstance(app, id, newName string) error {
 // 自己以 LOCK_NB 打开并持有 run.lock 直到 gio trash 返回：检查"没在跑"与
 // trash 之间存在竞态，另一个进程可以在中间 run 起来，随后目录被搬走（§4.2）。
 func (e *Env) DeleteInstance(ctx context.Context, app, id string) error {
-	if _, err := e.GetInstance(app, id); err != nil {
+	in, err := e.GetInstance(app, id)
+	if err != nil {
 		return err
 	}
 	lockPath := filepath.Join(e.InstancePath(app, id), "run.lock")
@@ -445,6 +458,15 @@ func (e *Env) DeleteInstance(ctx context.Context, app, id string) error {
 		return errState("err.instance.running", map[string]any{"app": app, "id": id})
 	}
 	defer unix.Flock(int(f.Fd()), unix.LOCK_UN)
+
+	// fork 实例上一轮被 SIGKILL 时可能留下仍挂着的 .fork/<hash>/merged。
+	// 带着挂载把实例目录搬进回收站，等于把挂载点（及其 lower 视图）一起
+	// 交出去；跨文件系统时 gio 的递归拷贝还会穿过挂载点。先卸后删，清不
+	// 干净就拒绝删除——用户重试一次比丢数据好。
+	forkBase := forkDir(in)
+	if err := resetForkBase(forkBase); err != nil {
+		return errEnv("err.instance.fork_cleanup", map[string]any{"path": forkBase}, err)
+	}
 
 	// 先删入口、再删实例：反过来的话，一旦入口这一步失败，用户就在概览里
 	// 留着一个指向不存在实例的死图标——而 repair-desktop 只重建"有实例"的入口，

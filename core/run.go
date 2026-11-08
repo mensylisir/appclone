@@ -135,11 +135,27 @@ func (e *Env) Run(ctx context.Context, app, id string, opt RunOptions) (RunResul
 		return RunResult{}, err
 	}
 
+	// 克隆起步（§8.1）：fork 实例在 bwrap 之前把主实例数据挂成只读 lower，
+	// bind 源换成挂载点；run 结束（含失败/信号）由 defer 卸载。
+	var forkSources map[string]string
+	if in.Fork {
+		var forkCleanup func()
+		forkSources, forkCleanup = e.forkMounts(p, in, func() bool {
+			return stopping.Load() || ctx.Err() != nil
+		}, func(msg string) {
+			if opt.Stderr != nil {
+				_, _ = io.WriteString(opt.Stderr, "appclone: "+msg+"\n")
+			}
+		})
+		defer forkCleanup()
+	}
+
 	// RuntimeDir 保持宿主值（它是 bind 的**目标**，命名空间里应用看到的路径）；
 	// 私有 runtime 的**源**是 <inst>/runtime，由 BuildBwrapArgs 自己拼。
 	// 曾经把这里改成实例目录，结果 socket 的源与目标都是实例内的空目录，
 	// wayland/pulse 全丢，而 bind 源又指向不存在的 <inst>/root/runtime。
 	o := e.BuildOptions()
+	o.ForkSources = forkSources
 	o.RuntimeSocks = FilterExisting(RuntimeSocketCandidates(o.RuntimeDir))
 
 	// 审计层（§6.5）：overlay 罩住 HOME + 把公共目录/AC_BASE 绑回真实。

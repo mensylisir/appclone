@@ -52,6 +52,11 @@ func BuildBwrapArgs(p Profile, in Instance, o BuildOptions) ([]string, error) {
 		if err != nil {
 			return nil, err
 		}
+		// fork 实例：源是 overlay 的挂载点（lower=主实例数据、upper=实例 root）。
+		// 只有挂载成功的路径才在表里；失败的路径退回普通实例目录，启动不中断。
+		if merged, ok := o.ForkSources[abs]; ok && merged != "" {
+			src = merged
+		}
 		args = append(args, "--bind", src, abs)
 	}
 

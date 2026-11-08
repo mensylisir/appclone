@@ -44,6 +44,7 @@ func newDoctorCmd(a *app) *cobra.Command {
 			data := map[string]any{"checks": checks}
 
 			var command string
+			var forkInstance bool
 			if len(args) >= 1 {
 				appKey := args[0]
 				id := "main"
@@ -69,6 +70,11 @@ func newDoctorCmd(a *app) *cobra.Command {
 				}
 				command = strings.Join(argv, " ")
 				data["command"] = command
+				forkInstance = in.Fork
+				if forkInstance {
+					// 脚本/JSON 消费者也要知道 command 是基线 argv。
+					data["fork"] = true
+				}
 			}
 
 			a.ok(data, func() {
@@ -81,6 +87,11 @@ func newDoctorCmd(a *app) *cobra.Command {
 				if command != "" {
 					fmt.Println("\n将执行的命令：")
 					fmt.Println("  " + command)
+					if forkInstance {
+						// 真正 run 时 paths 的 bind 源会换成 .fork/<hash>/merged
+						// （挂载点要到运行时才存在），这里只能给基线 argv。
+						fmt.Println("注：这是克隆起步分身的基线命令；真正运行前 paths 的源会被替换为 .fork/<hash>/merged 的 overlay 挂载点。")
+					}
 				}
 			})
 

@@ -86,6 +86,7 @@ var messages = map[string]map[string]string{
 		"err.instance.stop_timeout": "已发送停止信号，但「{app}」的分身在 6 秒内没有退出。",
 		"err.instance.stop_signal":  "无法向正在运行的分身发送停止信号。",
 		"err.instance.id_exhausted": "「{app}」下的分身数量已达上限，无法再自动分配名字。",
+		"err.instance.fork_cleanup": "无法清理这个分身上次运行留下的挂载点（{path}），删除已取消。请退出相关应用后重试。",
 
 		// 删除
 		"err.trash.outside": "拒绝删除 {path}：它不在 appclone 自己的数据目录里。为了不误删你的文件，appclone 只会把 instances/、profiles.d/ 与 appclone-*.desktop 移入回收站。",
@@ -402,6 +403,7 @@ var messages = map[string]map[string]string{
 		"err.instance.stop_timeout": "The stop signal was sent, but the clone of \"{app}\" did not exit within 6 seconds.",
 		"err.instance.stop_signal":  "Could not send the stop signal to the running clone.",
 		"err.instance.id_exhausted": "\"{app}\" has reached the maximum number of clones.",
+		"err.instance.fork_cleanup": "Could not clean up the mount points left by this clone's previous run ({path}); delete was cancelled. Quit the related apps and try again.",
 
 		"err.trash.outside": "Refusing to delete {path}: it is not inside appclone's own data directory. To avoid deleting your files by mistake, appclone only moves instances/, profiles.d/ and appclone-*.desktop to the trash.",
 

@@ -29,6 +29,11 @@ type BuildOptions struct {
 	XDG          map[string]string
 	// Audit 非空时在 ④ 与 ⑤ 之间插入审计层（只有 `run --audit` 会设置它）。
 	Audit *AuditLayers
+	// ForkSources 把 paths 的 bind 源从实例目录换成 overlay 挂载点
+	// （`add --fork` 的实例，§8.1）。键是 normalizePaths 之后的宿主绝对路径；
+	// 没有条目的路径仍绑定实例目录。BuildBwrapArgs 仍是纯函数：挂载由
+	// core.Run 在调用前完成，这里只消费结果。
+	ForkSources map[string]string
 }
 
 // BindPair 表示一次 bind 的源与目标。
