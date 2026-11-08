@@ -537,6 +537,11 @@ GTK 闸门补结构断言：无实例时 `GetVisibleChildName()=="all"`、创建
   兄弟控件与 `GtkListBox` 包装仍不 `Unref`（与 `findWidgets` 既有约定一致，测试进程内引用、
   退出即回收；puregotk 无 finalizer）；`9411453` 提交正文的「这两个版本」措辞应读作「1.8 之前」，
   已推送的历史不改写。
+- **strace 降级真机校准（2026-11-08）**：在假 `HOME` 下把 `PATH` 去掉 `fuse-overlayfs`（保留
+  `strace`），`appclone add stracedemo` 退出码 0；两轮真实日志经 `ParseStrace` 产出
+  `paths = ["~/.config/StraceDemo"]`、`probe_method = "strace"`，写入只落在假 HOME 的该目录，
+  `ignored` 四类与 keyring `unsupported` 按契约写进档案。此前"未校准"的判断来自**在外层 strace
+  里再跑**（嵌套 tracer 报 `PTRACE_TRACEME: Operation not permitted`），不是产品路径的缺陷。
 
 **第三十八轮：GUI 分身生命周期解耦（ADR-028）**（2026-11-08）。用户拍板：**分离运行 + 停止按钮**。
 - GUI 点「启动」不再在自己的进程里跑 `core.Run`，而是以自身二进制 fork 一个会话首进程（runner，
@@ -678,7 +683,8 @@ dbus-daemon 加 `Pdeathsig: SIGTERM`（GUI 被信号打死时私有总线跟着�
    评估卸载时是否清理 `/etc/apparmor.d/bwrap`（删除比保留更有风险，需要单独设计）；
    AUR 源码包（取决于 LICENSE）。
 
-3. 仍被挡住的条目见下节：arm64 真机、strace 真实日志校准、LICENSE 决策、CI 首次实跑。
+3. 仍被挡住的条目见下节：arm64 真机、LICENSE 决策、CI 首次实跑。strace 降级已于 2026-11-08
+   用真实日志校准（见"最近完成"）。
 
 ## 被挡住的
 
@@ -691,9 +697,11 @@ dbus-daemon 加 `Pdeathsig: SIGTERM`（GUI 被信号打死时私有总线跟着�
   红了就把失败 job 的日志带回来修，不要凭"YAML 解析通过"当运行证据。
 - **`LICENSE` 未定**：用户/法务决策（tech-stack 建议 GPL-3.0-or-later）。未确认前 nfpm 不写 license 字段、
   仓库不放 `LICENSE`；这不阻塞 deb/rpm/Arch 出包，但会阻塞进发行版官方仓库与 AUR 正式包。
-- **strace 降级未用真实日志校准**：直接 `strace -f /bin/true` 可用，但产品内由 Go 以 `setsid` 起的
-  `strace` 在本次外层 strace 环境下报 `PTRACE_TRACEME: Operation not permitted`——需要单独确认真实
-  触发条件（是否与嵌套 tracer / 沙箱有关），再把 `ParseStrace` 与真实日志对齐。
+- ~~**strace 降级未用真实日志校准**~~ **已解除（2026-11-08）**：把 `PATH` 去掉 `fuse-overlayfs`
+  （保留 `strace`）后在假 HOME 跑 `appclone add stracedemo`，退出码 0；两轮真实日志产出
+  `paths = ["~/.config/StraceDemo"]`、`probe_method = "strace"`，写入只落在假 HOME 该目录。
+  旧结论的根因是**在外层 strace 里再跑**（嵌套 tracer 报 `PTRACE_TRACEME: Operation not permitted`），
+  不是产品路径问题；正常用户不会在外层 tracer 下运行 appclone。
 - **GUI 侧的自动化闸门**：`guitest.js` 只覆盖 HTML 稿；GTK 实现现由 `design/guitest-gtk.sh`
   覆盖**页面生命周期与三屏四态**（列表/确认/创建/详情/返回 + 首屏落点、空态映射、
   探测中取消/失败/可重试错误态、快速重推竞态、降级与致命横幅、en 文案，2026-11-08 起），但**指针与键盘事件注入仍不可行**

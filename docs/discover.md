@@ -23,7 +23,7 @@
 | # | 方案 | 归因 | 完备性 | 免 root | 评价 |
 |---|---|---|---|---|---|
 | 1 | **overlay-diff**（fuse-overlayfs + bwrap） | ✅ 物理（独占写层） | ✅ VFS 层全捕获 | ✅ | **主探测（推荐）** |
-| 2 | **strace**（`-e trace=%file` + 写标志过滤） | ✅ 按 PID | ✅（限已行使路径） | ✅ | 降级兜底（**尚未实现**；`legacy/` 脚本可作行为参照，不是产品代码） |
+| 2 | **strace**（`-e trace=%file` + 写标志过滤） | ✅ 按 PID | ✅（限已行使路径） | ✅ | 降级兜底（已实现于 `core/probe.go`/`core/strace.go`；2026-11-08 用真实日志校准） |
 | 3 | LD_PRELOAD 拦截 libc open/mkdir | ✅ | ⚠️ 静态链接、直接 syscall 漏掉 | ✅ | Chromium 沙箱绕过 libc，恰是重点目标 |
 | 4 | inotify 递归监听 $HOME | ❌ 事件无 PID | ✅ | ✅ | 只在"全场仅目标应用在跑"时近似成立 |
 | 5 | fanotify（带 PID 归因） | ✅ | ✅ | ❌ | 归因需 CAP_SYS_ADMIN，rootless 不可用 |
@@ -306,8 +306,13 @@ L2 语义分类（喂给 GUI 屏3 预勾选）
   档案记 `probe_method = "strace"`，置信度必须按"可能写过"展示，不是"确定写过"。
 
 层间关系：L0 不执行任何代码，负责把"冷启动前就能猜到的"先填上；L1 定案；
-L2 把定案结果翻译成档案语义。**strace 降级为 L1 不可用时的兜底路径**
-（该分支尚未在 Go 中实现，`legacy/` 原型仅作行为参照）。
+L2 把定案结果翻译成档案语义。**strace 降级为 L1 不可用时的兜底路径**（已实现于 `core/probe.go` 的 `probeStrace`）。
+**真机校准（2026-11-08）**：在假 `HOME` 下把 `PATH` 去掉 `fuse-overlayfs`（仍保留 `strace`），
+`appclone add stracedemo` 退出码 0；两轮真实日志解析出 `paths = ["~/.config/StraceDemo"]`、
+`probe_method = "strace"`，应用写入只落在假 HOME 的该目录，`ignored` 四类与 keyring `unsupported`
+均按契约写入档案。**环境限制**：本机不能在 `strace` 里再套 `strace`（嵌套 tracer 报
+`PTRACE_TRACEME: Operation not permitted`），这是校准方法的问题，不是产品路径——正常用户不会在
+外层 tracer 下运行 `appclone`。
 
 **实现（2026-11-07，`core/static.go`）**：
 - 已知模式：`~/.config/<key>`、`~/.local/share/<key>`、`~/.<key>`、`~/.var/app/<desktop-id>`，
