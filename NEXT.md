@@ -747,7 +747,7 @@ HTML、GTK amd64、GTK arm64 五个 job 全部成功（1m 0s / 51s / 42s / 1m 15
 
 ## 最近完成
 
-- 2026-11-09 **v1.0.0 发布 + CI 并发组修复**：`v1.0.0` tag（指向 `9e0cf6f`）触发 Release #1，
+- 2026-11-09 **v1.0.0 发布与 CI #18 事件核对**：`v1.0.0` tag（指向 `9e0cf6f`）触发 Release #1，
   validate 4s、verify 的 Go 1m 7s / packages 44s / HTML 46s / GTK amd64 1m 11s / GTK arm64 43s、
   release 51s 全部成功（run https://github.com/mensylisir/appclone/actions/runs/42604108161）。
   Releases 页（https://github.com/mensylisir/appclone/releases/tag/v1.0.0）有 5 个安装包
