@@ -770,7 +770,8 @@ HTML、GTK amd64、GTK arm64 五个 job 全部成功（1m 0s / 51s / 42s / 1m 15
   断言 `--- PASS`、每轮隔离核对、失败保留现场；`design/guitest-gtk.sh` 加
   `-skip '^TestGtkSoakRenderList$'`，避免开发者 shell 残留变量把 180 秒闸门拖成
   30 分钟长稳。最终树复跑 `design/soak.sh 1`（10 轮，CLI 10/10、10 轮 3s）与
-  `APPCLONE_GTK_UINPUT=1 design/guitest-gtk.sh`（20 条全过）均退出码 0。
+  `APPCLONE_GTK_UINPUT=1 design/guitest-gtk.sh`（20 条全过）均退出码 0；提交 `0fca498` 的
+  CI run 26（42669738088）53s 五个 job 全绿。
 - 2026-11-09 **真实点击启动/停止 + v1.0.0 升级回收 + 跨发行版/性能证据**：
   ① 新增第二十条 GTK 用例 `TestGtkRealInputStartStop`：uinput 虚拟触摸屏真实点击详情页
   「启动」与「停止」，事件经 libinput → GDK → 按钮，走 detached runner → `core.Run` →
