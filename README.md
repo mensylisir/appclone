@@ -100,6 +100,19 @@ design/guitest-gtk.sh                             # 真实 GTK 闸门（需显�
 设计契约在 `docs/方案设计.md`，技术选型与 ADR 在 `docs/tech-stack.md`，已验证状态在
 `docs/STATUS.md`；`NEXT.md` 记录当前进度。打包配置在 `packaging/`。
 
+## 赞助
+
+赞助完全自愿，不影响功能与后续维护。如果这个工具帮到了你，可以扫码请我喝杯咖啡：
+
+<table>
+  <tr>
+    <td align="center"><img src="docs/assets/donate-alipay.jpg" alt="支付宝收款码" width="240"><br>支付宝</td>
+    <td align="center"><img src="docs/assets/donate-wechat.jpg" alt="微信收款码" width="240"><br>微信</td>
+  </tr>
+</table>
+
+> 收款方为仓库维护者本人（公子易）。请以本页图片为准，谨防他人替换收款码。
+
 ## 许可证
 
 Copyright (C) 2026 mensylisir <710080675@qq.com>
