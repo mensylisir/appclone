@@ -463,6 +463,7 @@ activated / response / idle，地址恒定、注册一次后不再重新赋值�
   两个 job 的断言相同：能起、三屏能切换、**删除实例弹出 `AdwAlertDialog` 确认且可取消**（§4.6 要求补的那条），
   不做像素比对。GTK step 固定 `GSK_RENDERER=cairo`：无 GPU 的 Xvfb 上 GLX 上下文可能被 X 拒绝（BadAccess），
   闸门验的是交互语义与控件树，不是渲染路径，不因此降低真实性。
+  **Actions 供应链**：所有第三方 action 钉 commit SHA（行尾标版本），不用浮动 tag。
   **首次实跑（2026-11-09，run #16 / `6210cf3`）五个 job 全绿**：Go 1m 0s、packages 51s、HTML 42s、
   GTK amd64 1m 15s、GTK arm64 50s；`ubuntu-24.04-arm` hosted runner 在当前账号内可用。注意 gofmt 版本：
   CI 按 `go.mod` 装 Go 1.26.0，1.26 与 1.27 对「return 多个复合字面量」的缩进规则不同——本地跑

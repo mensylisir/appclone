@@ -452,7 +452,7 @@ GTK 闸门补结构断言：无实例时 `GetVisibleChildName()=="all"`、创建
   **记录不修**：license 字段/`LICENSE` 是用户/法务决策（tech-stack 建议 GPL-3.0-or-later，未获确认前不写；
   **后续：2026-11-08 用户已定 GPL-3.0-or-later，见 ADR-030**）；
   `ubuntu-24.04-arm` hosted runner 是否在当前账号套餐内无法从本机验证，CI 保持必需 job 而不是静默跳过；
-  actions 仍钉 tag 未钉 SHA（供应链硬化留到发版流程稳定后）；卸载时清理 AppArmor profile 未做
+  ~~actions 仍钉 tag 未钉 SHA~~（2026-11-09 已钉 commit SHA）；卸载时清理 AppArmor profile 未做
   （删除 `/etc` 文件比留着更危险，交给发行版/用户）。
 - **二次复审后的收口**（2 P2 + 6 P3）：
   ① **P2：补 GTK 闸门证据**——`design/guitest-gtk.sh` 在最终树重跑，16 条全部 PASS、退出码 0
@@ -678,7 +678,9 @@ HTML、GTK amd64、GTK arm64 五个 job 全部成功（1m 0s / 51s / 42s / 1m 15
 `ubuntu-24.04-arm` 真机 runner 验证了 arm64。打包行已升 `verified`，arm64 阻塞解除。
 剩下的按优先级：
 
-1. **发版硬化**：actions 从 tag 改钉 commit SHA；评估卸载时是否清理 `/etc/apparmor.d/bwrap`
+1. **发版硬化**：~~actions 从 tag 改钉 commit SHA~~ **已完成（2026-11-09）**——五个 action 全部钉到
+   commit SHA 并在行尾标版本（checkout v4.4.0 / setup-go v5.6.0 / setup-node v4.4.0 /
+   setup-chrome v1.7.3 / action-gh-release v2.6.2）。剩余：评估卸载时是否清理 `/etc/apparmor.d/bwrap`
    （删除比保留更有风险，需要单独设计）；首个 `vX.Y.Z` tag 与 Releases（打 tag/发版需用户确认）。
 
 2. **AUR**：源码包与 `appclone-bin` 的 PKGBUILD 已具备许可证前提，只差 AUR 账号与提交；
@@ -741,6 +743,10 @@ HTML、GTK amd64、GTK arm64 五个 job 全部成功（1m 0s / 51s / 42s / 1m 15
 
 ## 最近完成
 
+- 2026-11-09 **Actions 供应链硬化**：`ci.yml`/`release.yml` 的 `actions/checkout`、`setup-go`、
+  `setup-node`、`browser-actions/setup-chrome`、`softprops/action-gh-release` 全部从浮动 tag
+  改为 commit SHA（行尾保留版本注释），避免上游 tag 被移动时 CI 执行到未知代码；三份 YAML
+  解析通过。CI 首次全绿时 checkout/setup-go 实际解析到的正是这两个 SHA，行为不变。
 - 2026-11-09 **首次 CI 全绿 + arm64 实跑验证**：run #16（`6210cf3`）在 GitHub hosted runner 上
   Go 1m 0s、packages 51s、HTML 42s、GTK amd64 1m 15s、GTK arm64 50s 全部成功
   （https://github.com/mensylisir/appclone/actions/runs/42502888804）。此前 15 次 CI 全红，
