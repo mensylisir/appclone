@@ -666,7 +666,7 @@ dbus-daemon 加 `Pdeathsig: SIGTERM`（GUI 被信号打死时私有总线跟着�
 `SetPopOnEscape(false)`（1.4+），页面导航不再有第二个 Esc 处理者（对话框/搜索框仍各自处理）；闸门断言 `GetPopOnEscape()==false`，
 GTK 18 条全过。真实按键注入仍不可用（本机 XTEST 被禁），但语义已不依赖事件传播顺序。
 **许可证已定**（2026-11-08，GPL-3.0-or-later，ADR-030）：`LICENSE` 入仓、nfpm 写 SPDX 标识符、
-三格式包随附许可证文本；AUR 与发行版官方仓库的许可证前置条件不再缺失（AUR 提交本身仍未做）。
+三格式包随附许可证文本；AUR 与发行版官方仓库的许可证前置条件不再缺失（AUR 按 2026-11-09 决定不提交，见 ADR-031）。
 **首次 CI 已全绿**（2026-11-09 run #16 / `6210cf3`）：Go/packages/HTML/GTK amd64/GTK arm64 五个 job
 全部成功；arm64 由 `ubuntu-24.04-arm` 真机 runner 跑通，打包行升 `verified`。
 
@@ -758,8 +758,9 @@ HTML、GTK amd64、GTK arm64 五个 job 全部成功（1m 0s / 51s / 42s / 1m 15
   job 均完成；该 run 在 Release #1 启动前约 8 分钟就已结束（Release 页 18:50:03+08:00，
   CI #18 页面的 18:56:54 是其 re-run 时间），二者没有重叠，**不是**并发组互相取消。
   job 单独 re-run 48s 全绿且未复现；原因未定位，按一次性事件记录，不改 workflow 并发配置。
-  改动推送后 CI #19（run 42605610769）五个 job 全绿：Go 56s / packages 46s / HTML 40s /
-  GTK amd64 52s / GTK arm64 46s。
+  改动推送后 CI #19（b67389c）、#20（2a952b4，撤回改动）与 #21（eedb6da，run 42607252858）
+  连续三次五个 job 全绿；#21 耗时 Go 1m 0s / packages 55s / HTML 34s / GTK amd64 1m 34s /
+  GTK arm64 56s。
 - 2026-11-09 **Actions 供应链硬化**：`ci.yml`/`release.yml` 的 `actions/checkout`、`setup-go`、
   `setup-node`、`browser-actions/setup-chrome`、`softprops/action-gh-release` 全部从浮动 tag
   改为 commit SHA（行尾保留版本注释），避免上游 tag 被移动时 CI 执行到未知代码；三份 YAML
