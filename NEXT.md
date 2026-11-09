@@ -777,7 +777,9 @@ HTML、GTK amd64、GTK arm64 五个 job 全部成功（1m 0s / 51s / 42s / 1m 15
   **无论成败都删文件**；同时把 deb `postrm` upgrade 参数、rpm `%postun` 参数 1、Arch
   `post_remove` 仅在 `newpkg==NULL` 时执行的语义写进注释与 ADR-016；nfpm 顶层
   `archlinux.scripts.postupgrade` 接同一迁移脚本（pacman 升级只跑 `post_upgrade`），
-  重出包后解包确认 `.INSTALL` 含 `post_install`/`post_upgrade`/`post_remove` 三段。`ubuntu:24.04` 容器真
+  重出包后解包确认 `.INSTALL` 含 `post_install`/`post_upgrade`/`post_remove` 三段；提交 `bcbb383`
+  的 CI run 42650211815 五个 job 全绿（Go 52s / packages 28s / HTML 30s / GTK amd64 48s /
+  GTK arm64 46s，总 54s）。`ubuntu:24.04` 容器真
   `dpkg` 实测 `0.0.0~test`（无标记）→ 升级 `0.0.0~test2` → `dpkg -r` 后文件被回收
   （`DPKG-UPGRADE-RECLAIM PASS`），异内容无标记文件两侧都不碰。③ 跨发行版冒烟（假 HOME，
   每环境 3 轮 add→run→list→rm，检查宿主零污染、公共目录共享可见）：Arch 宿主、Fedora 41、
