@@ -435,12 +435,19 @@ activated / response / idle，地址恒定、注册一次后不再重新赋值�
   deb 没有 pacman 那样的自动触发器：漏了 ② 的表现是"应用列表里搜不到"；③ 只是性能/旧主题优化，
   缺了不影响 SVG 按路径加载。
 
-  **落地状态（2026-11-08）**：`packaging/nfpm.yaml` + `packaging/postinstall.sh` + 桌面入口/图标/
-  `bwrap.apparmor` 已在仓库；`.github/workflows/ci.yml`（Go 门禁、HTML 闸门、amd64/arm64 GTK 闸门）
+  `postremove` 负责卸载回收：只删带 `# appclone-owned:` 标记的 `/etc/apparmor.d/bwrap`——postinstall
+  只在目标不存在时复制，同名文件若被发行版/其他包替换，标记消失，一律不碰。删除前先
+  `apparmor_parser -R` 卸掉内核里的 profile；卸载失败就保留文件并退 0（包删除不能失败，残留的
+  unconfined profile 不影响系统）。deb `postrm`、rpm `%postun`、Arch `.INSTALL` 的 `post_remove`
+  三种钩子都必须带上。
+
+  **落地状态（2026-11-08，卸载回收 2026-11-09）**：`packaging/nfpm.yaml` + `packaging/postinstall.sh` +
+  `packaging/postremove.sh` + 桌面入口/图标/`bwrap.apparmor` 已在仓库；`.github/workflows/ci.yml`（Go 门禁、HTML 闸门、amd64/arm64 GTK 闸门）
   与 `release.yml`（tag 触发、nfpm v2.41.0 固定版本、5 包 + 2 tar.gz + checksums）已编写。
   **nfpm 的两个已知限制**写进配置注释：① 不对 `contents.src` 做环境变量展开，发布流程先把二进制
   拷到 `dist/stage/`；② v2.41 无 Arch `optdepends`。本地已用 `VERSION=0.0.0-test` 走通全流程并解包核对
-  架构字段；GitHub Actions 尚未实跑，故暂标 `implemented`，首次 CI 全绿后才升 `verified`。
+  架构字段；GitHub Actions 已于 2026-11-09 全绿并完成 v1.0.0 发布，打包行升 `verified`。
+  卸载回收用 bwrap 隔离矩阵（四种情况）与 `ubuntu:24.04` 容器里的真 `dpkg -r` 实测过。
 - **v1 不做**（各有理由，不是遗漏）：
   - **Flatpak**：见 ADR-015；
   - **Snap**：同类问题（confinement 阻止调 bwrap），另需商店账号与审核流程；
@@ -494,7 +501,7 @@ activated / response / idle，地址恒定、注册一次后不再重新赋值�
 | 013 | GUI 三屏全部用 libadwaita 原生控件（SwitchRow/ActionRow/AlertDialog/Toast/StatusPage）；`design/appclone-gui.html` 是交互基线**不是视觉基线**，冲突时以原生为准（裁决表见 §4.6） | 已定 |
 | 014 | 不引入 GSettings schema：GUI 偏好写 `~/.local/share/appclone/ui.toml`（单二进制分发无法安装 schema 并编译） | 已定 |
 | 015 | v1 **不做 Flatpak 分发**：GUI 需宿主全可见 + 在宿主 namespace 起 bwrap，与沙箱模型冲突；走发行版包 + Releases | 已定 |
-| 016 | **操作系统 = 只 Linux；CPU 架构 = amd64 + arm64 一等公民**（bwrap 只存在于 Linux，macOS/Windows 属另一套机制，不是待办；arm64 的可行性由 purego Tier 1 覆盖 linux/arm64 保证，但必须用 `ubuntu-24.04-arm` runner 实跑冒烟才算验证）。分发产物四件：`.deb`（Ubuntu 24.04+/Debian 13+）、`.rpm`（Fedora 41+ / CentOS Stream 10 / RHEL 10；openSUSE 需另建 spec，v1 不承诺）、`.pkg.tar.zst`（Arch；原 AUR `appclone-bin` 部分已由 ADR-031 取消）、裸 `.tar.gz` 兜底；三种包格式由 **nfpm 一份配置**产出（`.tar.gz` 由同源清单另打 tar），依赖**写死版本下限**。**Ubuntu 24.04+ 的 AppArmor userns 限制必须由 postinstall 安装 `/etc/apparmor.d/bwrap` 解决**（否则 bwrap 建 userns 被拒，见 §6）。Flatpak 见 ADR-015；Snap / AppImage / COPR / PPA 不做 | 已定 |
+| 016 | **操作系统 = 只 Linux；CPU 架构 = amd64 + arm64 一等公民**（bwrap 只存在于 Linux，macOS/Windows 属另一套机制，不是待办；arm64 的可行性由 purego Tier 1 覆盖 linux/arm64 保证，但必须用 `ubuntu-24.04-arm` runner 实跑冒烟才算验证）。分发产物四件：`.deb`（Ubuntu 24.04+/Debian 13+）、`.rpm`（Fedora 41+ / CentOS Stream 10 / RHEL 10；openSUSE 需另建 spec，v1 不承诺）、`.pkg.tar.zst`（Arch；原 AUR `appclone-bin` 部分已由 ADR-031 取消）、裸 `.tar.gz` 兜底；三种包格式由 **nfpm 一份配置**产出（`.tar.gz` 由同源清单另打 tar），依赖**写死版本下限**。**Ubuntu 24.04+ 的 AppArmor userns 限制必须由 postinstall 安装 `/etc/apparmor.d/bwrap` 解决**（否则 bwrap 建 userns 被拒，见 §6）；卸载时 postremove 只回收带 `appclone-owned:` 标记的那份（先卸 profile，失败保留），不碰发行版同名文件。Flatpak 见 ADR-015；Snap / AppImage / COPR / PPA 不做 | 已定 |
 | 017 | **GUI 版本门槛下调为 libadwaita ≥ 1.5 / GTK ≥ 4.14**（原 1.6/4.16 是按控件清单正推，会排除 Ubuntu 24.04 LTS = 1.5.0 / 4.14.2）。代价：弃用 1.6 才有的 `AdwSpinner`，进度改 `GtkSpinner`。生效前提 = S0 第 5 条（Ubuntu 24.04 环境实跑通过）；该条不过则本结论作废，回到 1.6/4.16 | 已定 |
 | 018 | **探测期的隔离契约**（三条，缺一条就出事）：① XDG 公共目录、`AC_BASE`、`shared_writes` 必须在 overlay 之上 bind 回**真实**目录——否则用户在探测会话里存的文件落在 upper，探测结束删 upper 等于删用户文件；② 探测期**不看档案、强制隔离单例**（私有 runtime + 私有 DBus + L0 空锁文件），否则主实例在跑时应用转发参数后退出，探测零写入；③ 探测前扫进程挡住"应用还开着"，不给"仍然继续" | 已定 |
 | 019 | **`doctor --verify` 只在有运行期审计层时下结论**：`run --audit` 复用探测的 overlay 原语（lower=`$HOME`、upper=`/var/tmp/appclone/audit.<uid>/<app>.<id>/upper`），对账 `paths`/`shared_writes` 得 `verified`/`leak-detected`；没有审计层输出 `unverified`（不是"通过"）。免 root 下 fanotify 需 `CAP_SYS_ADMIN`、eBPF 被 `unprivileged_bpf_disabled` 关、inotify 无 PID——**不做假装能归因的检查**。审计默认关闭（全 `$HOME` 过 overlay 有 copy-up 开销） | 已定 |

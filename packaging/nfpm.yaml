@@ -95,3 +95,5 @@ contents:
 
 scripts:
   postinstall: packaging/postinstall.sh
+  # 卸载回收：只删 postinstall 自己装的那份 /etc/apparmor.d/bwrap（带标记行）。
+  postremove: packaging/postremove.sh

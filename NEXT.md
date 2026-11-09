@@ -661,10 +661,10 @@ dbus-daemon 加 `Pdeathsig: SIGTERM`（GUI 被信号打死时私有总线跟着�
 **已知策略**：`display_name` 的默认值「分身 N」是用户数据，不随界面语言翻译（ADR-025）；
 英文界面首次创建仍显示「分身 1」，这是有意选择，若要中性默认名需单独定案。
 **未覆盖**：删除/重命名/关闭开关对话框的
-响应路径（第四十一轮已由 `dialogHook` 覆盖）、真实指针/键盘注入。**Esc 竞态已结构性收口**
+响应路径（第四十一轮已由 `dialogHook` 覆盖）；真实指针/键盘注入已由第十九条 GTK 用例覆盖（2026-11-09）。**Esc 竞态已结构性收口**
 （2026-11-09）：不再假设窗口级控制器一定先于 `AdwNavigationView` 的快捷键控制器——直接
 `SetPopOnEscape(false)`（1.4+），页面导航不再有第二个 Esc 处理者（对话框/搜索框仍各自处理）；闸门断言 `GetPopOnEscape()==false`，
-GTK 18 条全过。真实按键注入仍不可用（本机 XTEST 被禁），但语义已不依赖事件传播顺序。
+GTK 18 条全过。真实按键注入现由 uinput 用例覆盖（见 `TestGtkRealInputUinput`），语义仍不依赖事件传播顺序。
 **许可证已定**（2026-11-08，GPL-3.0-or-later，ADR-030）：`LICENSE` 入仓、nfpm 写 SPDX 标识符、
 三格式包随附许可证文本；AUR 与发行版官方仓库的许可证前置条件不再缺失（AUR 按 2026-11-09 决定不提交，见 ADR-031）。
 **首次 CI 已全绿**（2026-11-09 run #16 / `6210cf3`）：Go/packages/HTML/GTK amd64/GTK arm64 五个 job
@@ -681,11 +681,14 @@ HTML、GTK amd64、GTK arm64 五个 job 全部成功（1m 0s / 51s / 42s / 1m 15
 1. **首次发版已完成（2026-11-09，v1.0.0）**：`release.yml` 的 validate → verify（复用整套
    `ci.yml`）→ release 全绿，Releases 上有 5 个安装包 + 2 个 tar.gz + `checksums.txt`
    （另 GitHub 自动附 2 个源码包，共 10 个资产）；证据见 `docs/STATUS.md` 打包行。
-   actions 供应链已钉 commit SHA。剩余：评估卸载时是否清理 `/etc/apparmor.d/bwrap`
-   （删除比保留更有风险，需要单独设计）。
+   actions 供应链已钉 commit SHA。**卸载回收 AppArmor profile 已完成**（2026-11-09）：
+   `packaging/postremove.sh` 只删带 `appclone-owned:` 标记的 `/etc/apparmor.d/bwrap`，
+   三格式包都带该钩子；bwrap 矩阵 + 真 `dpkg -r` 容器实测通过，证据见 `docs/STATUS.md` 打包行。
 
-2. **剩余自动化覆盖**：真实指针/键盘事件注入（本机 XTEST 被禁）；Esc 已由
-   `SetPopOnEscape(false)` 结构性收口，不再依赖注入。其余被挡住的条目见下节。
+2. **自动化覆盖已补齐**（2026-11-09）：真实指针/键盘由 `TestGtkRealInputUinput` 覆盖——
+   `/dev/uinput` 创建虚拟触摸屏/键盘（Wayland 原生、无需 root），触摸点切换器双向、点击聚焦
+   搜索框、按键过滤与退格恢复；每次注入前复查窗口焦点。CI runner 无 `/dev/uinput` 时该用例
+   按预期 SKIP（门禁会检查 SKIP 行）。Esc 已由 `SetPopOnEscape(false)` 结构性收口。
    **AUR 按用户决定不做**（2026-11-09）——只维护 GitHub Releases。
 
 3. **CI #18 的一次性 job 取消已核对，不改 workflow**：packages job 在 `actions/setup-go`
@@ -747,6 +750,22 @@ HTML、GTK amd64、GTK arm64 五个 job 全部成功（1m 0s / 51s / 42s / 1m 15
 
 ## 最近完成
 
+- 2026-11-09 **真实指针/键盘注入 + 卸载回收 AppArmor profile**：① `TestGtkRealInputUinput`
+  用 `/dev/uinput` 创建虚拟触摸屏/键盘（与 ydotool 同机制，Wayland 会话原生可用、无需 root），
+  事件经 libinput → GDK → 控件；覆盖视图切换器左右标签的触摸点击（双向）、触摸聚焦搜索框、
+  逐键输入若干字符（不假设键盘布局）与逐键退格恢复。窗口全屏后注入，每次注入前复查 `GtkWindow:is-active`，
+  失焦或退回非全屏即安全中止；首次注入前做校准点击（捕获相观察器）确认事件回到本窗口，全屏固定到桌面原点所在显示器，连发按键改为逐键发送并在每键前
+  复查焦点，断言不假设键盘布局（按实际字符数退格）。门禁要求显式
+  `APPCLONE_GTK_UINPUT=1` 且 `/dev/uinput` 可写才启用（默认关闭，避免嵌套合成器下误投）；输入后用 Return 提交
+  IME 预编辑，并按产品归一化（ToLower/TrimSpace）断言 `u.query` 已由 search-changed 写入再退格。本机 2.9–3.1s PASS、连续 3 次，
+  `design/guitest-gtk.sh` 19 条全过、退出码 0；CI 无 `/dev/uinput` 时按预期 SKIP 且
+  门禁检查该行。**审查记录**：本次 Claude subagent 三次启动（含窄范围）均未在 7–11 分钟内
+  返回，按规则记录为阻塞；改用本机 Codex 只读审查（`codex exec review --uncommitted`），
+  提出 1 P1（门禁强制开启注入、覆盖调用者显式关闭）+ 2 P2（连发按键间不复查焦点、
+  键盘布局假设），三条均已修复并复跑门禁。② `packaging/postremove.sh`：只删带
+  `appclone-owned:` 标记的 `/etc/apparmor.d/bwrap`，先 `apparmor_parser -R`，失败保留；
+  deb/rpm/Arch 三种包均带钩子（deb `postrm`、rpm 脚本、Arch `.INSTALL` 的 `post_remove`）。
+  bwrap 矩阵八种情况全过（含 rpm/deb 升级参数守卫），`ubuntu:24.04` 容器里 `dpkg -r` 实测自己的文件删除、无标记文件保留；`dpkg -i` 跨版本升级时文件保留。
 - 2026-11-09 **v1.0.0 发布与 CI #18 事件核对**：`v1.0.0` tag（指向 `9e0cf6f`）触发 Release #1，
   validate 4s、verify 的 Go 1m 7s / packages 44s / HTML 46s / GTK amd64 1m 11s / GTK arm64 43s、
   release 51s 全部成功（run https://github.com/mensylisir/appclone/actions/runs/42604108161）。

@@ -1,3 +1,5 @@
+# appclone-owned: 本文件由 appclone 的 postinstall 复制到 /etc/apparmor.d/bwrap，
+# postremove 只回收带这一行标记的文件；发行版/其他包提供的同名文件不碰。
 abi <abi/4.0>,
 include <tunables/global>
 

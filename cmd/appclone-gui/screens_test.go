@@ -10,11 +10,10 @@ package main
 // panic，`t.Skip` 根本来不及执行。默认门禁（core-only 容器）不编译这个文件；
 // `design/guitest-gtk.sh` 用 `-tags gtk_e2e` 显式把它编进来。
 //
-// 为什么不用合成输入：本机会话禁止 XTEST 注入（xdotool 无效），broadway 在
-// push 后还会以 gdk/broadway 自身断言自崩。但产品的入口就在信号回调里——
-// 拨 SwitchRow 的 active 会发真实 notify::active 进 u.onSwitch；确认页
-// 直调的是按钮 clicked 绑定的同一个 submit 处理函数。这是直调回调，不是
-// 合成点击，不需要指针事件。
+// 这些用例走产品回调而不是合成点击：拨 SwitchRow 的 active 会发真实
+// notify::active 进 u.onSwitch；确认页直调的是按钮 clicked 绑定的同一个
+// submit 处理函数。真实指针/键盘事件由同目录的 input_uinput_test.go 单独覆盖
+// （uinput，Wayland 原生，不需要 XTEST/broadway）。
 import (
 	"bytes"
 	"context"
