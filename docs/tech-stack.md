@@ -462,11 +462,6 @@ activated / response / idle，地址恒定、注册一次后不再重新赋值�
   不做像素比对。GTK step 固定 `GSK_RENDERER=cairo`：无 GPU 的 Xvfb 上 GLX 上下文可能被 X 拒绝（BadAccess），
   闸门验的是交互语义与控件树，不是渲染路径，不因此降低真实性。
   **Actions 供应链**：所有第三方 action 钉 commit SHA（行尾标版本），不用浮动 tag。
-  **并发组用 `github.workflow_ref` 而不是 `github.ref`**：`release.yml` 经 `workflow_call` 复用本文件时，
-  只按 ref 分组会让发版 verify 与主分支 CI 落进同一组并互相取消（2026-11-09 首次发版实际发生：
-  主分支 CI #18 的 packages job 被 release 的 verify 取消，re-run 单跑 48s 全绿）。`workflow_ref`
-  含调用方工作流路径（`ci.yml@refs/heads/main` vs `release.yml@refs/tags/v1.0.0`），两者天然分开；
-  同一分支的连续 push 仍会取消上一轮。
   **首次实跑（2026-11-09，run #16 / `6210cf3`）五个 job 全绿**：Go 1m 0s、packages 51s、HTML 42s、
   GTK amd64 1m 15s、GTK arm64 50s；`ubuntu-24.04-arm` hosted runner 在当前账号内可用。注意 gofmt 版本：
   CI 按 `go.mod` 装 Go 1.26.0，1.26 与 1.27 对「return 多个复合字面量」的缩进规则不同——本地跑

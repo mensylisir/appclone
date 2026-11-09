@@ -688,9 +688,10 @@ HTML、GTK amd64、GTK arm64 五个 job 全部成功（1m 0s / 51s / 42s / 1m 15
    `SetPopOnEscape(false)` 结构性收口，不再依赖注入。其余被挡住的条目见下节。
    **AUR 按用户决定不做**（2026-11-09）——只维护 GitHub Releases。
 
-3. **CI 并发组已修**：CI #18 的 packages job 在首次发版时被 release 的 verify 取消；
-   `ci.yml` 的并发组从 `github.ref` 改为 `github.workflow_ref`（主分支 CI 与发版 verify
-   不再同组），re-run 单跑 48s 全绿，排除 job 缺陷。
+3. **CI #18 的一次性 job 取消已核对，不改 workflow**：packages job 在 `actions/setup-go`
+   解压缓存阶段收到 `The operation was canceled.`（41s），同 run 其余四个 job 均完成；
+   CI #18 在 Release #1 启动前约 8 分钟就已结束，二者没有重叠，**不是**并发组互相取消。
+   该 job 单独 re-run 48s 全绿，未复现；原因未定位，按一次性事件记录（见 STATUS 打包行），不改 workflow。
 
 ## 被挡住的
 
@@ -752,11 +753,13 @@ HTML、GTK amd64、GTK arm64 五个 job 全部成功（1m 0s / 51s / 42s / 1m 15
   Releases 页（https://github.com/mensylisir/appclone/releases/tag/v1.0.0）有 5 个安装包
   （deb/rpm × amd64/arm64 + Arch x86_64）、2 个架构化 tar.gz 与 `checksums.txt`，另有 GitHub
   自动生成的 2 个源码包，共 10 个资产；页面同时展示每个资产的 SHA-256（`checksums.txt`
-  自身为 `d31d0f4a…`）。发版时 CI #18（run 42602702293）的 packages job 被 release 的 verify
-  取消（`The operation was canceled.`，其余四个 job 已完成）；单跑 re-run 48s 全绿，证明是
-  workflow 并发组冲突而非 job 缺陷。`ci.yml` 的组名改为 `ci-${{ github.workflow_ref }}`
-  （主分支 `ci.yml@refs/heads/main` 与发版 `release.yml@refs/tags/v1.0.0` 分属不同组），
-  同一分支连续 push 仍会取消上一轮。
+  自身为 `d31d0f4a…`）。**CI #18（run 42602702293）的一次性取消已核对**：packages job 在
+  `actions/setup-go` 解压缓存阶段收到 `The operation was canceled.`（41s），同 run 其余四个
+  job 均完成；该 run 在 Release #1 启动前约 8 分钟就已结束（Release 页 18:50:03+08:00，
+  CI #18 页面的 18:56:54 是其 re-run 时间），二者没有重叠，**不是**并发组互相取消。
+  job 单独 re-run 48s 全绿且未复现；原因未定位，按一次性事件记录，不改 workflow 并发配置。
+  改动推送后 CI #19（run 42605610769）五个 job 全绿：Go 56s / packages 46s / HTML 40s /
+  GTK amd64 52s / GTK arm64 46s。
 - 2026-11-09 **Actions 供应链硬化**：`ci.yml`/`release.yml` 的 `actions/checkout`、`setup-go`、
   `setup-node`、`browser-actions/setup-chrome`、`softprops/action-gh-release` 全部从浮动 tag
   改为 commit SHA（行尾保留版本注释），避免上游 tag 被移动时 CI 执行到未知代码；三份 YAML
