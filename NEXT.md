@@ -756,6 +756,21 @@ HTML、GTK amd64、GTK arm64 五个 job 全部成功（1m 0s / 51s / 42s / 1m 15
 
 ## 最近完成
 
+- 2026-11-10 **长稳 / 内存稳定性证据（60 分钟 Wayland + CLI 100 轮）**：新增
+  `cmd/appclone-gui/soak_test.go`（`TestGtkSoakRenderList`，默认 SKIP，需
+  `APPCLONE_GTK_SOAK_MIN`）与 `design/soak.sh`（手动或发版前跑，不进 CI）。
+  `GDK_BACKEND=wayland WAYLAND_DISPLAY=/run/user/1000/wayland-0 SOAK_CYCLES=100
+  design/soak.sh 60` 退出码 0：GTK 段 61m0s 整页重建 **148,947 次**，基线 144 MiB、
+  结束 144 MiB、峰值 145 MiB、**增长 0 MiB**（阈值 64 MiB）；CLI 段 100 轮
+  add→run→stop→rm 失败 0，剩余实例目录 0、残留 runner 0。只读审查首轮 REJECTED：
+  2 P1（就绪判据误用只建不删的 `run.lock`，stop 命中"正在启动"窗口会退 7；
+  GTK 段 SKIP 被当通过）与 P2（每轮固定空等 5s、`wait` 无上限、缺"写入落在实例根 /
+  宿主零污染"断言、RSS 采样失败被当 0、注释命令缺 `-count=1`/`-timeout`、错误被
+  `/dev/null` 吞掉、缺 bwrap/gio/pgrep 预检）已全部修复：脚本改等 `run.pid`、显式
+  断言 `--- PASS`、每轮隔离核对、失败保留现场；`design/guitest-gtk.sh` 加
+  `-skip '^TestGtkSoakRenderList$'`，避免开发者 shell 残留变量把 180 秒闸门拖成
+  30 分钟长稳。最终树复跑 `design/soak.sh 1`（10 轮，CLI 10/10、10 轮 3s）与
+  `APPCLONE_GTK_UINPUT=1 design/guitest-gtk.sh`（20 条全过）均退出码 0。
 - 2026-11-09 **真实点击启动/停止 + v1.0.0 升级回收 + 跨发行版/性能证据**：
   ① 新增第二十条 GTK 用例 `TestGtkRealInputStartStop`：uinput 虚拟触摸屏真实点击详情页
   「启动」与「停止」，事件经 libinput → GDK → 按钮，走 detached runner → `core.Run` →

@@ -94,8 +94,13 @@ fi
 # 阶段 dlopen GTK，没有 GTK 运行库的机器会在 init panic 而不是 skip）。
 LOG="$WORK/gtk-test.log"
 set +e
+# -skip：长稳用例（TestGtkSoakRenderList）的同名前缀会被 -run 命中；它默认
+# 因缺 APPCLONE_GTK_SOAK_MIN 而 SKIP，但开发者 shell 里残留该变量时会让
+# 180 秒的闸门静默跑成 30 分钟长稳。
 CGO_ENABLED=0 PATH="$WORK:$PATH" APPCLONE_GTK_TEST=1 \
-  go test -tags gtk_e2e -count=1 -timeout 180s -v -run 'TestGtk|TestDetachedRunnerSpawn|TestDetachLogHelpers|TestDetachedTargetEnv' ./cmd/appclone-gui \
+  go test -tags gtk_e2e -count=1 -timeout 180s -v \
+  -run 'TestGtk|TestDetachedRunnerSpawn|TestDetachLogHelpers|TestDetachedTargetEnv' \
+  -skip '^TestGtkSoakRenderList$' ./cmd/appclone-gui \
   2>&1 | tee "$LOG"
 rc=${PIPESTATUS[0]}
 set -e
