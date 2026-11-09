@@ -667,37 +667,35 @@ dbus-daemon 加 `Pdeathsig: SIGTERM`（GUI 被信号打死时私有总线跟着�
 GTK 18 条全过。真实按键注入仍不可用（本机 XTEST 被禁），但语义已不依赖事件传播顺序。
 **许可证已定**（2026-11-08，GPL-3.0-or-later，ADR-030）：`LICENSE` 入仓、nfpm 写 SPDX 标识符、
 三格式包随附许可证文本；AUR 与发行版官方仓库的许可证前置条件不再缺失（AUR 提交本身仍未做）。
+**首次 CI 已全绿**（2026-11-09 run #16 / `6210cf3`）：Go/packages/HTML/GTK amd64/GTK arm64 五个 job
+全部成功；arm64 由 `ubuntu-24.04-arm` 真机 runner 跑通，打包行升 `verified`。
 
 ## 下一步
 
 功能面已收口：探测（overlay + strace 兜底）→ 档案 → CLI → GUI 三屏 → 克隆起步 → deb/rpm/Arch 包
-→ CI/发版流程 → 许可证都已落地，最终树的真机冒烟（`design/probe-smoke.sh`）与三套闸门（Go / HTML 62 / GTK 18）
-全绿。剩下的不是新功能，而是**外部验证**，按依赖顺序：
+→ CI/发版流程 → 许可证都已落地。**首次 CI 已全绿（2026-11-09 run #16 / `6210cf3`）**：Go、packages、
+HTML、GTK amd64、GTK arm64 五个 job 全部成功（1m 0s / 51s / 42s / 1m 15s / 50s），
+`ubuntu-24.04-arm` 真机 runner 验证了 arm64。打包行已升 `verified`，arm64 阻塞解除。
+剩下的按优先级：
 
-1. **等首次 CI 实跑**：`b41f8fa` 起每次 push 都会触发 `ci.yml` 的 go/packages/html/gtk/gtk-arm。
-   本机没有 `gh` CLI 与 GitHub 凭据、未认证请求读不到（仓库返回 404），只能在 GitHub 页面看：
-   https://github.com/mensylisir/appclone/actions
-   全绿后把 STATUS 的打包行从 `implemented` 升 `verified`；任一 job 红了，把日志带回来修，
-   不要用「YAML 解析通过」「本机跑过」替代 CI 证据。首次绿之前已经踩掉的坑：
-   - libadwaita 1.5 没有 `adw_preferences_group_get_row`（1.8 才有），4.24 本机永远暴露不出来；
-   - 无 GPU 的 Xvfb 上 GLX 可能 `BadAccess`，GTK step 已固定 `GSK_RENDERER=cairo`。
+1. **发版硬化**：actions 从 tag 改钉 commit SHA；评估卸载时是否清理 `/etc/apparmor.d/bwrap`
+   （删除比保留更有风险，需要单独设计）；首个 `vX.Y.Z` tag 与 Releases（打 tag/发版需用户确认）。
 
-2. **CI 绿之后的发版硬化**（不急，等稳定性证据）：actions 从 tag 改钉 commit SHA；
-   评估卸载时是否清理 `/etc/apparmor.d/bwrap`（删除比保留更有风险，需要单独设计）；
-   AUR 源码包与 `appclone-bin`（许可证已定，只差 AUR 账号与提交）。
+2. **AUR**：源码包与 `appclone-bin` 的 PKGBUILD 已具备许可证前提，只差 AUR 账号与提交；
+   需要先有首个 release tag 才能用正式 tarball 验证。
 
-3. 仍被挡住的条目见下节：arm64 真机、CI 首次实跑。strace 降级已于 2026-11-08
-   用真实日志校准（见"最近完成"）。
+3. **剩余自动化覆盖**：真实指针/键盘事件注入（本机 XTEST 被禁）；Esc 已由
+   `SetPopOnEscape(false)` 结构性收口，不再依赖注入。其余被挡住的条目见下节。
 
 ## 被挡住的
 
 - ~~`/dev/fuse` 不可用~~ **已解除**（2026-11-07 本机出现 `/dev/fuse`，fuse-overlayfs 1.18 / fusermount3 3.18）：
   `design/probe-smoke.sh` 已跑通整条真机链路。测试脚本自身曾有两处 fixture 缺陷（XDG 根放在假 HOME 之外、
   `run --audit` 的 flag 写在位置参数之后），已修。
-- **CI 首次实跑仍无法在本机确认**（2026-11-08）：`b41f8fa` 已推送，会触发 `ci.yml` 的
-  go/packages/html/gtk/gtk-arm 五个 job；本机没有 `gh` CLI 与 GitHub 凭据，未认证请求读不到
-  （仓库返回 404），所以打包能力仍是 `implemented`。到 GitHub UI 看首次结果，全绿后再升 `verified`；
-  红了就把失败 job 的日志带回来修，不要凭"YAML 解析通过"当运行证据。
+- ~~**CI 首次实跑无法确认 / arm64 未验证**~~ **已解除（2026-11-09）**：run #16（`6210cf3`）五个 job
+  全绿（Go / packages / HTML / GTK amd64 / GTK arm64），`ubuntu-24.04-arm` hosted runner 实跑
+  GTK 闸门 50s 通过，ADR-016 的 arm64 要求达成。首轮红是 gofmt 1.26/1.27 缩进分歧（`core/audit.go`），
+  拆分返回字面量后消除；STATUS 打包行已升 `verified`。
 - ~~**`LICENSE` 未定**~~ **已解除（2026-11-08）**：用户拍板 **GPL-3.0-or-later**（ADR-030）。仓库根
   新增 `LICENSE`（GPLv3 全文，sha256 `3972dc…`，与 automake/R 的 GPL-3 副本逐字节一致）、
   `packaging/copyright`（DEP-5）与 `THIRD_PARTY_NOTICES`；nfpm `license: GPL-3.0-or-later`，
@@ -743,6 +741,13 @@ GTK 18 条全过。真实按键注入仍不可用（本机 XTEST 被禁），但
 
 ## 最近完成
 
+- 2026-11-09 **首次 CI 全绿 + arm64 实跑验证**：run #16（`6210cf3`）在 GitHub hosted runner 上
+  Go 1m 0s、packages 51s、HTML 42s、GTK amd64 1m 15s、GTK arm64 50s 全部成功
+  （https://github.com/mensylisir/appclone/actions/runs/42502888804）。此前 15 次 CI 全红，
+  根因不是依赖/GTK，而是 **gofmt 1.26 与 1.27 对「return 多个复合字面量」的缩进规则不同**：
+  CI 用 go.mod 的 Go 1.26.0 判 `core/audit.go` 未格式化，本地 1.27 判通过。把两个字面量拆成
+  `sess`/`layers` 再返回后两版 gofmt 都干净；Go 1.26.0 下 vet/test/staticcheck 全绿。
+  STATUS 打包行 `implemented` → `verified`；arm64 阻塞解除（GTK arm64 job 实跑通过）。
 - 2026-11-09 **Esc 语义结构性收口**：GUI 除窗口级 `GtkEventControllerKey` 外，
   调用 `AdwNavigationView.SetPopOnEscape(false)`（libadwaita 1.4+）。此前"窗口控制器先于
   nav 的快捷键控制器"依赖控件树传播顺序：焦点在子控件时 nav 可能先冒泡触发并 pop，

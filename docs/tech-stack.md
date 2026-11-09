@@ -463,6 +463,11 @@ activated / response / idle，地址恒定、注册一次后不再重新赋值�
   两个 job 的断言相同：能起、三屏能切换、**删除实例弹出 `AdwAlertDialog` 确认且可取消**（§4.6 要求补的那条），
   不做像素比对。GTK step 固定 `GSK_RENDERER=cairo`：无 GPU 的 Xvfb 上 GLX 上下文可能被 X 拒绝（BadAccess），
   闸门验的是交互语义与控件树，不是渲染路径，不因此降低真实性。
+  **首次实跑（2026-11-09，run #16 / `6210cf3`）五个 job 全绿**：Go 1m 0s、packages 51s、HTML 42s、
+  GTK amd64 1m 15s、GTK arm64 50s；`ubuntu-24.04-arm` hosted runner 在当前账号内可用。注意 gofmt 版本：
+  CI 按 `go.mod` 装 Go 1.26.0，1.26 与 1.27 对「return 多个复合字面量」的缩进规则不同——本地跑
+  门禁要调用该工具链自带的 `gofmt`（`"$(GOTOOLCHAIN=go1.26.0 go env GOROOT)/bin/gofmt" -l .`），
+  或把代码写成两版都接受的形式（`core/audit.go` 已如此）。
 - **许可证**：**GPL-3.0-or-later**（ADR-030，2026-11-08 用户拍板）。与 GTK/libadwaita 生态一致
   （puregotk 为 MIT、libadwaita 为 LGPL，均兼容）；仓库根 `LICENSE` 存放 GPLv3 全文，nfpm
   `license` 字段写 SPDX 标识符。deb 按 Policy §12.5 用 `packaging/copyright`（DEP-5，含版权人与
