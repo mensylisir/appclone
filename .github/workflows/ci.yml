@@ -15,7 +15,14 @@ permissions:
   contents: read
 
 concurrency:
-  group: ci-${{ github.ref }}
+  # 不能只用 github.ref 分组：release.yml 经 workflow_call 复用本文件时，
+  # 调用方解析出的 ref 可能与主分支 CI 相同，两组 run 会互相 cancel
+  # （2026-11-09 首次发版时 CI #18 的 packages job 就是这样被 release 的
+  # verify 取消的；re-run 单独跑 48s 全绿，排除 job 自身问题）。
+  # workflow_ref 含调用方工作流路径：主分支是 ci.yml@refs/heads/main，
+  # 发版是 release.yml@refs/tags/<tag>，天然分到不同组；同一分支的
+  # 连续 push 仍会取消上一轮，保留抢跑语义。
+  group: ci-${{ github.workflow_ref }}
   cancel-in-progress: true
 
 jobs:

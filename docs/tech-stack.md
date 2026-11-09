@@ -399,11 +399,9 @@ activated / response / idle，地址恒定、注册一次后不再重新赋值�
     只能命中一套，要支持得另建 spec——留待社区走 OBS，不写进承诺。
   - `.pkg.tar.zst` → Arch / Manjaro（**仅 x86_64**）；`depends=(gtk4>=4.14 libadwaita>=1.5 bubblewrap
     desktop-file-utils glib2)`；**nfpm v2.41 不支持表达 Arch 的 `optdepends`**，`fuse-overlayfs`/`strace`
-    只在 README 与 `doctor` 里提示（缺 fuse 走 strace，两者都缺则无法探测、但分身仍可运行）；
-    同时提交 AUR `appclone-bin`（预编译，只含 x86_64；**尚未提交**，README 不把它写成现成路径）。
-    **Arch 的 arm64 走另一条路**：Arch Linux ARM 是独立项目、官方仓库只发 x86_64，所以 arm64 用户用 AUR 的
-    源码包 `appclone`（本地编译，零 cgo 不需要装 GTK 开发包）或 `.tar.gz`——这条要写进 README，别让 arm64 用户去装
-    `appclone-bin` 然后拿到一个跑不起来的 x86_64 二进制；
+    只在 README 与 `doctor` 里提示（缺 fuse 走 strace，两者都缺则无法探测、但分身仍可运行）。
+    **不提交 AUR**（2026-11-09 用户决定，ADR-031）：Arch 用户从 GitHub Releases 取 `.pkg.tar.zst`；
+    **Arch 的 arm64 走 `.tar.gz`**（Arch Linux ARM 是独立项目、官方仓库只发 x86_64），README 已写明；
   - `.tar.gz`（裸二进制 + `.desktop` + 图标 + `bwrap.apparmor` + `LICENSE` + `THIRD_PARTY_NOTICES`，同上清单）→ 兜底，覆盖其他 glibc 发行版，README 写清运行期依赖。
     **命名必须带架构**：`appclone_<version>_linux_<goarch>.tar.gz`（如 `appclone_1.0.0_linux_arm64.tar.gz`）——
     两个架构同名会在 Releases 里撞车，arm64 用户也无从辨认；
@@ -464,6 +462,11 @@ activated / response / idle，地址恒定、注册一次后不再重新赋值�
   不做像素比对。GTK step 固定 `GSK_RENDERER=cairo`：无 GPU 的 Xvfb 上 GLX 上下文可能被 X 拒绝（BadAccess），
   闸门验的是交互语义与控件树，不是渲染路径，不因此降低真实性。
   **Actions 供应链**：所有第三方 action 钉 commit SHA（行尾标版本），不用浮动 tag。
+  **并发组用 `github.workflow_ref` 而不是 `github.ref`**：`release.yml` 经 `workflow_call` 复用本文件时，
+  只按 ref 分组会让发版 verify 与主分支 CI 落进同一组并互相取消（2026-11-09 首次发版实际发生：
+  主分支 CI #18 的 packages job 被 release 的 verify 取消，re-run 单跑 48s 全绿）。`workflow_ref`
+  含调用方工作流路径（`ci.yml@refs/heads/main` vs `release.yml@refs/tags/v1.0.0`），两者天然分开；
+  同一分支的连续 push 仍会取消上一轮。
   **首次实跑（2026-11-09，run #16 / `6210cf3`）五个 job 全绿**：Go 1m 0s、packages 51s、HTML 42s、
   GTK amd64 1m 15s、GTK arm64 50s；`ubuntu-24.04-arm` hosted runner 在当前账号内可用。注意 gofmt 版本：
   CI 按 `go.mod` 装 Go 1.26.0，1.26 与 1.27 对「return 多个复合字面量」的缩进规则不同——本地跑
@@ -496,7 +499,7 @@ activated / response / idle，地址恒定、注册一次后不再重新赋值�
 | 013 | GUI 三屏全部用 libadwaita 原生控件（SwitchRow/ActionRow/AlertDialog/Toast/StatusPage）；`design/appclone-gui.html` 是交互基线**不是视觉基线**，冲突时以原生为准（裁决表见 §4.6） | 已定 |
 | 014 | 不引入 GSettings schema：GUI 偏好写 `~/.local/share/appclone/ui.toml`（单二进制分发无法安装 schema 并编译） | 已定 |
 | 015 | v1 **不做 Flatpak 分发**：GUI 需宿主全可见 + 在宿主 namespace 起 bwrap，与沙箱模型冲突；走发行版包 + Releases | 已定 |
-| 016 | **操作系统 = 只 Linux；CPU 架构 = amd64 + arm64 一等公民**（bwrap 只存在于 Linux，macOS/Windows 属另一套机制，不是待办；arm64 的可行性由 purego Tier 1 覆盖 linux/arm64 保证，但必须用 `ubuntu-24.04-arm` runner 实跑冒烟才算验证）。分发产物四件：`.deb`（Ubuntu 24.04+/Debian 13+）、`.rpm`（Fedora 41+ / CentOS Stream 10 / RHEL 10；openSUSE 需另建 spec，v1 不承诺）、`.pkg.tar.zst` + AUR `appclone-bin`（Arch）、裸 `.tar.gz` 兜底；三种包格式由 **nfpm 一份配置**产出（`.tar.gz` 由同源清单另打 tar），依赖**写死版本下限**。**Ubuntu 24.04+ 的 AppArmor userns 限制必须由 postinstall 安装 `/etc/apparmor.d/bwrap` 解决**（否则 bwrap 建 userns 被拒，见 §6）。Flatpak 见 ADR-015；Snap / AppImage / COPR / PPA 不做 | 已定 |
+| 016 | **操作系统 = 只 Linux；CPU 架构 = amd64 + arm64 一等公民**（bwrap 只存在于 Linux，macOS/Windows 属另一套机制，不是待办；arm64 的可行性由 purego Tier 1 覆盖 linux/arm64 保证，但必须用 `ubuntu-24.04-arm` runner 实跑冒烟才算验证）。分发产物四件：`.deb`（Ubuntu 24.04+/Debian 13+）、`.rpm`（Fedora 41+ / CentOS Stream 10 / RHEL 10；openSUSE 需另建 spec，v1 不承诺）、`.pkg.tar.zst`（Arch；原 AUR `appclone-bin` 部分已由 ADR-031 取消）、裸 `.tar.gz` 兜底；三种包格式由 **nfpm 一份配置**产出（`.tar.gz` 由同源清单另打 tar），依赖**写死版本下限**。**Ubuntu 24.04+ 的 AppArmor userns 限制必须由 postinstall 安装 `/etc/apparmor.d/bwrap` 解决**（否则 bwrap 建 userns 被拒，见 §6）。Flatpak 见 ADR-015；Snap / AppImage / COPR / PPA 不做 | 已定 |
 | 017 | **GUI 版本门槛下调为 libadwaita ≥ 1.5 / GTK ≥ 4.14**（原 1.6/4.16 是按控件清单正推，会排除 Ubuntu 24.04 LTS = 1.5.0 / 4.14.2）。代价：弃用 1.6 才有的 `AdwSpinner`，进度改 `GtkSpinner`。生效前提 = S0 第 5 条（Ubuntu 24.04 环境实跑通过）；该条不过则本结论作废，回到 1.6/4.16 | 已定 |
 | 018 | **探测期的隔离契约**（三条，缺一条就出事）：① XDG 公共目录、`AC_BASE`、`shared_writes` 必须在 overlay 之上 bind 回**真实**目录——否则用户在探测会话里存的文件落在 upper，探测结束删 upper 等于删用户文件；② 探测期**不看档案、强制隔离单例**（私有 runtime + 私有 DBus + L0 空锁文件），否则主实例在跑时应用转发参数后退出，探测零写入；③ 探测前扫进程挡住"应用还开着"，不给"仍然继续" | 已定 |
 | 019 | **`doctor --verify` 只在有运行期审计层时下结论**：`run --audit` 复用探测的 overlay 原语（lower=`$HOME`、upper=`/var/tmp/appclone/audit.<uid>/<app>.<id>/upper`），对账 `paths`/`shared_writes` 得 `verified`/`leak-detected`；没有审计层输出 `unverified`（不是"通过"）。免 root 下 fanotify 需 `CAP_SYS_ADMIN`、eBPF 被 `unprivileged_bpf_disabled` 关、inotify 无 PID——**不做假装能归因的检查**。审计默认关闭（全 `$HOME` 过 overlay 有 copy-up 开销） | 已定 |
@@ -511,3 +514,4 @@ activated / response / idle，地址恒定、注册一次后不再重新赋值�
 | 028 | **GUI 启动的分身与设置窗口解耦**（2026-11-08）：GUI 点「启动」时以**自身二进制 fork 一个会话首进程**（runner，`APPCLONE_GUI_DETACH_*` 环境变量标识），runner 复用 `core.Run`——与 CLI 完全同一条生命周期实现（ADR-020）。关掉设置窗口不再结束正在运行的分身；详情页在运行中把「启动」换成「停止」，停止 = 向 runner 发 `SIGTERM`，由 `core.Run` 的进程组终止链收尾。**不引入 daemon/IPC**（ADR-004 不变）：runner 是一次性进程，不监听、不提供 API；运行态判定仍只看 `run.lock`（ADR-023 不变），新增的 `run.pid`（pid + `/proc/<pid>/stat` 启动时刻）只用于"给正在跑的 runner 发信号"，发送前校验启动时刻防 PID 复用、`run.lock` 拿得到时按 stale 清理。CLI 增 `appclone stop <app> <id>` 共用同一实现 | 已定 |
 | 029 | **「克隆起步」在 run 期做 per-path overlay，不在 add 期复制**（2026-11-08）：`add --fork` 只写 `instance.toml` 的 `fork = true`；每次 `run` 由 `core` 对归一封顶后的每个 `paths` 条目挂一层 `fuse-overlayfs`（lower=宿主真实目录，upper=`<inst>/root/<原路径>`，work/merged 在 `<inst>/.fork/<hash>/`，`hash = sha256(clean abs)[:8]`），merged 只作 bwrap ⑤ 的 bind 源；`shared_writes` 仍排在其后 bind 真实文件。**只对存在、是目录、且非空的 lower 挂载**，空/缺失路径退回普通实例目录。**失败不阻断启动**：fuse 不可用、挂载失败、残留卸不掉都只降级该路径并写 stderr，安全语义（只隔离 `paths`）不变。**残留回收只能按 mountinfo 判断，不能 `stat`**：fuse daemon 已死时 `stat` 返回 `ENOTCONN` 会被误判成"未挂载"，随后 `RemoveAll` 会穿过挂载点遍历 lower、删掉主实例真实数据；顺序固定为"先卸、后删"，卸载失败则保留 `.fork/` 等下轮；mountinfo 的路径是八进制转义过的（空格 = `\040`），比对必须先解码再整串相等，否则 `HOME`/`AC_BASE` 带空格时会漏判 stale。mountinfo 记录的是软链解析后的 d_path，比对还必须同时接受词法路径与 `EvalSymlinks` 结果（挂载点已死时退到最近可解析祖先）；`mounted()` 同步改成 mountinfo-only，探测链路也因此不再在带空格/软链的路径上挂载超时，而挂载轮询另用 `mountLive`（mountinfo + stat）避免把 fuse crash 后的死挂载判成成功。挂载报错但挂载点已生效时不得 `RemoveAll` 工作目录；`resetForkBase` 逐条卸载并在删除前用 `mountUnder` 兜底；删除实例前先做同一清理（失败返回 `err.instance.fork_cleanup` 并拒绝删除）；`upper` 落在 lower 之内时跳过（否则 overlay 递归）；`forkMounts` 每路径前检查停止信号。**语义边界**：lower 是实时数据不是快照；分身与主实例**不得同时使用**同一份应用数据（overlay 对挂载期间 lower 的并发修改不做可见性保证），需要冻结起点须先复制数据（§方案设计 8.1 已写明）。无 root、无 daemon、无特权 | 已定 |
 | 030 | **许可证 = GPL-3.0-or-later**（2026-11-08 用户拍板）：仓库根 `LICENSE` 存 GPLv3 全文，nfpm `license` 字段写 SPDX 标识符；deb 用 DEP-5 `packaging/copyright`（版权人 + or-later），rpm/Arch 用 `/usr/share/licenses/appclone/LICENSE`；`THIRD_PARTY_NOTICES` 汇总静态链接依赖的许可证全文并随包分发。理由：与 GTK/libadwaita 生态一致（puregotk 默认 MIT、libadwaita LGPL，均兼容）；本产品是桌面应用而非嵌入式库，copyleft 更贴合定位；发行版官方仓库与 AUR 要求明确的许可证声明。「core 用 MIT 便于第三方嵌入」的方案作废 | 已定 |
+| 031 | **分发渠道 = GitHub Releases，不提交 AUR**（2026-11-09 用户决定）：Arch 用户取 Releases 里的 `.pkg.tar.zst`（仅 x86_64），Arch Linux ARM 走架构化 `.tar.gz`；ADR-016 中 AUR `appclone-bin` 的承诺据此取消，README 不再出现「AUR 尚未提交」这类待办口吻。理由：维护 AUR 需要账号与持续的 PKGBUILD 同步，当前没有发布到发行版仓库的计划；GitHub Releases 的 8 个上传资产（5 包 + 2 tar.gz + checksums.txt）已是完整可验证的分发面 | 已定 |

@@ -35,7 +35,7 @@ sudo dnf install ./appclone-<version>-1.aarch64.rpm    # Fedora 41+ / RHEL 10
 sudo pacman -U appclone-<version>-1-x86_64.pkg.tar.zst
 ```
 
-Arch Linux ARM 是独立项目，请使用 `.tar.gz`（本仓库只发 x86_64 的 Arch 包；AUR 源码包尚未提交，不要把它当现成安装方式）。
+Arch Linux ARM 是独立项目，请使用 `.tar.gz`（本仓库只发 x86_64 的 Arch 包，不提交 AUR；所有安装包都以 GitHub Releases 为准）。
 
 从源码构建（无需 C 工具链）：
 
