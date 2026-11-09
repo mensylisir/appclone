@@ -9,9 +9,10 @@
 #   - 不开 /dev/uinput 时（CI 的 GitHub runner 就没有），用例直调产品回调：
 #     `SwitchRow.SetActive` 发 notify::active 进 onSwitch，确认按钮与
 #     v.submit() 绑的是同一个处理函数。这验的是"接线"，不是合成点击。
-#   - /dev/uinput 可写时（Wayland 桌面即可，无需 root；ydotool 同款机制），
+#   - Wayland 会话且 /dev/uinput 可写时（无需 root；ydotool 同款机制），
 #     额外跑 TestGtkRealInputUinput：真实触摸点切换器、真实按键输入搜索框，
 #     事件走 libinput → GDK → 控件。窗口在用例期间全屏，结束即恢复。
+#     X11/Xvfb 下不启用：事件进宿主 seat，可能落到别的应用上。
 #
 # 需要可用的显示与宿主 `bwrap`（缺任何一个都直接报错，不要让它跑 45 秒
 # 超时后才发现环境不对）；在假 HOME 下运行（不碰真实主目录），并临时构建
@@ -49,17 +50,45 @@ mkdir -p "$APPCLONE_GTK_ROOT"
 
 # 不引入 cgo；与产品发布形态一致（puregotk 不需要 C 工具链）。
 CGO_ENABLED=0 go build -o "$WORK/appclone" ./cmd/appclone
+# 真实启动/停止用例要 fork 真正的 runner（测试二进制自己会再跑测试，不能当 runner）。
+CGO_ENABLED=0 go build -o "$WORK/appclone-gui" ./cmd/appclone-gui
+export APPCLONE_GTK_GUI_BIN="$WORK/appclone-gui"
 
-# 真实输入注入必须显式开启（APPCLONE_GTK_UINPUT=1），且 /dev/uinput 可写：
-# uinput 事件进入宿主 seat，若闸门跑在 Xvfb/嵌套合成器里，事件到不了测试窗口，
-# 还可能落到宿主应用上。默认关闭，宁可 SKIP 也不冒险；CI 没有 /dev/uinput，
-# 该用例会 SKIP——门禁检查这一行，不允许它静默消失。
+# 真实输入注入必须显式开启（APPCLONE_GTK_UINPUT=1），且当前是 Wayland 会话、
+# /dev/uinput 可写：uinput 事件进入宿主 seat，X11/Xvfb/嵌套合成器里窗口可以
+# 在自己的 server 里 active，事件却落到宿主的其他应用上。默认关闭，宁可 SKIP
+# 也不冒险；CI 没有 /dev/uinput，该用例会 SKIP——门禁检查这一行，不允许它静默消失。
 CALLER_UINPUT="${APPCLONE_GTK_UINPUT:-}"
 UINPUT=0
-if [ "$CALLER_UINPUT" = 1 ] && [ -w /dev/uinput ]; then
-  UINPUT=1
+UINPUT_WHY=""
+if [ "$CALLER_UINPUT" = 1 ]; then
+  if [ -z "${WAYLAND_DISPLAY:-}" ]; then
+    UINPUT_WHY="当前不是 Wayland 会话（X11/Xvfb 下注入可能落到宿主应用）"
+  elif [ -n "${GDK_BACKEND:-}" ] && [ "${GDK_BACKEND#*wayland}" = "$GDK_BACKEND" ]; then
+    # WAYLAND_DISPLAY 可能从宿主继承（例如在 Wayland 桌面里套 xvfb-run），
+    # 显式 GDK_BACKEND 才是真正的后端选择。
+    UINPUT_WHY="GDK_BACKEND=$GDK_BACKEND 强制了非 Wayland 后端"
+  elif [ "${WAYLAND_DISPLAY#/}" = "$WAYLAND_DISPLAY" ] && [ -z "${XDG_RUNTIME_DIR:-}" ]; then
+    UINPUT_WHY="XDG_RUNTIME_DIR 未设置，无法定位 Wayland socket"
+  elif [ ! -w /dev/uinput ]; then
+    UINPUT_WHY="/dev/uinput 不可写"
+  else
+    UINPUT=1
+  fi
 fi
 export APPCLONE_GTK_UINPUT="$UINPUT"
+
+if [ "$UINPUT" = 1 ]; then
+  # 用例会把 XDG_RUNTIME_DIR 指到假 HOME 下（隔离应用 socket），GDK 的 Wayland
+  # 后端却按 XDG_RUNTIME_DIR 解析 WAYLAND_DISPLAY。这里先固化成绝对 socket
+  # 路径，并强制 Wayland 后端：真实注入验的必须是产品主目标的原生路径，而不是
+  # 依赖 XWayland 的转发。
+  case "${WAYLAND_DISPLAY:-}" in
+    /*) : ;;
+    *) WAYLAND_DISPLAY="${XDG_RUNTIME_DIR:-}/$WAYLAND_DISPLAY" ;;
+  esac
+  export WAYLAND_DISPLAY GDK_BACKEND=wayland
+fi
 
 # -tags gtk_e2e：测试文件带构建标签，默认 go test 不编译它（puregotk 在 init
 # 阶段 dlopen GTK，没有 GTK 运行库的机器会在 init panic 而不是 skip）。
@@ -82,8 +111,9 @@ for name in TestGtkScreensLifecycle TestGtkLandsOnClonesView TestGtkEmptyStateMa
             TestGtkForkDisabledWhenDegraded TestGtkAppIconFallback \
             TestGtkDialogResponses TestGtkCloseSwitchDialog \
             TestDetachedRunnerSpawn \
-            TestDetachLogHelpers TestDetachedTargetEnv TestGtkRealInputUinput; do
-  if [ "$name" = TestGtkRealInputUinput ] && [ "$UINPUT" != 1 ]; then
+            TestDetachLogHelpers TestDetachedTargetEnv TestGtkRealInputUinput \
+            TestGtkRealInputStartStop; do
+  if { [ "$name" = TestGtkRealInputUinput ] || [ "$name" = TestGtkRealInputStartStop ]; } && [ "$UINPUT" != 1 ]; then
     continue
   fi
   if ! grep -q -- "--- PASS: $name" "$LOG"; then
@@ -92,14 +122,16 @@ for name in TestGtkScreensLifecycle TestGtkLandsOnClonesView TestGtkEmptyStateMa
   fi
 done
 if [ "$UINPUT" != 1 ]; then
-  if ! grep -q -- "--- SKIP: TestGtkRealInputUinput" "$LOG"; then
-    echo "guitest-gtk: /dev/uinput 不可写，但也没看到 TestGtkRealInputUinput 的 SKIP" >&2
-    exit 5
-  fi
+  for name in TestGtkRealInputUinput TestGtkRealInputStartStop; do
+    if ! grep -q -- "--- SKIP: $name" "$LOG"; then
+      echo "guitest-gtk: 真实注入未启用，但也没看到 $name 的 SKIP" >&2
+      exit 5
+    fi
+  done
   if [ "$CALLER_UINPUT" = 0 ]; then
     echo "guitest-gtk: 调用者显式关闭真实注入（APPCLONE_GTK_UINPUT=0），用例 SKIP" >&2
   elif [ "$CALLER_UINPUT" = 1 ]; then
-    echo "guitest-gtk: 已请求真实注入但 /dev/uinput 不可写，用例 SKIP" >&2
+    echo "guitest-gtk: 已请求真实注入但未启用：$UINPUT_WHY，用例 SKIP" >&2
   else
     echo "guitest-gtk: 未设置 APPCLONE_GTK_UINPUT=1（真实注入默认关闭），用例 SKIP" >&2
   fi

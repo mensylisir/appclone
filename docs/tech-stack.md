@@ -169,8 +169,11 @@ puregotk 自称 experimental，所以**不允许"边写产品边试"**。第一�
   无 `init` 符号缺失 panic；**未覆盖三屏本身**——S0 验的是"绑定在 1.5 上可用"。
   三屏 v1 已落地（`cmd/appclone-gui/`，2026-11-08），在 1.5 上的控件子集未再加测；
   GTK 侧回归闸门已建立（`design/guitest-gtk.sh`：列表 → 确认 → 创建 → 详情 → 返回，
-  以及首屏落点、空态映射、探测中取消/失败/可重试错误态、快速重推竞态、降级/致命横幅、en 文案、运行中停止按钮、detached runner 派生、run.log 封顶与清洗、runner 标记分流十三条用例），
-  删除/重命名/关闭开关对话框与真实指针/键盘注入仍无自动化（见 `STATUS.md` 与 `NEXT.md` "被挡住的"）。
+  以及首屏落点、空态映射、探测中取消/失败/可重试错误态、快速重推竞态、降级/致命横幅、en 文案、
+  运行中停止按钮、克隆开关持久化/降级禁用、图标回退、重命名/删除/关闭开关对话框响应、
+  detached runner 派生、run.log 封顶与清洗、runner 标记分流、真实触摸/键盘注入、
+  真实点击启动/停止共 **20 条**用例；默认 `go test ./...` 不编译，闸门逐条核对 PASS，
+  真实注入用例在无 `/dev/uinput` 的 CI 上按预期 SKIP 且被门禁显式检查）。
 
 ### 4.4 版本门槛与一条必须承认的边界
 
@@ -436,10 +439,22 @@ activated / response / idle，地址恒定、注册一次后不再重新赋值�
   缺了不影响 SVG 按路径加载。
 
   `postremove` 负责卸载回收：只删带 `# appclone-owned:` 标记的 `/etc/apparmor.d/bwrap`——postinstall
-  只在目标不存在时复制，同名文件若被发行版/其他包替换，标记消失，一律不碰。删除前先
-  `apparmor_parser -R` 卸掉内核里的 profile；卸载失败就保留文件并退 0（包删除不能失败，残留的
-  unconfined profile 不影响系统）。deb `postrm`、rpm `%postun`、Arch `.INSTALL` 的 `post_remove`
-  三种钩子都必须带上。
+  在目标不存在时安装；目标存在且无标记、内容又与旧版模板逐字节一致时补写标记（v1.0.0 迁移）；
+  其余同名文件（发行版/其他包）一律不碰。删除前先
+  `apparmor_parser -R` 卸掉内核里的 profile（best-effort），**无论卸载是否成功都删除文件**并退 0：
+  包已删除却留下一个自称 appclone 所有的 profile，既没有归属者，又会让下一次安装误以为目标已存在而
+  跳过安装；parser 失败最多让内核里多一条 unconfined profile，不影响系统，重装在 postinstall 的
+  `parser -r` 会再覆盖。deb `postrm`、rpm `%postun`、Arch `.INSTALL` 的 `post_remove` 三种钩子都必须带上；
+  deb 的 `postrm` 在 upgrade 时也会被调用（参数为 `upgrade`），rpm `%postun` 在升级时参数为 `1`，
+  这两处必须在升级分支早退，否则升级过程中会把正在使用的 profile 删掉；Arch 的 `post_remove`
+  只在 `newpkg == NULL` 时执行并收到旧版本号，脚本里的参数守卫对 Arch 是防御性死代码（保留无害）。
+  pacman 升级只跑 `post_upgrade`，不会重跑
+  `post_install`，因此迁移逻辑还要经 nfpm 的 `archlinux.scripts.postupgrade` 接到同一条脚本
+  （顶层 `scripts.postinstall` 在 Arch 包里只生成 `post_install`）。
+  **v1.0.0 → 1.0.1 迁移**：v1.0.0 安装的 profile 没有标记行，postremove 认不出、永远不会回收。
+  postinstall 在目标已存在且无标记时，比较"目标内容"与"模板去掉标记行后的内容"：逐字节一致说明它
+  就是旧版 appclone 写的，用带标记的模板覆盖（策略内容不变，不需要 reload）；内容不同则不碰
+  （发行版或其他包的文件）。
 
   **落地状态（2026-11-08，卸载回收 2026-11-09）**：`packaging/nfpm.yaml` + `packaging/postinstall.sh` +
   `packaging/postremove.sh` + 桌面入口/图标/`bwrap.apparmor` 已在仓库；`.github/workflows/ci.yml`（Go 门禁、HTML 闸门、amd64/arm64 GTK 闸门）
@@ -501,7 +516,7 @@ activated / response / idle，地址恒定、注册一次后不再重新赋值�
 | 013 | GUI 三屏全部用 libadwaita 原生控件（SwitchRow/ActionRow/AlertDialog/Toast/StatusPage）；`design/appclone-gui.html` 是交互基线**不是视觉基线**，冲突时以原生为准（裁决表见 §4.6） | 已定 |
 | 014 | 不引入 GSettings schema：GUI 偏好写 `~/.local/share/appclone/ui.toml`（单二进制分发无法安装 schema 并编译） | 已定 |
 | 015 | v1 **不做 Flatpak 分发**：GUI 需宿主全可见 + 在宿主 namespace 起 bwrap，与沙箱模型冲突；走发行版包 + Releases | 已定 |
-| 016 | **操作系统 = 只 Linux；CPU 架构 = amd64 + arm64 一等公民**（bwrap 只存在于 Linux，macOS/Windows 属另一套机制，不是待办；arm64 的可行性由 purego Tier 1 覆盖 linux/arm64 保证，但必须用 `ubuntu-24.04-arm` runner 实跑冒烟才算验证）。分发产物四件：`.deb`（Ubuntu 24.04+/Debian 13+）、`.rpm`（Fedora 41+ / CentOS Stream 10 / RHEL 10；openSUSE 需另建 spec，v1 不承诺）、`.pkg.tar.zst`（Arch；原 AUR `appclone-bin` 部分已由 ADR-031 取消）、裸 `.tar.gz` 兜底；三种包格式由 **nfpm 一份配置**产出（`.tar.gz` 由同源清单另打 tar），依赖**写死版本下限**。**Ubuntu 24.04+ 的 AppArmor userns 限制必须由 postinstall 安装 `/etc/apparmor.d/bwrap` 解决**（否则 bwrap 建 userns 被拒，见 §6）；卸载时 postremove 只回收带 `appclone-owned:` 标记的那份（先卸 profile，失败保留），不碰发行版同名文件。Flatpak 见 ADR-015；Snap / AppImage / COPR / PPA 不做 | 已定 |
+| 016 | **操作系统 = 只 Linux；CPU 架构 = amd64 + arm64 一等公民**（bwrap 只存在于 Linux，macOS/Windows 属另一套机制，不是待办；arm64 的可行性由 purego Tier 1 覆盖 linux/arm64 保证，但必须用 `ubuntu-24.04-arm` runner 实跑冒烟才算验证）。分发产物四件：`.deb`（Ubuntu 24.04+/Debian 13+）、`.rpm`（Fedora 41+ / CentOS Stream 10 / RHEL 10；openSUSE 需另建 spec，v1 不承诺）、`.pkg.tar.zst`（Arch；原 AUR `appclone-bin` 部分已由 ADR-031 取消）、裸 `.tar.gz` 兜底；三种包格式由 **nfpm 一份配置**产出（`.tar.gz` 由同源清单另打 tar），依赖**写死版本下限**。**Ubuntu 24.04+ 的 AppArmor userns 限制必须由 postinstall 安装 `/etc/apparmor.d/bwrap` 解决**（否则 bwrap 建 userns 被拒，见 §6）；卸载时 postremove 只回收带 `appclone-owned:` 标记的那份（先卸 profile；parser 失败也删文件，避免留下无主 unconfined profile），不碰发行版同名文件；v1.0.0 的无标记文件由 postinstall 在 deb/rpm 升级与 Arch `post_upgrade` 时按内容比对补写标记。Flatpak 见 ADR-015；Snap / AppImage / COPR / PPA 不做 | 已定 |
 | 017 | **GUI 版本门槛下调为 libadwaita ≥ 1.5 / GTK ≥ 4.14**（原 1.6/4.16 是按控件清单正推，会排除 Ubuntu 24.04 LTS = 1.5.0 / 4.14.2）。代价：弃用 1.6 才有的 `AdwSpinner`，进度改 `GtkSpinner`。生效前提 = S0 第 5 条（Ubuntu 24.04 环境实跑通过）；该条不过则本结论作废，回到 1.6/4.16 | 已定 |
 | 018 | **探测期的隔离契约**（三条，缺一条就出事）：① XDG 公共目录、`AC_BASE`、`shared_writes` 必须在 overlay 之上 bind 回**真实**目录——否则用户在探测会话里存的文件落在 upper，探测结束删 upper 等于删用户文件；② 探测期**不看档案、强制隔离单例**（私有 runtime + 私有 DBus + L0 空锁文件），否则主实例在跑时应用转发参数后退出，探测零写入；③ 探测前扫进程挡住"应用还开着"，不给"仍然继续" | 已定 |
 | 019 | **`doctor --verify` 只在有运行期审计层时下结论**：`run --audit` 复用探测的 overlay 原语（lower=`$HOME`、upper=`/var/tmp/appclone/audit.<uid>/<app>.<id>/upper`），对账 `paths`/`shared_writes` 得 `verified`/`leak-detected`；没有审计层输出 `unverified`（不是"通过"）。免 root 下 fanotify 需 `CAP_SYS_ADMIN`、eBPF 被 `unprivileged_bpf_disabled` 关、inotify 无 PID——**不做假装能归因的检查**。审计默认关闭（全 `$HOME` 过 overlay 有 copy-up 开销） | 已定 |

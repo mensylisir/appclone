@@ -56,6 +56,15 @@ overrides:
       - desktop-file-utils
       - glib2
 
+# Arch 专属钩子必须放在顶层 archlinux，不能放进 overrides（overrides 的
+# scripts 是通用 Scripts，没有 postupgrade 字段）。pacman 升级时只跑
+# post_upgrade，不会重跑 post_install；不接这条，v1.0.0 装的「无标记」
+# /etc/apparmor.d/bwrap 在 Arch 升级后仍无法被 postremove 回收。
+# 脚本本身按目标状态幂等，无需区分安装/升级。
+archlinux:
+  scripts:
+    postupgrade: packaging/postinstall.sh
+
 contents:
   - src: dist/stage/appclone
     dst: /usr/bin/appclone

@@ -687,8 +687,12 @@ HTML、GTK amd64、GTK arm64 五个 job 全部成功（1m 0s / 51s / 42s / 1m 15
 
 2. **自动化覆盖已补齐**（2026-11-09）：真实指针/键盘由 `TestGtkRealInputUinput` 覆盖——
    `/dev/uinput` 创建虚拟触摸屏/键盘（Wayland 原生、无需 root），触摸点切换器双向、点击聚焦
-   搜索框、按键过滤与退格恢复；每次注入前复查窗口焦点。CI runner 无 `/dev/uinput` 时该用例
-   按预期 SKIP（门禁会检查 SKIP 行）。Esc 已由 `SetPopOnEscape(false)` 结构性收口。
+   搜索框、按键过滤与退格恢复；每次注入前复查窗口焦点。第二十条 `TestGtkRealInputStartStop`
+   用真实触摸点击「启动/停止」，走 detached runner → `core.Run` → `run.lock` → `core.StopRun`
+   完整链路（被测 Exec 为假 HOME 里的 `sleep 30` 脚本），确认框经 `dialogHook` 交出、测试以同一
+   `dialogFn` 投递 `stop`；本机 5/5 PASS、一次点击即出框，`design/guitest-gtk.sh` 20 条全过。
+   CI runner 无 `/dev/uinput` 时两条用例按预期 SKIP（门禁会检查 SKIP 行）。Esc 已由
+   `SetPopOnEscape(false)` 结构性收口。
    **AUR 按用户决定不做**（2026-11-09）——只维护 GitHub Releases。
 
 3. **CI #18 的一次性 job 取消已核对，不改 workflow**：packages job 在 `actions/setup-go`
@@ -736,7 +740,9 @@ HTML、GTK amd64、GTK arm64 五个 job 全部成功（1m 0s / 51s / 42s / 1m 15
   或把三屏的纯逻辑状态机从 GTK 里抽出来做无显示测试。不需要输入的 GTK 生命周期已由
   `design/navspike`（导航页 Unref 时机）与 `design/guitest-gtk.sh`（列表 → 确认 → 创建 →
   详情 → 返回 + 三屏四态/横幅/en 文案）覆盖；**未覆盖部分**（第四十一轮前的删除/重命名/关闭开关对话框；
-  真实指针/键盘注入）仍不能声称已验证。
+  真实指针/键盘注入）在写下时不能声称已验证。**2026-11-09 已解除**：删除/重命名/关闭开关
+  对话框经 `dialogHook` 覆盖，真实输入由 `TestGtkRealInputUinput` 与 `TestGtkRealInputStartStop`
+  覆盖（Wayland + 显式 `APPCLONE_GTK_UINPUT=1`），本条仅保留当时的环境限制记录。
 - 复现命令（broadway 冒烟，假 HOME）：`gtk4-broadwayd -p 8095 :5` +
   `GDK_BACKEND=broadway BROADWAY_DISPLAY=:5 HOME=<fake> AC_BASE=<fake>/xdg/appclone ./appclone-gui`，
   浏览器打开 `http://127.0.0.1:8095/`（注意 `XDG_RUNTIME_DIR` 必须是 broadwayd 所在的那个，
@@ -750,6 +756,35 @@ HTML、GTK amd64、GTK arm64 五个 job 全部成功（1m 0s / 51s / 42s / 1m 15
 
 ## 最近完成
 
+- 2026-11-09 **真实点击启动/停止 + v1.0.0 升级回收 + 跨发行版/性能证据**：
+  ① 新增第二十条 GTK 用例 `TestGtkRealInputStartStop`：uinput 虚拟触摸屏真实点击详情页
+  「启动」与「停止」，事件经 libinput → GDK → 按钮，走 detached runner → `core.Run` →
+  `run.lock` → `core.StopRun` 全链路；被测 Exec 是假 HOME 里的 `keepalive.sh`（写自己的配置后
+  `sleep 30`），失败也由 defer `StopRun` 收尾。确认框经 `dialogHook` 交出并断言默认响应 `cancel`，
+  测试用同一个 `u.cb.dialogFn` 投递 `stop`。本机单次约 2.8s、连续 **5/5 PASS**（每次 1 次点击
+  即出框），`APPCLONE_GTK_UINPUT=1 design/guitest-gtk.sh` **20 条全过 / 退出码 0**。
+  真实输入门禁在本轮收紧为 Wayland 原生：`APPCLONE_GTK_UINPUT=1` 时脚本强制
+  `GDK_BACKEND=wayland` 并把 `WAYLAND_DISPLAY` 转成绝对路径（用例把
+  `XDG_RUNTIME_DIR` 指向假 HOME），用例内再用 GDK display name 复核，且检查先于
+  首次校准点击；完整闸门在本机连续 5/5、20 条全过。用例还断言应用写出的 `state`
+  只落在实例根、宿主假 HOME 无该文件（只查存在性）。顺带修掉 `TestGtkRapidRepush`
+  的 X11 时序假设：第二页可见时探测可能已完成到 error，断言改为「新 view + 可见 +
+  进入 probing/confirm/error 之一」，固定 tag 回归仍由 `second != first` 与可见性钉住。
+  调试中确认产品侧 `clickedFn` 每次都执行、确认框在点击后约 52ms 已交给测试；此前的失败是
+  测试自己把对话框塞回通道、继续补点并最终走到临时「直接调用处理器」诊断分支造成的假阴性，
+  把对话框塞回通道的诊断分支与「直接调用处理器」旁路已删除；落点重试（最多两次）保留。② `postinstall` 增加 v1.0.0 无标记 profile 迁移：只在目标内容与
+  模板去掉标记行后逐字节一致时补写标记；`postremove` 改为 `apparmor_parser -R` best-effort 后
+  **无论成败都删文件**；同时把 deb `postrm` upgrade 参数、rpm `%postun` 参数 1、Arch
+  `post_remove` 仅在 `newpkg==NULL` 时执行的语义写进注释与 ADR-016；nfpm 顶层
+  `archlinux.scripts.postupgrade` 接同一迁移脚本（pacman 升级只跑 `post_upgrade`），
+  重出包后解包确认 `.INSTALL` 含 `post_install`/`post_upgrade`/`post_remove` 三段。`ubuntu:24.04` 容器真
+  `dpkg` 实测 `0.0.0~test`（无标记）→ 升级 `0.0.0~test2` → `dpkg -r` 后文件被回收
+  （`DPKG-UPGRADE-RECLAIM PASS`），异内容无标记文件两侧都不碰。③ 跨发行版冒烟（假 HOME，
+  每环境 3 轮 add→run→list→rm，检查宿主零污染、公共目录共享可见）：Arch 宿主、Fedora 41、
+  Arch 容器、Ubuntu 24.04 容器全部 3/3 通过。④ 性能基线（本机，假 HOME）：`BuildBwrapArgs`
+  约 1.70ms/op（约 4874 次分配，主要花在 `EvalSymlinks`）、`LoadProfile` 约 36.7µs、
+  `ListInstances(100)` 约 1.91ms；CLI 20 次 p50：`version` 3.3ms、`list --json` 27.0ms、
+  `run` 110.5ms、`doctor --json` 5.9ms。新增 `core/bench_test.go` 固化前两项基准。
 - 2026-11-09 **真实指针/键盘注入 + 卸载回收 AppArmor profile**：① `TestGtkRealInputUinput`
   用 `/dev/uinput` 创建虚拟触摸屏/键盘（与 ydotool 同机制，Wayland 会话原生可用、无需 root），
   事件经 libinput → GDK → 控件；覆盖视图切换器左右标签的触摸点击（双向）、触摸聚焦搜索框、
@@ -763,7 +798,7 @@ HTML、GTK amd64、GTK arm64 五个 job 全部成功（1m 0s / 51s / 42s / 1m 15
   返回，按规则记录为阻塞；改用本机 Codex 只读审查（`codex exec review --uncommitted`），
   提出 1 P1（门禁强制开启注入、覆盖调用者显式关闭）+ 2 P2（连发按键间不复查焦点、
   键盘布局假设），三条均已修复并复跑门禁。② `packaging/postremove.sh`：只删带
-  `appclone-owned:` 标记的 `/etc/apparmor.d/bwrap`，先 `apparmor_parser -R`，失败保留；
+  `appclone-owned:` 标记的 `/etc/apparmor.d/bwrap`，先 `apparmor_parser -R`，失败保留（**同日已改为失败也删文件**，见上一条与本轮记录）；
   deb/rpm/Arch 三种包均带钩子（deb `postrm`、rpm 脚本、Arch `.INSTALL` 的 `post_remove`）。
   bwrap 矩阵八种情况全过（含 rpm/deb 升级参数守卫），`ubuntu:24.04` 容器里 `dpkg -r` 实测自己的文件删除、无标记文件保留；`dpkg -i` 跨版本升级时文件保留。
 - 2026-11-09 **v1.0.0 发布与 CI #18 事件核对**：`v1.0.0` tag（指向 `9e0cf6f`）触发 Release #1，
@@ -798,7 +833,8 @@ HTML、GTK amd64、GTK arm64 五个 job 全部成功（1m 0s / 51s / 42s / 1m 15
   其余页什么都不做；对话框/搜索框仍按各自控件语义消费 Esc），Alt+← / 鼠标返回键 /
   触摸手势仍由 nav 原生处理。`TestGtkScreensLifecycle` 新增 `GetPopOnEscape()==false` 断言；
   `gofmt`/`go vet`/`go test ./...`、`design/guitest-gtk.sh` **18/18 / 退出码 0**、
-  HTML 62/62。仍不可做真实指针/键盘注入（本机 XTEST 被禁），但语义不再依赖事件顺序。
+  HTML 62/62。该轮写下时本机 XTEST 被禁、尚不能做真实指针/键盘注入；同日随后的
+  `/dev/uinput` 用例（第十九、二十条）已补上真实触摸/键盘与真实点击启动/停止，语义仍不依赖事件顺序。
 - 2026-11-08 **许可证定为 GPL-3.0-or-later（ADR-030）**：仓库根新增 `LICENSE`（GNU GPLv3 全文，
   取自 gnu.org，与本机 `/usr/share/automake-1.19/COPYING`、`/usr/share/R/licenses/GPL-3` **逐字节一致**，
   sha256 `3972dc…`；与 SPDX 副本只差 `(C)`/`©` 与 why-not-lgpl 链接写法）；另增 `packaging/copyright`

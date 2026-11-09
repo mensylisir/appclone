@@ -1058,14 +1058,22 @@ func TestGtkRapidRepush(t *testing.T) {
 					fail("重推后 activeSetup 为空")
 					return false
 				}
+				if second == first {
+					fail("重推复用了正在退场的旧页面")
+					return false
+				}
 				step++
 			case 2:
 				// 第二页必须真的成为可见页；旧实现（固定 tag）在这里永远等不到。
+				// 探测完成得快时，可见的瞬间可能已是 confirm/error（假应用不写盘
+				// 就是 error），所以只要求它进入某个真实构建出来的状态。
 				if !visibleIsPage(u, second.page) {
 					return true
 				}
-				if second.state != "probing" {
-					fail("重推的页面状态不对：%q", second.state)
+				switch second.state {
+				case "probing", "confirm", "error":
+				default:
+					fail("重推的页面没有进入有效状态：%q", second.state)
 					return false
 				}
 				gobject.SignalEmitByName(&second.cancelBtn.Widget.Object, "clicked")
