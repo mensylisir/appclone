@@ -796,8 +796,21 @@ HTML、GTK amd64、GTK arm64 五个 job 全部成功（1m 0s / 51s / 42s / 1m 15
   真机 `setpriv --no-new-privs` 下直接 panic 退出 2；改成 TTL 后复验无 panic。第三轮复审 **APPROVED**（P2-1/P2-2 闭环、无新 P0/P1）；其三条 P3 也一并处理：
   `quarantinePendingAudit` 识别 `dstComplete`、verified 收尾改用"补权限再删"、`legacyTmpRoot` 标注不可并行。
   另清掉异常退出（含那次自死锁 panic）留在 `/tmp` 的 `appclone-fusesmoke-*`：每次冒烟前只清本 uid、
-  停手 10 分钟以上的目录。**CI 状态未核**（2026-11-10 提交 `ce12a31`/`db8d891` 后）：浏览器扩展未连接、
-  本机无 `gh`、GitHub API 403，读不到 Actions；本地门禁已全部通过，待浏览器可用时补记 run 号。
+  停手 10 分钟以上的目录。**CI 已核**（2026-11-10 run #31 / `4674ee1`）：五个 job 全绿
+  （Go 43s / packages 48s / HTML 32s / GTK amd64 38s / GTK arm64 49s，总 56s）。此前
+  run #28/#30 红在两个环境假设上并已修复：① 清扫用注入的 `Env.UID`（单测固定 1000）判目录属主，
+  GitHub runner 的 uid 不是 1000，于是把本进程残留全当别人的跳过 → 改用 `os.Getuid()`，
+  并补 `TestSweepOwnershipUsesProcessUID` / `TestAuditSweepOwnershipUsesProcessUID`（故意把
+  `e.UID` 设成错值，本机 uid=1000 也能暴露）+ `TestDirOwnedByRejectsForeignOwner` 负向边界；
+  ② packages job 仍按 ADR-032 之前的 `Recommends` 断言 `fuse-overlayfs`/`strace`，改为 `Depends`。
+  **依赖声明按三种格式逐项上锁**（用户指出不能只看 deb）：packages job 现对 deb `Depends`、
+  rpm `Requires`、Arch `.PKGINFO depend` 逐条断言完整硬依赖（GTK4/libadwaita/bubblewrap/
+  desktop-file-utils/glib2/fuse-overlayfs/strace）。**容器实装**：Ubuntu 24.04
+  `apt-get install ./appclone_0.0.0_amd64.deb` 退出 0，`fuse-overlayfs 1.13` / `strace 6.8` /
+  bubblewrap / libgtk-4-1 / libadwaita-1-0 / libglib2.0-bin 随包自动装入；Arch `pacman -U`
+  退出 0，`fuse-overlayfs 1.18` / `strace 7.3` / bubblewrap / gtk4 / libadwaita / glib2
+  自动装入；Fedora 41 `dnf install --assumeno`（base 仓库）把 `fuse-overlayfs 1.13` /
+  `strace 6.10` 解析进 “Installing dependencies”（该镜像 openh264 元数据源不可达，只验证解析）。
 - 2026-11-10 **长稳 / 内存稳定性证据（60 分钟 Wayland + CLI 100 轮）**：新增
   `cmd/appclone-gui/soak_test.go`（`TestGtkSoakRenderList`，默认 SKIP，需
   `APPCLONE_GTK_SOAK_MIN`）与 `design/soak.sh`（手动或发版前跑，不进 CI）。

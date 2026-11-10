@@ -106,6 +106,8 @@ jobs:
           ar p dist/pkg/appclone_0.0.0_amd64.deb control.tar.gz | tar -xzO ./control > /tmp/control
           grep -qx 'Architecture: amd64' /tmp/control
           grep -qx 'License: GPL-3.0-or-later' /tmp/control
+          grep -q '^Depends: .*libgtk-4-1 (>= 4.14)' /tmp/control
+          grep -q '^Depends: .*libadwaita-1-0 (>= 1.5)' /tmp/control
           grep -q '^Depends: .*bubblewrap' /tmp/control
           grep -q '^Depends: .*desktop-file-utils' /tmp/control
           grep -q '^Depends: .*libglib2.0-bin' /tmp/control
@@ -139,6 +141,18 @@ jobs:
           rpm -qp --qf '%{LICENSE}\n' "$rpm_pkg" | grep -qx 'GPL-3.0-or-later'
           rpm -qlp "$rpm_pkg" | grep -qx '/usr/share/licenses/appclone/LICENSE'
           rpm -qlp "$rpm_pkg" | grep -qx '/usr/share/licenses/appclone/THIRD_PARTY_NOTICES'
+          # 硬依赖必须三种格式都声明齐：rpm 看 Requires（rpm -qpR 逐行一条）。
+          rpm -qpR "$rpm_pkg" > /tmp/rpmreq
+          for d in 'gtk4 >= 4.14' 'libadwaita >= 1.5' bubblewrap desktop-file-utils \
+                   glib2 fuse-overlayfs strace; do
+            grep -qxF "$d" /tmp/rpmreq || { echo "::error::rpm 缺少依赖 $d"; exit 1; }
+          done
+          # Arch 看 .PKGINFO 的 depend =（版本约束写成 dep>=ver）。
+          bsdtar -xOf "$arch_pkg" .PKGINFO | grep '^depend = ' > /tmp/archdeps
+          for d in 'gtk4>=4.14' 'libadwaita>=1.5' bubblewrap desktop-file-utils \
+                   glib2 fuse-overlayfs strace; do
+            grep -qxF "depend = $d" /tmp/archdeps || { echo "::error::Arch 缺少依赖 $d"; exit 1; }
+          done
 
   html:
     name: GUI 设计稿交互回归（62 项）

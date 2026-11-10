@@ -761,11 +761,14 @@ func TestSweepStaleProbesQuarantinesUnreadableUpper(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() {
-		for _, q := range quarantineDirs(t, e) {
-			_ = filepath.WalkDir(q, func(p string, _ os.DirEntry, _ error) error {
-				return os.Chmod(p, 0o700)
-			})
-		}
+		// 清扫再次回退时 000 现场会留在写层根：失败路径也要能清掉 TempDir，
+		// 否则真正的失败原因会被 RemoveAll 的权限错误盖住。
+		_ = filepath.WalkDir(e.TmpRoot, func(p string, d os.DirEntry, err error) error {
+			if err == nil && d.IsDir() {
+				_ = os.Chmod(p, 0o700)
+			}
+			return nil
+		})
 	})
 
 	if err := e.sweepStaleProbes(); err != nil {
@@ -814,13 +817,37 @@ func TestSweepOwnershipUsesProcessUID(t *testing.T) {
 	e := probeEnv(t)
 	e.UID = os.Getuid() + 1
 	d := filepath.Join(e.TmpRoot, fmt.Sprintf("appclone-probe-%d-own", e.UID))
-	if err := os.MkdirAll(filepath.Join(d, "upper"), 0o700); err != nil {
+	upper := filepath.Join(d, "upper")
+	if err := os.MkdirAll(upper, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	// 非空 upper 才会走 quarantine 分支；空目录走 RemoveAll。两条都要按真实
+	// 属主判定，错配时不能把本进程的残留当成别人的跳过。
+	if err := os.WriteFile(filepath.Join(upper, "evidence"), []byte("user data"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if err := e.sweepStaleProbes(); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := os.Stat(d); !os.IsNotExist(err) {
-		t.Fatalf("本进程留下的空残留应按真实 uid 判定属主并清走：%v", err)
+		t.Fatalf("本进程留下的残留应按真实 uid 判定属主并搬走：%v", err)
+	}
+	qs := quarantineDirs(t, e)
+	if len(qs) != 1 {
+		t.Fatalf("应留下 1 个 quarantine，得到 %v", qs)
+	}
+	if _, err := os.Stat(filepath.Join(qs[0], "upper", "evidence")); err != nil {
+		t.Fatalf("quarantine 里应保留原 upper 文件：%v", err)
+	}
+}
+
+// 负向边界：属主不是本进程的目录必须跳过，不能被当成残留处理。
+func TestDirOwnedByRejectsForeignOwner(t *testing.T) {
+	root := t.TempDir()
+	if dirOwnedBy(root, os.Getuid()+1) {
+		t.Fatal("属主判断不能把别人的目录当成自己的")
+	}
+	if !dirOwnedBy(root, os.Getuid()) {
+		t.Fatal("本进程的目录应被认作自己的")
 	}
 }

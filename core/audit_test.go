@@ -279,6 +279,16 @@ func TestAuditSweepQuarantinesUnreadableUpper(t *testing.T) {
 	if err := os.Chmod(sub, 0o000); err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() {
+		// 清扫回退时 000 现场仍会留在写层根；先补权再让 t.TempDir 清理，
+		// 免得真正的失败原因被 RemoveAll 的权限错误盖住。
+		_ = filepath.WalkDir(e.TmpRoot, func(p string, d os.DirEntry, err error) error {
+			if err == nil && d.IsDir() {
+				_ = os.Chmod(p, 0o700)
+			}
+			return nil
+		})
+	})
 
 	if err := e.sweepStaleAudits(); err != nil {
 		t.Fatalf("读失败不应让清扫报环境错误（它应改为保留）：%v", err)
