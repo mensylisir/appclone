@@ -869,8 +869,9 @@ func TestDirOwnedByRejectsForeignOwner(t *testing.T) {
 }
 
 // chmodTestTree 在失败路径上补回目录权限，保证 t.TempDir 能清理。
-// 只允许遍历测试临时目录（Go 的 t.TempDir 路径含 /Test 前缀），避免这段
-// cleanup 被复用到真实 /tmp 时批量修改宿主目录权限。
+// 只允许遍历测试临时目录：当前 Go 的 t.TempDir 路径含 /Test（实现约定，
+// 不是 API 保证），且调用方只传 probeEnv 的 TmpRoot。避免这段 cleanup 被
+// 复用到真实 /tmp 时批量修改宿主目录权限。
 func chmodTestTree(t *testing.T, root string) {
 	t.Helper()
 	if !strings.Contains(root, string(os.PathSeparator)+"Test") {
