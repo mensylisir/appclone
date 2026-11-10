@@ -795,6 +795,9 @@ HTML、GTK amd64、GTK arm64 五个 job 全部成功（1m 0s / 51s / 42s / 1m 15
   **自查抓到并修掉一个自引入的死锁**：最初在 `Mount` 失败里清冒烟缓存，而 `Available` 持锁调用冒烟，
   真机 `setpriv --no-new-privs` 下直接 panic 退出 2；改成 TTL 后复验无 panic。第三轮复审 **APPROVED**（P2-1/P2-2 闭环、无新 P0/P1）；其三条 P3 也一并处理：
   `quarantinePendingAudit` 识别 `dstComplete`、verified 收尾改用"补权限再删"、`legacyTmpRoot` 标注不可并行。
+  另清掉异常退出（含那次自死锁 panic）留在 `/tmp` 的 `appclone-fusesmoke-*`：每次冒烟前只清本 uid、
+  停手 10 分钟以上的目录。**CI 状态未核**（2026-11-10 提交 `ce12a31`/`db8d891` 后）：浏览器扩展未连接、
+  本机无 `gh`、GitHub API 403，读不到 Actions；本地门禁已全部通过，待浏览器可用时补记 run 号。
 - 2026-11-10 **长稳 / 内存稳定性证据（60 分钟 Wayland + CLI 100 轮）**：新增
   `cmd/appclone-gui/soak_test.go`（`TestGtkSoakRenderList`，默认 SKIP，需
   `APPCLONE_GTK_SOAK_MIN`）与 `design/soak.sh`（手动或发版前跑，不进 CI）。
