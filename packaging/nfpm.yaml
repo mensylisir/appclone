@@ -18,6 +18,9 @@ description: |
   为任意 Linux 应用再开一个分身（只隔离它自己的数据）。
   bubblewrap 实现 per-app 沙箱；公共文件与桌面会话照常共享；GUI 与 CLI 共用同一份
   core 与实例目录。无需 root、无 daemon。
+# 硬依赖清单是安装契约：新增/删除下面任一 depends 条目（含 overrides 里的
+# 三份）时必须同步 .github/workflows/ci.yml 的 packages job——它按三种格式
+# 逐项断言这份清单，漏改会让包元数据与门禁脱节。
 depends:
   - bubblewrap
 

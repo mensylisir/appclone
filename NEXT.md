@@ -797,7 +797,9 @@ HTML、GTK amd64、GTK arm64 五个 job 全部成功（1m 0s / 51s / 42s / 1m 15
   `quarantinePendingAudit` 识别 `dstComplete`、verified 收尾改用"补权限再删"、`legacyTmpRoot` 标注不可并行。
   另清掉异常退出（含那次自死锁 panic）留在 `/tmp` 的 `appclone-fusesmoke-*`：每次冒烟前只清本 uid、
   停手 10 分钟以上的目录。**CI 已核**（2026-11-10 run #31 / `4674ee1`）：五个 job 全绿
-  （Go 43s / packages 48s / HTML 32s / GTK amd64 38s / GTK arm64 49s，总 56s）。此前
+  （Go 43s / packages 48s / HTML 32s / GTK amd64 38s / GTK arm64 49s，总 56s）；加入三格式
+  依赖断言后的 run #32（`d570e9b`）同样五个 job 全绿（Go 51s / packages 32s / HTML 30s /
+  GTK amd64 42s / GTK arm64 50s，总 55s）。此前
   run #28/#30 红在两个环境假设上并已修复：① 清扫用注入的 `Env.UID`（单测固定 1000）判目录属主，
   GitHub runner 的 uid 不是 1000，于是把本进程残留全当别人的跳过 → 改用 `os.Getuid()`，
   并补 `TestSweepOwnershipUsesProcessUID` / `TestAuditSweepOwnershipUsesProcessUID`（故意把

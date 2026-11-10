@@ -106,14 +106,13 @@ jobs:
           ar p dist/pkg/appclone_0.0.0_amd64.deb control.tar.gz | tar -xzO ./control > /tmp/control
           grep -qx 'Architecture: amd64' /tmp/control
           grep -qx 'License: GPL-3.0-or-later' /tmp/control
-          grep -q '^Depends: .*libgtk-4-1 (>= 4.14)' /tmp/control
-          grep -q '^Depends: .*libadwaita-1-0 (>= 1.5)' /tmp/control
-          grep -q '^Depends: .*bubblewrap' /tmp/control
-          grep -q '^Depends: .*desktop-file-utils' /tmp/control
-          grep -q '^Depends: .*libglib2.0-bin' /tmp/control
-          # ADR-032：探测后端是硬依赖，安装即带上，断言 Depends 而不是 Recommends。
-          grep -q '^Depends: .*fuse-overlayfs' /tmp/control
-          grep -q '^Depends: .*strace' /tmp/control
+          # 按逗号拆开 Depends 后逐项精确比对，避免子串/版本前缀误匹配
+          # （如 4.140 命中 4.14），与下面 rpm/Arch 的 -qxF 严格度对齐。
+          sed -n 's/^Depends: //p' /tmp/control | tr ',' '\n' | sed 's/^ *//; s/ *$//' > /tmp/debdeps
+          for d in 'libgtk-4-1 (>= 4.14)' 'libadwaita-1-0 (>= 1.5)' bubblewrap \
+                   desktop-file-utils libglib2.0-bin fuse-overlayfs strace; do
+            grep -qxF "$d" /tmp/debdeps || { echo "::error::deb 缺少依赖 $d"; exit 1; }
+          done
           ar p dist/pkg/appclone_0.0.0_amd64.deb data.tar.gz | tar -tzf - > /tmp/data
           for p in ./usr/bin/appclone ./usr/bin/appclone-gui \
                    ./usr/share/doc/appclone/copyright \

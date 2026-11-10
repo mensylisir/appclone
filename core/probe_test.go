@@ -763,12 +763,7 @@ func TestSweepStaleProbesQuarantinesUnreadableUpper(t *testing.T) {
 	t.Cleanup(func() {
 		// 清扫再次回退时 000 现场会留在写层根：失败路径也要能清掉 TempDir，
 		// 否则真正的失败原因会被 RemoveAll 的权限错误盖住。
-		_ = filepath.WalkDir(e.TmpRoot, func(p string, d os.DirEntry, err error) error {
-			if err == nil && d.IsDir() {
-				_ = os.Chmod(p, 0o700)
-			}
-			return nil
-		})
+		chmodTestTree(t, e.TmpRoot)
 	})
 
 	if err := e.sweepStaleProbes(); err != nil {
@@ -841,13 +836,50 @@ func TestSweepOwnershipUsesProcessUID(t *testing.T) {
 	}
 }
 
-// 负向边界：属主不是本进程的目录必须跳过，不能被当成残留处理。
+// 负向边界：属主不是本进程、或根本不是真实目录的条目都必须跳过，
+// 不能被当成残留处理。世界可写的 /tmp 里，同 uid 进程可以预置软链，
+// 所以必须用 Lstat 而不是 Stat——跟随软链会把用户目录当成自己的残留搬走。
 func TestDirOwnedByRejectsForeignOwner(t *testing.T) {
 	root := t.TempDir()
-	if dirOwnedBy(root, os.Getuid()+1) {
-		t.Fatal("属主判断不能把别人的目录当成自己的")
+	file := filepath.Join(root, "plain-file")
+	if err := os.WriteFile(file, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
 	}
-	if !dirOwnedBy(root, os.Getuid()) {
-		t.Fatal("本进程的目录应被认作自己的")
+	link := filepath.Join(root, "self-link")
+	if err := os.Symlink(root, link); err != nil {
+		t.Fatal(err)
 	}
+	cases := []struct {
+		name string
+		path string
+		uid  int
+		want bool
+	}{
+		{"本进程目录", root, os.Getuid(), true},
+		{"别人的 uid", root, os.Getuid() + 1, false},
+		{"普通文件", file, os.Getuid(), false},
+		{"指向目录的软链", link, os.Getuid(), false},
+		{"不存在的路径", filepath.Join(root, "missing"), os.Getuid(), false},
+	}
+	for _, c := range cases {
+		if got := dirOwnedBy(c.path, c.uid); got != c.want {
+			t.Errorf("%s: dirOwnedBy=%v，期望 %v", c.name, got, c.want)
+		}
+	}
+}
+
+// chmodTestTree 在失败路径上补回目录权限，保证 t.TempDir 能清理。
+// 只允许遍历测试临时目录（Go 的 t.TempDir 路径含 /Test 前缀），避免这段
+// cleanup 被复用到真实 /tmp 时批量修改宿主目录权限。
+func chmodTestTree(t *testing.T, root string) {
+	t.Helper()
+	if !strings.Contains(root, string(os.PathSeparator)+"Test") {
+		t.Fatalf("cleanup 只允许遍历测试临时目录，拒绝 %q", root)
+	}
+	_ = filepath.WalkDir(root, func(p string, d os.DirEntry, err error) error {
+		if err == nil && d.IsDir() {
+			_ = os.Chmod(p, 0o700)
+		}
+		return nil
+	})
 }
