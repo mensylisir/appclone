@@ -104,8 +104,7 @@ node design/guitest.js                            # HTML 交互基线
 design/guitest-gtk.sh                             # 真实 GTK 闸门（需显示 + bwrap）
 ```
 
-设计契约在 `docs/方案设计.md`，技术选型与 ADR 在 `docs/tech-stack.md`，已验证状态在
-`docs/STATUS.md`；`NEXT.md` 记录当前进度。打包配置在 `packaging/`。
+打包配置在 `packaging/`；内部设计文档与进度记录不随仓库发布。
 
 ## 赞助
 

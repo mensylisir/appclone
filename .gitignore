@@ -13,3 +13,12 @@ node_modules/
 
 # 冒烟时 gio trash 会在数据目录所在卷根建 Trash 目录
 .Trash-*/
+
+# 内部文档只保留在本机，不入库（THIRD_PARTY_NOTICES 与 docs/assets 除外：
+# 前者是打包/许可证合规必需，后者被 README 引用）
+/CLAUDE.md
+/AGENTS.md
+/ARCHITECTURE.md
+/ENV.md
+/NEXT.md
+/docs/*.md
