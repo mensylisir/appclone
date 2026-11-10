@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // probeEnv 造一个 XDG 全在家目录里、且带 user-dirs.dirs 的环境。
@@ -779,5 +780,29 @@ func TestSweepStaleProbesQuarantinesUnreadableUpper(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(qs[0], "upper", "secret")); err != nil {
 		t.Fatalf("quarantine 里应保留原 upper 子树：%v", err)
+	}
+}
+
+// 冒烟目录只清除本 uid、且已停手 10 分钟以上的：并发进程正在冒烟时删它
+// 会把"能挂"变成假失败；panic/SIGKILL 留下的则不该在 /tmp 里攒着。
+func TestSweepStaleSmokeKeepsFreshAndForeign(t *testing.T) {
+	root := t.TempDir()
+	old := filepath.Join(root, "appclone-fusesmoke-old")
+	fresh := filepath.Join(root, "appclone-fusesmoke-fresh")
+	for _, d := range []string{old, fresh} {
+		if err := os.MkdirAll(filepath.Join(d, "merged"), 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	past := time.Now().Add(-time.Hour)
+	if err := os.Chtimes(old, past, past); err != nil {
+		t.Fatal(err)
+	}
+	sweepStaleSmoke(root)
+	if _, err := os.Stat(old); !os.IsNotExist(err) {
+		t.Fatal("一小时前的冒烟目录应被清掉")
+	}
+	if _, err := os.Stat(fresh); err != nil {
+		t.Fatalf("刚建的冒烟目录不能删（可能是并发进程正在用）：%v", err)
 	}
 }

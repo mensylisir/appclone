@@ -70,6 +70,7 @@ func fuseSmokeCheck() error {
 	}
 	// 与探测同一个写层根（ADR-033）：在 /var/tmp 下冒烟必然失败，
 	// 而用 MkdirTemp("") 又会跟着 $TMPDIR 漂移，结论与探测不一致。
+	sweepStaleSmoke(DefaultTmpRoot())
 	dir, err := os.MkdirTemp(DefaultTmpRoot(), "appclone-fusesmoke-")
 	if err != nil {
 		// 写层根建不出来不是"缺 /dev/fuse"：把它归进后端缺失会让 Probe 去
@@ -88,6 +89,23 @@ func fuseSmokeCheck() error {
 		return err
 	}
 	return unmount()
+}
+
+// sweepStaleSmoke 清掉异常退出（panic/SIGKILL）留下的冒烟目录：它们只有
+// 空目录骨架，但写层根是用户可见区。只碰本 uid 且 10 分钟没动过的——
+// 另一个进程正在冒烟时删它的目录会把结论变成假失败。
+func sweepStaleSmoke(root string) {
+	dirs, _ := filepath.Glob(filepath.Join(root, "appclone-fusesmoke-*"))
+	for _, d := range dirs {
+		if !dirOwnedBy(d, os.Getuid()) {
+			continue
+		}
+		fi, err := os.Stat(d)
+		if err != nil || time.Since(fi.ModTime()) < 10*time.Minute {
+			continue
+		}
+		_ = os.RemoveAll(d)
+	}
 }
 
 func (fuseOverlayMounter) Mount(lower, upper, work, merged string) (func() error, error) {
