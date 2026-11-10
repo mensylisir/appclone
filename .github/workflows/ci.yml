@@ -109,8 +109,9 @@ jobs:
           grep -q '^Depends: .*bubblewrap' /tmp/control
           grep -q '^Depends: .*desktop-file-utils' /tmp/control
           grep -q '^Depends: .*libglib2.0-bin' /tmp/control
-          grep -q '^Recommends: .*fuse-overlayfs' /tmp/control
-          grep -q '^Recommends: .*strace' /tmp/control
+          # ADR-032：探测后端是硬依赖，安装即带上，断言 Depends 而不是 Recommends。
+          grep -q '^Depends: .*fuse-overlayfs' /tmp/control
+          grep -q '^Depends: .*strace' /tmp/control
           ar p dist/pkg/appclone_0.0.0_amd64.deb data.tar.gz | tar -tzf - > /tmp/data
           for p in ./usr/bin/appclone ./usr/bin/appclone-gui \
                    ./usr/share/doc/appclone/copyright \

@@ -350,3 +350,19 @@ func TestNewAuditAttemptDoesNotReplayOldSummary(t *testing.T) {
 		t.Fatalf("应判 audit_incomplete，得到 %+v", v)
 	}
 }
+
+// 与 TestSweepOwnershipUsesProcessUID 同因：审计写层清扫也必须按进程真实
+// uid 判属主，否则 CI（uid != 1000）上无人认领的写层永远留着。
+func TestAuditSweepOwnershipUsesProcessUID(t *testing.T) {
+	e := probeEnv(t)
+	e.UID = os.Getuid() + 1
+	app, _ := seedVerifyApp(t, e)
+	work := e.AuditWorkDir(app, "ghost")
+	writeTree(t, filepath.Join(work, "upper", filepath.FromSlash(".config/TestApp/state")))
+	if err := e.sweepStaleAudits(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(work); !os.IsNotExist(err) {
+		t.Fatalf("本进程的无人认领写层应按真实 uid 判定属主并搬走：%v", err)
+	}
+}

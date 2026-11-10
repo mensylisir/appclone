@@ -322,7 +322,8 @@ func (e *Env) sweepStaleAudits() error {
 func (e *Env) sweepAuditRoot(root string) error {
 	dirs, _ := filepath.Glob(filepath.Join(root, "appclone", fmt.Sprintf("audit.%d", e.UID), "*"))
 	for _, d := range dirs {
-		if !dirOwnedBy(d, e.UID) {
+		// 属主判断用进程真实 uid，不用 e.UID（可注入的配置值）：见 sweepProbeRoot。
+		if !dirOwnedBy(d, os.Getuid()) {
 			continue
 		}
 		skip, release := e.lockAuditWork(filepath.Base(d))

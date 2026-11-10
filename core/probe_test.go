@@ -806,3 +806,21 @@ func TestSweepStaleSmokeKeepsFreshAndForeign(t *testing.T) {
 		t.Fatalf("刚建的冒烟目录不能删（可能是并发进程正在用）：%v", err)
 	}
 }
+
+// 清扫判断属主必须用进程真实 uid，而不是 Env.UID：Env.UID 在单测里被注入
+// 成固定值，CI runner 的 uid 却不是 1000。用 e.UID 比较会把本进程刚留下的
+// 残留全当成"别人的"跳过，残留永远清不掉（GitHub runner 上就是这样红的）。
+func TestSweepOwnershipUsesProcessUID(t *testing.T) {
+	e := probeEnv(t)
+	e.UID = os.Getuid() + 1
+	d := filepath.Join(e.TmpRoot, fmt.Sprintf("appclone-probe-%d-own", e.UID))
+	if err := os.MkdirAll(filepath.Join(d, "upper"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.sweepStaleProbes(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(d); !os.IsNotExist(err) {
+		t.Fatalf("本进程留下的空残留应按真实 uid 判定属主并清走：%v", err)
+	}
+}

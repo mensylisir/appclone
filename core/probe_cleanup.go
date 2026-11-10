@@ -98,10 +98,13 @@ func (e *Env) sweepProbeRoot(root string) error {
 		return nil
 	}
 	for _, d := range dirs {
-		// /tmp 与 /var/tmp 都是世界可写：只处理属主是本 uid 的**目录**。
+		// /tmp 与 /var/tmp 都是世界可写：只处理属主是本进程 uid 的**目录**。
 		// 别的用户预置同名条目时，搬走/删除既可能被粘滞位拒绝，也会让我们
 		// 把一个不属于自己的目录拷进 quarantine。
-		if !dirOwnedBy(d, e.UID) {
+		// 这里必须用 os.Getuid() 而不是 e.UID：e.UID 是可注入的配置值（单测
+		// 固定成 1000），属主判断只能信进程真实身份，否则 uid 非 1000 的机器
+		// （CI runner）会把本进程的残留全当成别人的残留跳过。
+		if !dirOwnedBy(d, os.Getuid()) {
 			continue
 		}
 		merged := filepath.Join(d, "merged")
