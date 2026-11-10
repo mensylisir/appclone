@@ -93,15 +93,19 @@ func (e *Env) Probe(ctx context.Context, app string, opt ProbeOptions) (ProbeRes
 	if runner == nil {
 		runner = setsidRunner{}
 	}
-	// 降级判据（§3.4）：overlay 挂不起来但有 strace，就走 strace；
-	// 两者都没有才报"环境给不出结论"。降级必须显式告知：strace 只能看到
-	// "打开过什么"，拿不到 overlay 那种零噪声的写入集。
+	// 降级判据（§3.4 + ADR-032）：**只有后端确实不存在**时，才在 strace 可用
+	// 的前提下降级。fuse-overlayfs 在、但挂载被系统拒绝（权限/沙盒/超时）是
+	// 可修复的环境问题：静默走 strace 会把权限问题藏起来，还会给用户一份低
+	// 置信度档案。这类错误必须原样交给界面/CLI。
 	if err := mounter.Available(); err != nil {
+		if !ProbeBackendMissing(err) {
+			return ProbeResult{}, err
+		}
 		if _, serr := exec.LookPath("strace"); serr != nil {
 			return ProbeResult{}, err
 		}
 		if opt.Stderr != nil {
-			fmt.Fprintln(opt.Stderr, "appclone: 没有可用的 fuse-overlayfs，改用 strace 跟踪（结果置信度较低，且需要多开几次应用）")
+			fmt.Fprintln(opt.Stderr, "appclone: fuse-overlayfs 不可用，改用 strace 跟踪（结果置信度较低，且需要多开几次应用）")
 		}
 		// 降级事件由 probeStrace 在闸门之后发（见那里的注释）：还没确认能真的
 		// 开跑就告诉界面"已降级"，紧接着又报 app_running，横幅会和错误文案打架。
@@ -116,6 +120,31 @@ func (e *Env) Probe(ctx context.Context, app string, opt ProbeOptions) (ProbeRes
 // 与 overlay 路径的差别必须写在档案里（`probe_method = "strace"`），
 // 界面要按低置信展示——两套结果看起来一样，但一套是"确定写过"、
 // 一套是"可能写过"。
+// ProbeBackendMissing 区分"探测后端根本不存在"与"后端存在但挂载失败"。
+// 前者可以降级 strace；后者（Permission denied、EPERM、超时）是权限/沙盒
+// 问题，自动降级只会掩盖它——ADR-032。
+// ProbeErrorKey 取 core 错误键；不是 *Error 时返回空串。界面按它区分
+// "组件缺失 / 写层不可写 / 挂载被拒"（三者的处置完全不同），不解析文案。
+func ProbeErrorKey(err error) string {
+	var ce *Error
+	if !errors.As(err, &ce) {
+		return ""
+	}
+	return ce.Key
+}
+
+func ProbeBackendMissing(err error) bool { return ProbeBackendKeyMissing(ProbeErrorKey(err)) }
+
+// ProbeBackendKeyMissing 是上面那条判据的键形态：界面手里只有键（错误已经
+// 不再携带底层 errno），但仍要判断"是组件缺失还是挂载被拒"。
+func ProbeBackendKeyMissing(key string) bool {
+	switch key {
+	case "err.probe.no_fuse_overlayfs", "err.probe.no_fusermount", "err.probe.no_dev_fuse":
+		return true
+	}
+	return false
+}
+
 func (e *Env) probeStrace(ctx context.Context, app string, opt ProbeOptions, runner SessionRunner) (ProbeResult, error) {
 	if running, err := e.AppRunning(opt.Command[0]); err != nil {
 		return ProbeResult{}, err
@@ -290,12 +319,14 @@ func (e *Env) probeSession(ctx context.Context, app string, opt ProbeOptions, mo
 		if isMounted {
 			return work, errEnv("err.probe.quarantine_mounted", map[string]any{"path": work}, nil)
 		}
-		q := filepath.Join(e.tmpRoot(), fmt.Sprintf("appclone-quarantine-%d-%s", e.UID,
-			time.Now().UTC().Format("20060102T150405")+"-"+randSuffix()))
-		if err := os.Rename(work, q); err != nil {
+		// 写层根可能在 tmpfs（/tmp、$XDG_RUNTIME_DIR），quarantine 优先落磁盘；
+		// quarantineDir 负责 EXDEV 拷贝 + fsync，拷贝不动（子树不可读）时退回
+		// 同 fs rename，任何失败都不删源（§3.2.1）。
+		q, qerr := e.quarantineDir(work)
+		if qerr != nil {
 			// **绝不回退到 RemoveAll**：这里面可能就是用户刚存的文件（§3.2.1）。
 			// 留着、把真实路径告诉用户，让人自己决定。
-			return work, errEnv("err.probe.quarantine_failed", map[string]any{"path": work}, err)
+			return work, errEnv("err.probe.quarantine_failed", map[string]any{"path": work}, qerr)
 		}
 		removed = true
 		return q, nil
@@ -331,7 +362,7 @@ func (e *Env) probeSession(ctx context.Context, app string, opt ProbeOptions, mo
 	// （§3.2.3「先杀进程再卸载」）。preserve 表示"应用可能已经跑过、不能
 	// 直接删"：卸载后先做一次污染检查——公共目录进了 upper 才 quarantine，
 	// 只有应用自身配置/缓存写入时和成功路径一样删掉（否则每次取消都在
-	// /var/tmp 攒一份用户不知道的垃圾）。读不出来时按"可能有内容"保留。
+	// 写层根攒一份用户不知道的垃圾）。读不出来时按"可能有内容"保留。
 	teardown := func(preserve bool) (string, error) {
 		if stopBus != nil {
 			stopBus()

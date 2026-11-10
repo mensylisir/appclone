@@ -28,11 +28,13 @@ overrides:
       - libadwaita-1-0 (>= 1.5)
       - bubblewrap
       - desktop-file-utils
+      # 路径探测主后端与兜底后端都是产品能力，不是可选优化（ADR-032）：
+      # 缺 fuse-overlayfs 只能走低置信度 strace，两者都缺则新应用无法首次探测。
+      - fuse-overlayfs
+      - strace
       # 删除进回收站依赖 /usr/bin/gio；它不在 libglib2.0-0t64 里。
       - libglib2.0-bin
     recommends:
-      - fuse-overlayfs
-      - strace
       # postinstall 的图标缓存更新器在 Debian 系属于 libgtk-4-bin；
       # 只装运行库时该步骤会 best-effort 跳过（SVG 仍能按路径加载）。
       - libgtk-4-bin
@@ -43,11 +45,9 @@ overrides:
       - bubblewrap
       - desktop-file-utils
       - glib2
-    recommends:
       - fuse-overlayfs
       - strace
-  # nfpm v2.41 不表达 Arch 的 optdepends；fuse-overlayfs / strace 属推荐依赖，
-  # README 与 doctor 都会提示：缺 fuse 走 strace，两者都缺则探测不可用（分身仍可运行）。
+  # ADR-032：探测后端是硬依赖，安装即带上；Arch 的 optdepends 不参与表达。
   archlinux:
     depends:
       - gtk4>=4.14
@@ -55,6 +55,8 @@ overrides:
       - bubblewrap
       - desktop-file-utils
       - glib2
+      - fuse-overlayfs
+      - strace
 
 # Arch 专属钩子必须放在顶层 archlinux，不能放进 overrides（overrides 的
 # scripts 是通用 Scripts，没有 postupgrade 字段）。pacman 升级时只跑

@@ -756,6 +756,45 @@ HTML、GTK amd64、GTK arm64 五个 job 全部成功（1m 0s / 51s / 42s / 1m 15
 
 ## 最近完成
 
+- 2026-11-10 **Ubuntu 26.04 真机探测失败根因修复（ADR-032/033）**：用户截图报
+  `fusermount3: mount failed: Permission denied`。真机（Ubuntu 26.04.1，`mensyli4@192.168.31.8`）
+  复现并定位到**写层根 `/var/tmp` 不在 fusermount3 的 AppArmor 白名单内**（该 profile 只允许
+  `$HOME/**`、`/tmp/**`、`/run/user/<uid>/**`、`/mnt/**`、`/media/**`）：同一账号在 `/var/tmp`
+  直接 `fuse-overlayfs` 挂载被拒、在 `/tmp` 成功。修复：
+  ① **写层根改 `/tmp`**（`core/state.go` 的 `tmpRoot`/`defaultTmpRoot`，`/tmp` 不可写才退
+  `$XDG_RUNTIME_DIR`），探测/审计/清扫全部随它；quarantine 仍放持久的 `/var/tmp`，跨设备用
+  `moveDir` 拷贝 + fsync（`fsmove.go`）。**不改系统 AppArmor 策略、不提权**。
+  ② **doctor 的冒烟挂载改用同一个写层根**（原 `MkdirTemp("")` 在 `/tmp` 能过，造成"doctor 说可用、
+  探测报错"）；`fuseSmoke` 只缓存成功结论，失败下次重试——GUI 每 30 秒自检才能从错误态恢复。
+  ③ **fuse-overlayfs 与 strace 成为包硬依赖**（deb/rpm/Arch 都进 depends），安装即带上；
+  只有后端**真的缺失**才降级 strace（`probeBackendMissing`），**挂载被拒不降级**，报环境处置
+  （`err.probe.mount_failed` 文案 + doctor `fail` 提示 + GUI 软横幅「路径探测不可用：FUSE 挂载被拒绝…」，
+  克隆开关同时禁用）。
+  证据：Ubuntu 26.04.1 上安装 0.0.2（升级自 0.0.1，`fuse-overlayfs`/`strace` 由包依赖自动装入）
+  后 `design/probe-smoke.sh /usr/bin/appclone` **9 步全过、退出码 0**（overlay 探测 → 档案 →
+  创建实例 → 公共目录哨兵保留 → 无残留写层/挂载 → `run --audit` → `doctor --verify` = verified →
+  回收站删除）；`appclone doctor` 报「fuse-overlayfs 可用…冒烟挂载通过」；
+  `setpriv --no-new-privs appclone doctor` 报「已安装，但挂载被拒（权限/沙盒）；不会降级 strace」且
+  `--strict` 退出 3；同环境下 `add` 退出 3 并给出 `/dev/fuse`/`fusermount3` setuid/桌面会话的处置文案。
+  门禁：`gofmt -l .` 空、`go vet ./...`、`go vet -tags gtk_e2e ./cmd/appclone-gui`、`staticcheck ./...`、
+  `go test ./...`、`CGO_ENABLED=0 go build ./...` 全过；`node design/guitest.js` 62/62；
+  `APPCLONE_GTK_UINPUT=1 design/guitest-gtk.sh` **21 条 PASS / 退出码 0**（新增
+  `TestGtkFuseDeniedIsAnErrorNotADegrade`，`noFuseMounter` 改为精确的"后端缺失"错误）。
+  文档同步：`docs/tech-stack.md` ADR-032/033 与打包依赖、`docs/方案设计.md` §4.4/§6.5 写层路径、
+  `docs/discover.md` 写层与 quarantine、`README.md` 系统需求与排障、`design/probe-smoke.sh` 残留检查路径。
+  **只读审查三轮（首轮 REJECTED，无 P0）**：P1-1 探测残留清扫读失败即删（与审计口径相反，chmod 000
+  子树可能含用户文件）→ 改为 `quarantineDir`，新增 `TestSweepStaleProbesQuarantinesUnreadableUpper`；
+  P1-2 写层根改 tmpfs 后跨设备拷贝搬不走不可读子树 → `quarantineDir` 退回同 fs rename；
+  P1-3 doctor 对 `no_fusermount` 与 Probe 结论相反 → 统一走 `ProbeBackendKeyMissing`/`ProbeFallsBackToStrace`
+  （有 strace 是 warn，不是 fail）。P2 一并修：写层根建目录失败不再冒充"缺 /dev/fuse"
+  （新键 `err.probe.workroot_unavailable`）、doctor 增加 tmpfs 写层根 warn 与 root 运行 warn、
+  GUI 横幅按 degraded/backend_missing/workroot_unavailable/fuse_blocked 四态选文案且原因变化时重置
+  「了解」、旧 `/var/tmp` 的 probe/audit 残留一次性清扫、verify 在新根无证据时回退旧根读已完成审计证据、
+  `fuseSmoke` 成功只缓存 60s（失败不缓存，双向可恢复）、quarantine 在"拷贝完成但删源失败"时返回完整副本
+  （`dstCompleteError`，新增 `TestQuarantineDirKeepsCompleteCopyWhenSourceCleanupFails`、`TestUpperDirFallsBackToLegacyRoot`）。
+  **自查抓到并修掉一个自引入的死锁**：最初在 `Mount` 失败里清冒烟缓存，而 `Available` 持锁调用冒烟，
+  真机 `setpriv --no-new-privs` 下直接 panic 退出 2；改成 TTL 后复验无 panic。第三轮复审 **APPROVED**（P2-1/P2-2 闭环、无新 P0/P1）；其三条 P3 也一并处理：
+  `quarantinePendingAudit` 识别 `dstComplete`、verified 收尾改用"补权限再删"、`legacyTmpRoot` 标注不可并行。
 - 2026-11-10 **长稳 / 内存稳定性证据（60 分钟 Wayland + CLI 100 轮）**：新增
   `cmd/appclone-gui/soak_test.go`（`TestGtkSoakRenderList`，默认 SKIP，需
   `APPCLONE_GTK_SOAK_MIN`）与 `design/soak.sh`（手动或发版前跑，不进 CI）。

@@ -60,14 +60,19 @@ probe_available() {
 
 **检查通过也不够**：静态检查（`/dev/fuse` 可读 + 命令存在）在容器、权限受限、上一轮 stale 挂载的场景都会给出假阳性，
 真正挂载时才失败，而那时用户已经在探测页等着了。所以四道闸门之外再补一步：
-在临时目录做一次 **`fuse-overlayfs` mount → unmount 的冒烟**（3 秒超时），结果进程内缓存一次；
-失败按 §3.4 降级或退出 3，不要等用户点完开关才报错。
+在**与探测相同的写层根**（`/tmp`，`/tmp` 不可写时 `$XDG_RUNTIME_DIR`；ADR-033）做一次
+**`fuse-overlayfs` mount → unmount 的冒烟**（3 秒超时），**只缓存成功结论**——失败下次重试，
+否则 GUI 每 30 秒的自检永远停在错误态。失败时**只有后端确实缺失**才按 §3.4 降级；
+挂载被拒（权限/沙盒）原样报错，不降级（ADR-032）。不要等用户点完开关才报错。
 
 **写层位置是硬约束（不是布局偏好）**：`upper/`、`work/`、`merged/` 必须整体位于 lower（有效 `HOME`）**之外**。
 实测（2026-11-06）：upper 嵌在 lower 里时 overlay **挂载成功**，但视图立刻递归——
 `ls merged/<更深层路径>` 直接 `ELOOP`，`rm -rf` 也删不掉。默认 `AC_BASE` 就在 `$HOME` 里，所以
-探测写层放 `/var/tmp/appclone-probe-<uid>-<rand>/`（`MkdirTemp`，0700），**不放 `$AC_BASE/probe`**（方案设计 §4.4）；
-命中污染时整个目录改名为 `/var/tmp/appclone-quarantine-<uid>-<时间>-<随机>/` 保留（`core/probe_cleanup.go`）。
+探测写层放 `/tmp/appclone-probe-<uid>-<rand>/`（`/tmp` 不可写时退到 `$XDG_RUNTIME_DIR`；`MkdirTemp`，0700），
+**不放 `$AC_BASE/probe`**（方案设计 §4.4），**也不放 `/var/tmp`**——
+Ubuntu 26.04 的 fusermount3 AppArmor profile 不允许在 `/var/tmp` 下挂 FUSE（ADR-033）；
+命中污染时整个目录搬去 `/var/tmp/appclone-quarantine-<uid>-<时间>-<随机>/` 保留（跨设备由 `moveDir`
+拷贝 + fsync，失败不删源；`core/probe_cleanup.go`）。
 
 挂载前断言（缺一不挂）：
 1. `realpath(upper)` 不是 `realpath(lower)` 的前缀（父子都不行）；
@@ -122,7 +127,8 @@ overlay 把整个 `$HOME` 罩住，**用户在探测会话里的每一次保存�
 - **反向断言（必须实现）**：探测结束后检查 `upper` 下是否出现上述任一公共目录路径。
   出现即说明摘出失效（或应用绕过了 bind），**本次探测结果整体作废、丢弃候选并报错**，
   因为无法排除已有用户文件被写进 upper。宁可让用户重跑一次，也不能带着"可能删过文件"的探测结果去建实例；
-- **作废时一律不删 upper**：把它改名成 `quarantine-<时间戳>/`（同一 `/var/tmp` 目录下），把恢复路径打进错误信息
+- **作废时一律不删 upper**：把它搬到持久的 `/var/tmp/appclone-quarantine-<uid>-<时间>-<随机>/`
+  （跨设备用 `moveDir` 拷贝 + fsync），把恢复路径打进错误信息
   （`probe.method` 记 `quarantined`）。原文"§4 清理约定仍执行"与这条直接冲突——清理约定在这里让位于
   "不删可能属于用户的文件"，这也是审计层（方案设计 §6.5）的同一条规则，不许两处两种做法。
 
@@ -167,7 +173,7 @@ overlay 把整个 `$HOME` 罩住，**用户在探测会话里的每一次保存�
   否则 core 被 SIGKILL 后挂载点变成 `Transport endpoint is not connected`，下次挂载直接 EBUSY。
   **`auto_unmount` 不能当保证**：2026-11-07 实测 fuse-overlayfs 1.18 + libfuse 3.18 会打印
   `unknown argument ignored: auto_unmount`，SIGKILL 后 mountinfo 仍有条目；唯一的兜底是下面那条启动前扫残留；
-- **启动前必须扫残留**：`/var/tmp/appclone-probe-<uid>-*` 下属于本 uid 的目录 → 读 `/proc/self/mountinfo` 判断是否仍挂载
+- **启动前必须扫残留**：写层根（默认 `/tmp`）下 `appclone-probe-<uid>-*` 属于本 uid 的目录 → 读 `/proc/self/mountinfo` 判断是否仍挂载
   → 是则 `fusermount3 -uz` → **删前先做污染检查**（可能含用户文件）→ 校验通过才删；
   残留清理失败就报环境错误（3），不许"清理不了就继续跑"；
 - **探测期的 `dbus-daemon` 要单独回收**：它是 `core` 起的兄弟子进程，不在 bwrap 那个 session/pgid 里，
@@ -275,6 +281,13 @@ bwrap 对同一目标后挂载覆盖先挂载，写反了前两条会被整体�
 `fusermount3` 缺失。降级时 CLI/GUI 必须说明"本次用 strace 探测，覆盖率更低、需要你多操作一会儿"，
 不得静默换方法。
 
+**挂载失败不是降级判据（ADR-032）**：前置检查通过、但 `fuse-overlayfs` 实际挂载被系统拒绝
+（`mount_failed`/`mount_timeout`，典型输出 `fusermount3: mount failed: Permission denied`）时，
+**不降级 strace**，直接把可操作的权限/环境错误交给界面。原因：FUSE 挂载本来不需要 root
+（`fusermount3` setuid 即可），失败说明进程处在受限环境（Flatpak/容器/`NoNewPrivs`/`nosuid`/AppArmor）；
+静默降级既掩盖了可修复的问题，又给出一份低置信度档案。提权运行不是解法——会把探测会话或被探测
+应用变成 root、污染实例数据所有权，违反免 root 红线。
+
 ## 4. 三层探测管线（目标形态）
 
 ```
@@ -294,8 +307,10 @@ L2 语义分类（喂给 GUI 屏3 预勾选）
    └─ §5 规则表 → 绝大多数应用到屏3 时只剩"确认预勾选项"
 ```
 
-**strace 降级的实现**（2026-11-07，`core/strace.go`）：`Probe` 在 `mounter.Available()` 失败时
-检查 `strace` 是否存在，有则整条改成 strace 路径（否则退出 3）。几处必须写清的取舍：
+**strace 降级的实现**（2026-11-07，`core/strace.go`；2026-11-10 按 ADR-032 收窄）：`Probe` 只在
+`mounter.Available()` 表示**后端确实缺失**（无 binary、无 `fusermount3`、打不开 `/dev/fuse`）时，
+检查 `strace` 是否存在，有则整条改成 strace 路径（否则退出 3）。`mount_failed`/`mount_timeout`
+原样返回，不降级。几处必须写清的取舍：
 - strace 跑在 **bwrap 外面**（`strace -f -o <log> -- bwrap …`）：日志由宿主写，不用操心"沙箱里往哪写日志"；
 - 不罩 overlay（HOME 就是真实的），所以**没有"把公共目录绑回去"这回事**——那句话的前提是 overlay 罩住了它们；
 - 解析只认**带写入意图**的 `open/openat/openat2/creat/mkdir/rename/link/symlink/truncate/chmod/utimensat`，
@@ -341,7 +356,7 @@ GUI 只对用户说"打开应用用一下，然后关掉"，两轮循环由工�
 | # | 闸门 | 不过时的行为 |
 |---|---|---|
 | 1 | bwrap 可用、user namespace 可建 | 报环境不可用（方案设计 §6.3，退出码 3），不进探测 |
-| 2 | fuse 三件套可用（§3.2 前置检查） | 降级 strace，并在界面显式说明覆盖率更低 |
+| 2 | fuse 三件套可用（§3.2 前置检查） | 后端缺失 → 降级 strace 并显式说明覆盖率更低；后端存在但挂载被拒 → 报可操作的权限/环境错误，**不降级**（ADR-032） |
 | 3 | 目标应用当前**没有**实例在跑 | 提示「请先把「X」完全退出」并禁用开始按钮；**不给"仍然继续"**——继续只会得到零写入和一条假结论 |
 | 4 | 拿到 `AC_BASE` 的跨进程写锁（方案设计 §4.2） | 等锁，超时 5 秒报"另一个 appclone 正在操作"，不并发探测（两个探测共用一个 `probe/` 会互相污染） |
 

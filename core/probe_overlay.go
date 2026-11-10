@@ -21,16 +21,37 @@ type OverlayMounter interface {
 // fuseOverlayMounter 是 OverlayMounter 的真实现：fuse-overlayfs + fusermount3。
 type fuseOverlayMounter struct{}
 
-// fuseSmoke 缓存"能不能真挂一次"的结论：静态检查在容器/权限受限时假阳性，
-// 但每次探测都做一次冒烟挂载又太贵。进程内只做一次。
+// fuseSmoke 缓存"能不能真挂一次"的**成功**结论：静态检查在容器/权限受限时
+// 假阳性，但每次探测都做一次冒烟挂载又太贵。
+//
+// 两个方向都要能翻转（§4.5"只能进不能出的状态等于卡死"）：
+//   - 失败不缓存：用户装好组件、改好权限后，GUI 每 30 秒的自检要能变绿；
+//   - 成功只缓存一个短 TTL：环境可能在自检之后退化（/tmp 被 remount ro、
+//     AppArmor 重载、/dev/fuse 权限变化），否则界面一直显示"可用"而每次
+//     探测都失败。TTL 内不重复挂载，过期后重验一次（一次空挂载而已）。
+const fuseSmokeTTL = 60 * time.Second
+
 var fuseSmoke struct {
-	once sync.Once
-	err  error
+	mu      sync.Mutex
+	okUntil time.Time
 }
 
 func (fuseOverlayMounter) Available() error {
-	fuseSmoke.once.Do(func() { fuseSmoke.err = fuseSmokeCheck() })
-	return fuseSmoke.err
+	fuseSmoke.mu.Lock()
+	fresh := time.Now().Before(fuseSmoke.okUntil)
+	fuseSmoke.mu.Unlock()
+	if fresh {
+		return nil
+	}
+	// 冒烟本身不在锁里做：它会 spawn fuse-overlayfs 并等挂载，持锁会把
+	// 并发的 Available 全堵住。两个 goroutine 同时冒烟只是多挂一次。
+	if err := fuseSmokeCheck(); err != nil {
+		return err
+	}
+	fuseSmoke.mu.Lock()
+	fuseSmoke.okUntil = time.Now().Add(fuseSmokeTTL)
+	fuseSmoke.mu.Unlock()
+	return nil
 }
 
 func fuseSmokeCheck() error {
@@ -47,9 +68,13 @@ func fuseSmokeCheck() error {
 	} else {
 		f.Close()
 	}
-	dir, err := os.MkdirTemp("", "appclone-fusesmoke-")
+	// 与探测同一个写层根（ADR-033）：在 /var/tmp 下冒烟必然失败，
+	// 而用 MkdirTemp("") 又会跟着 $TMPDIR 漂移，结论与探测不一致。
+	dir, err := os.MkdirTemp(DefaultTmpRoot(), "appclone-fusesmoke-")
 	if err != nil {
-		return errEnv("err.probe.no_dev_fuse", nil, err)
+		// 写层根建不出来不是"缺 /dev/fuse"：把它归进后端缺失会让 Probe 去
+		// 降级 strace、让 doctor 叫用户装 fuse3，全错方向。
+		return errEnv("err.probe.workroot_unavailable", map[string]any{"path": DefaultTmpRoot()}, err)
 	}
 	defer os.RemoveAll(dir)
 	for _, sub := range []string{"lower", "upper", "work", "merged"} {

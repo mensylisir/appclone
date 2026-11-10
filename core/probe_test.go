@@ -3,6 +3,7 @@ package core
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"os/exec"
@@ -174,7 +175,10 @@ func TestProbeContaminated(t *testing.T) {
 type fakeMounter struct {
 	entries []string
 	failOn  string
-	mounted bool
+	// availableErr 精确控制 Available 的错误；failOn=="available" 固定返回
+	// no_dev_fuse，这里用来模拟"binary 在、但挂载被拒"的权限失败。
+	availableErr error
+	mounted      bool
 	// sentinel 在 merged（模拟的 $HOME 视图）里放一个文件。真实实现里它是
 	// 挂载点；如果代码在挂载状态下 RemoveAll(work)，这个文件会先被删掉——
 	// 用它来证明"先卸载、后处置目录"的顺序。
@@ -182,6 +186,9 @@ type fakeMounter struct {
 }
 
 func (f *fakeMounter) Available() error {
+	if f.availableErr != nil {
+		return f.availableErr
+	}
 	if f.failOn == "available" {
 		return errEnv("err.probe.no_dev_fuse", nil, nil)
 	}
@@ -495,6 +502,59 @@ func quarantineDirs(t *testing.T, e *Env) []string {
 	return dirs
 }
 
+// ADR-032：只有后端真正缺失才允许降级。fuse-overlayfs 在、但挂载被拒
+// （权限/沙盒）时必须把错误交给用户，不能在 strace 可用时静默降级——那会
+// 掩盖可修复的权限问题，还给出一份低置信度档案。
+func TestProbeBackendMissingOnlyForAbsentBackend(t *testing.T) {
+	cases := []struct {
+		key  string
+		want bool
+	}{
+		{"err.probe.no_fuse_overlayfs", true},
+		{"err.probe.no_fusermount", true},
+		{"err.probe.no_dev_fuse", true},
+		{"err.probe.mount_failed", false},
+		{"err.probe.mount_timeout", false},
+		{"err.probe.umount_failed", false},
+	}
+	for _, c := range cases {
+		if got := ProbeBackendMissing(errEnv(c.key, nil, nil)); got != c.want {
+			t.Fatalf("ProbeBackendMissing(%s)=%v want %v", c.key, got, c.want)
+		}
+	}
+	if ProbeBackendMissing(errors.New("plain")) {
+		t.Fatal("非 core.Error 不应被判成后端缺失")
+	}
+}
+
+func TestProbeDoesNotDowngradeWhenMountIsDenied(t *testing.T) {
+	e := probeEnv(t)
+	// 放一个假 strace：旧逻辑看到它就会静默降级；新逻辑必须仍然返回
+	// mount_failed，让界面告诉用户去修权限/换会话。
+	bin := t.TempDir()
+	if err := os.WriteFile(filepath.Join(bin, "strace"), []byte("#!/bin/sh\nexit 0\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	denied := errEnv("err.probe.mount_failed", map[string]any{"output": "fusermount3: mount failed: Permission denied"}, nil)
+	m := &fakeMounter{availableErr: denied}
+	r := &fakeRunner{}
+	var stderr strings.Builder
+	_, err := e.Probe(context.Background(), "testapp", ProbeOptions{
+		Command: []string{"/bin/true"}, Mounter: m, Runner: r, Stderr: &stderr,
+	})
+	var ce *Error
+	if !errors.As(err, &ce) || ce.Key != "err.probe.mount_failed" {
+		t.Fatalf("挂载被拒应原样返回 mount_failed，得到 %v", err)
+	}
+	if r.calls != 0 {
+		t.Fatalf("挂载被拒时不应降级 strace，runner 被调用 %d 次", r.calls)
+	}
+	if strings.Contains(stderr.String(), "改用 strace") {
+		t.Fatalf("不应向用户宣告降级：%q", stderr.String())
+	}
+}
+
 // 四道闸门：overlay 不可用时不许硬试。
 func TestProbeSessionGateOnMounter(t *testing.T) {
 	e := probeEnv(t)
@@ -680,5 +740,44 @@ func TestProbeRunsTwoRoundsByDefault(t *testing.T) {
 	}
 	if r2.calls != 1 {
 		t.Fatalf("显式 Rounds=1 时只该跑一轮，实际 %d", r2.calls)
+	}
+}
+
+// 残留 upper 读不出来时是"看不见内容"，不是"空"：整棵删掉可能就是删用户
+// 文件。与 sweepOneAudit 同口径——搬去 quarantine，源不再留着挡下一次探测。
+func TestSweepStaleProbesQuarantinesUnreadableUpper(t *testing.T) {
+	e := probeEnv(t)
+	d := filepath.Join(e.TmpRoot, fmt.Sprintf("appclone-probe-%d-test", e.UID))
+	upper := filepath.Join(d, "upper")
+	secret := filepath.Join(upper, "secret")
+	if err := os.MkdirAll(secret, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(secret, "file"), []byte("user data"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(secret, 0o000); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		for _, q := range quarantineDirs(t, e) {
+			_ = filepath.WalkDir(q, func(p string, _ os.DirEntry, _ error) error {
+				return os.Chmod(p, 0o700)
+			})
+		}
+	})
+
+	if err := e.sweepStaleProbes(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(d); !os.IsNotExist(err) {
+		t.Fatal("读不出内容的残留应被搬走，不该留在写层根挡住下一次探测")
+	}
+	qs := quarantineDirs(t, e)
+	if len(qs) != 1 {
+		t.Fatalf("应留下 1 个 quarantine，得到 %v", qs)
+	}
+	if _, err := os.Stat(filepath.Join(qs[0], "upper", "secret")); err != nil {
+		t.Fatalf("quarantine 里应保留原 upper 子树：%v", err)
 	}
 }

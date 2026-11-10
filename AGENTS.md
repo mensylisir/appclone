@@ -124,7 +124,7 @@ node design/guitest.js
 # 找不到依赖时：npm i puppeteer-core，或用 PUPPETEER_CORE=/path、CHROMIUM=/path 指定
 # 长稳 / 内存稳定性（手动或发版前跑，不进 CI；默认 30 分钟 GTK + 100 轮 CLI，需显示 + bwrap）
 design/soak.sh 60                              # SOAK_CYCLES=200 可调；--keep 保留现场
-# GTK 侧回归（真实 GTK，需 DISPLAY/WAYLAND + 宿主 bwrap；假 HOME，20 条约 12 秒；APPCLONE_GTK_UINPUT=1 且 /dev/uinput 可写时含两条真实输入用例）
+# GTK 侧回归（真实 GTK，需 DISPLAY/WAYLAND + 宿主 bwrap；假 HOME，21 条约 12 秒；APPCLONE_GTK_UINPUT=1 且 /dev/uinput 可写时含两条真实输入用例。**会在当前桌面弹出测试窗口并抢焦点**，无人值守时用 xvfb-run，或在用户不操作时再跑）
 design/guitest-gtk.sh                          # --keep 保留临时目录与假 HOME 便于排查
 # 隔离冒烟（假 HOME，不污染真实主目录）：
 TESTROOT=$(mktemp -d); export AC_BASE="$TESTROOT/xdg/appclone" XDG_DATA_HOME="$TESTROOT/xdg"

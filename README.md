@@ -19,8 +19,9 @@
 | bubblewrap | 隔离引擎（必需） |
 | glib2（`gio`） | 删除实例移入回收站（必需；deb/rpm/Arch 包会自动装） |
 | GTK ≥ 4.14 + libadwaita ≥ 1.5 | 仅 GUI 需要（运行库，不需要开发包） |
-| fuse-overlayfs | 推荐；缺失时路径探测降级为 `strace`，启动不受影响 |
-| strace | 推荐（与 fuse-overlayfs 二选一即可探测）；两者都缺时不能首次探测新应用，已有合法档案仍可建普通分身（克隆起步会降级） |
+| fuse-overlayfs | 路径探测主后端（必需；deb/rpm/Arch 包会自动装） |
+| strace | 探测兜底后端（必需；deb/rpm/Arch 包会自动装）；只在 fuse 后端确实缺失时才降级使用 |
+| FUSE 挂载权限 | 普通桌面会话即可，无需 root：`fusermount3` 应以 setuid 安装。在 Flatpak/容器/`NoNewPrivs` 会话里会被系统拒绝，此时 appclone 会直接报权限错误，不静默降级 |
 
 Ubuntu 23.10+ 默认限制非特权 user namespace。deb / rpm / Arch 包的安装脚本都会在检测到该限制时安装
 `/etc/apparmor.d/bwrap`（只放开 bwrap 自身，不改全局 sysctl）；手工安装 `.tar.gz` 时见「排障」。
@@ -83,7 +84,13 @@ appclone doctor
 - **`bwrap: setting up uid map: Permission denied`（Ubuntu 23.10+）**：安装包应已处理；手工安装
   `.tar.gz` 时在解压目录执行
   `sudo cp bwrap.apparmor /etc/apparmor.d/bwrap && sudo apparmor_parser -r /etc/apparmor.d/bwrap`。
-- **「缺 fuse-overlayfs」横幅**：安装 `fuse-overlayfs` 后重启 GUI；不装但装了 `strace` 也能用，探测覆盖不完整。两者都缺时 `appclone doctor` 会报 fail：已有合法档案仍可建普通分身，但无法首次探测新应用，克隆起步也会降级。
+- **「缺 fuse-overlayfs」横幅**：deb/rpm/Arch 包已把它和 `strace` 作为硬依赖自动安装；手工 `.tar.gz` 请自行装
+  `fuse-overlayfs` 与 `strace`。只有后端确实缺失时才会降级/报 `doctor` fail。
+- **`fusermount3: mount failed: Permission denied` / `fuse-overlayfs: cannot mount: Operation not permitted`**：
+  当前会话不允许非特权 FUSE 挂载，常见于 Flatpak、容器、`NoNewPrivs=yes` 的服务或 `fusermount3` 丢失 setuid。
+  **不要用 sudo 跑 GUI**（会把实例数据变成 root 所有）；请在普通桌面会话启动，并确认
+  `ls -l /dev/fuse $(command -v fusermount3)` 中设备可读写、`fusermount3` 带 `-rws`。这属于权限/环境问题，
+  appclone 不会静默降级 `strace` 掩盖它。
 - **GUI 起不来**：确认 `libgtk-4.so.1` 与 `libadwaita-1.so.0` 的版本达到上表下限。
 
 ## 开发

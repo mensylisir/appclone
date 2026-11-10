@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"syscall"
 	"time"
 )
 
@@ -77,11 +78,32 @@ func (e *Env) newProbeWorkDir(app string) (string, error) {
 // sweepStaleProbes 清掉上一轮残留（§3.2.3）：仍挂载的先 `fusermount -uz`，
 // 然后**先做污染检查再删**——残留的 upper 里可能就有用户文件。
 func (e *Env) sweepStaleProbes() error {
-	dirs, err := filepath.Glob(filepath.Join(e.tmpRoot(), fmt.Sprintf("appclone-probe-%d-*", e.UID)))
+	if err := e.sweepProbeRoot(e.tmpRoot()); err != nil {
+		return err
+	}
+	// ADR-033 之前写层根是 /var/tmp：升级上来的机器里可能留着崩溃残留
+	// （含未卸载的挂载点）。它们再也不会被探测命中，必须一次性扫掉。
+	// 只扫 appclone-probe-*，绝不碰 appclone-quarantine-*。
+	// 测试注入 TmpRoot 时只扫注入根：生产旧根里是**真实**残留，不能让
+	// 单测顺手删掉用户机器上的现场。
+	if e.TmpRoot == "" && legacyTmpRoot != e.tmpRoot() {
+		return e.sweepProbeRoot(legacyTmpRoot)
+	}
+	return nil
+}
+
+func (e *Env) sweepProbeRoot(root string) error {
+	dirs, err := filepath.Glob(filepath.Join(root, fmt.Sprintf("appclone-probe-%d-*", e.UID)))
 	if err != nil {
 		return nil
 	}
 	for _, d := range dirs {
+		// /tmp 与 /var/tmp 都是世界可写：只处理属主是本 uid 的**目录**。
+		// 别的用户预置同名条目时，搬走/删除既可能被粘滞位拒绝，也会让我们
+		// 把一个不属于自己的目录拷进 quarantine。
+		if !dirOwnedBy(d, e.UID) {
+			continue
+		}
 		merged := filepath.Join(d, "merged")
 		if mounted(merged) {
 			if err := umount(merged); err != nil {
@@ -90,18 +112,59 @@ func (e *Env) sweepStaleProbes() error {
 		}
 		upper := filepath.Join(d, "upper")
 		entries, present, rerr := readUpperTree(upper)
-		if rerr != nil || !present || len(entries) == 0 {
-			os.RemoveAll(d)
+		// 读失败不能当"空"：看不见内容恰恰说明里面可能有用户文件
+		// （与 sweepOneAudit 同一口径）。只有确认存在且为空才删。
+		if rerr == nil && present && len(entries) == 0 {
+			if err := os.RemoveAll(d); err != nil {
+				return errEnv("err.env.write", map[string]any{"path": d}, err)
+			}
 			continue
 		}
-		// 有内容：可能含用户文件，改名保留而不是删。
-		q := filepath.Join(e.tmpRoot(), fmt.Sprintf("appclone-quarantine-%d-%s", e.UID,
-			time.Now().UTC().Format("20060102T150405")+"-"+randSuffix()))
-		if err := os.Rename(d, q); err != nil {
+		if _, err := e.quarantineDir(d); err != nil {
 			return errEnv("err.probe.quarantine_failed", map[string]any{"path": d}, err)
 		}
 	}
 	return nil
+}
+
+// quarantineDir 把可能含用户文件的目录搬去保留区，并返回最终落点。
+//
+// 优先持久的 /var/tmp；写层根在 tmpfs 时（/tmp、$XDG_RUNTIME_DIR）跨设备
+// 只能**拷贝**，而 chmod 000 的子树连属主都读不了——拷贝失败不能让现场卡死
+// 后续探测/审计。此时退回写层根内的同文件系统 rename：名字仍唯一、内容不动，
+// 只是持久性降到重启为止。
+//
+// 注意"拷贝成功、删源失败"（子目录 0555 且含文件）：那**不是**搬迁失败，
+// 完整副本就在 q，必须把 q 交给用户；再拿残缺的源去 rename 只会指向副本。
+func (e *Env) quarantineDir(src string) (string, error) {
+	name := fmt.Sprintf("appclone-quarantine-%d-%s", e.UID,
+		time.Now().UTC().Format("20060102T150405")+"-"+randSuffix())
+	q := filepath.Join(e.quarantineRoot(), name)
+	err := moveDir(src, q)
+	if err == nil || dstComplete(err) {
+		return q, nil
+	}
+	fallback := filepath.Join(e.tmpRoot(), name)
+	if ferr := moveDir(src, fallback); ferr != nil && !dstComplete(ferr) {
+		// 两个都失败：源必须原样留着（moveDir 保证拷贝未完成时不动源）。
+		return "", err
+	}
+	return fallback, nil
+}
+
+// legacyTmpRoot 是 ADR-033 之前的写层根（/var/tmp）。变量化只为测试注入：
+// 生产路径永远是 /var/tmp，单测不能去碰真实旧根。
+var legacyTmpRoot = "/var/tmp"
+
+// dirOwnedBy 判断路径是不是本 uid 的目录（不跟随软链）。世界可写目录里的
+// 同名条目可能是别的用户放的，不能当成自己的残留处理。
+func dirOwnedBy(path string, uid int) bool {
+	fi, err := os.Lstat(path)
+	if err != nil || !fi.IsDir() {
+		return false
+	}
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	return ok && int(st.Uid) == uid
 }
 
 // randSuffix 给 quarantine 名加随机尾巴：同一秒内两次命中污染时不能撞名

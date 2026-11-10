@@ -27,7 +27,8 @@ func newDoctorCmd(a *app) *cobra.Command {
 	c := &cobra.Command{
 		Use:   "doctor [<app> [<id>]]",
 		Short: "环境检查（bwrap / userns / AppArmor / fuse / dbus / gio / GTK）",
-		Long: `环境检查，排障用、只读。
+		Long: `环境检查，排障用。不改状态目录、不建实例、不写探针文件；
+fuse 检查会在写层根建一个临时目录真挂一次 overlay，结束即删。
 
 退出码约定：报告完成即 0（结论在输出里），参数错误 2，
 只有 --strict 才在必需项失败时返回 3——否则脚本无法区分
@@ -213,7 +214,7 @@ func (a *app) runVerify(cmd *cobra.Command, args []string) error {
 			if v.Quarantine != "" {
 				fmt.Println("证据保留：是（已搬到 " + v.Quarantine + "）")
 			} else {
-				// 不写死 audit/：不完整证据通常在工作区（/var/tmp 的写层），
+				// 不写死 audit/：不完整证据通常在工作区（写层根 /tmp），
 				// 指错目录比只说"没删"更糟。
 				fmt.Println("证据保留：是（未自动清理）")
 			}
@@ -245,9 +246,10 @@ func unverifiedWhy(reason string) string {
 }
 
 // required 区分"没有它产品起不来"和"没有它只是降级"。
-// fuse 本身不是必需（缺了可走 strace），但 probeBackend 在 fuse 与 strace
-// 两者都不可用时会把 "fuse" 检查标成 fail——那意味着**无法探测新应用**，
-// --strict 应当红。只缺 fuse 且 strace 在时该检查是 warn，不会触发退出码 3。
+// fuse 本身不是必需（缺了可走 strace），但 fuse 与 strace 两者都不可用时
+// 该检查是 fail——那意味着**无法探测新应用**，--strict 应当红。只缺 fuse
+// 且 strace 在时是 warn，不触发退出码 3；"装了但挂载被拒"同样是 fail
+// （ADR-032：此时不会降级，用户必须修环境）。
 func required(id string) bool {
 	switch id {
 	case "bwrap", "userns", "apparmor", "state-dir", "fuse":
@@ -259,6 +261,28 @@ func required(id string) bool {
 func runChecks(a *app) []check {
 	var out []check
 	add := func(id, status, detail string) { out = append(out, check{ID: id, Status: status, Detail: detail}) }
+
+	// root 下 fuse 挂载不需要 fusermount3 的 setuid，普通用户却需要：sudo
+	// 跑 doctor 会给出"可用"，而真实桌面探测仍被拒。产品本身拒绝 root 运行，
+	// 这里至少把结论的适用范围说清楚。
+	if os.Geteuid() == 0 {
+		add("user", "warn", "以 root 运行：fuse/userns 检查结果不代表普通用户，请用日常账号重跑；不要 sudo 运行 appclone")
+	}
+
+	// 写层根放 /tmp 是为了进 fusermount3 的 AppArmor 白名单（ADR-033）；
+	// 但部分发行版把 /tmp 挂成 tmpfs，探测会话里应用写的 ~/.cache 会吃内存。
+	// 这不是错误（探测仍能跑），但装大应用的用户需要知道 ENOSPC 从哪来。
+	root := core.DefaultTmpRoot()
+	var fs unix.Statfs_t
+	if err := unix.Statfs(root, &fs); err == nil {
+		if fs.Type == unix.TMPFS_MAGIC {
+			add("probe-root", "warn", "探测写层根 "+root+" 在 tmpfs（内存）上：大缓存应用可能因空间不足中断；可把 /tmp 挂到磁盘，或减少探测会话里的写入")
+		} else {
+			add("probe-root", "ok", "探测写层根 "+root)
+		}
+	} else {
+		add("probe-root", "fail", "探测写层根 "+root+" 不可用："+err.Error())
+	}
 
 	if p, err := exec.LookPath("bwrap"); err == nil {
 		v := strings.TrimSpace(runOut(p, "--version"))
@@ -302,11 +326,36 @@ func runChecks(a *app) []check {
 	// 是最常见的形态，Stat 会说"有"，实际挂载立刻失败。
 	devFuseOK := unix.Access("/dev/fuse", unix.R_OK|unix.W_OK) == nil
 	_, straceErr := exec.LookPath("strace")
-	status, detail := probeBackend(fuseErr == nil, devFuseOK, straceErr == nil)
-	if status == "ok" {
-		detail = "fuse-overlayfs 可用（" + fusePath + "）"
+	switch {
+	case fuseErr == nil && devFuseOK:
+		// 静态检查会假阳性（容器/沙盒里 binary 与设备都在，mount 仍被拒），
+		// doctor 的价值就是给结论，所以真挂一次空目录。
+		if mountErr := a.env.OverlayAvailable(); mountErr != nil {
+			switch key := core.ProbeErrorKey(mountErr); {
+			case key == "err.probe.workroot_unavailable" || key == "err.env.mkdir":
+				// 写层根建不出来不是 fuse 的问题：别叫用户去装 fuse3。
+				add("fuse", "fail", "写层根目录不可写（/tmp 或 XDG_RUNTIME_DIR）：探测与审计都无法开始。请检查磁盘空间与目录权限")
+			case core.ProbeBackendKeyMissing(key):
+				// 静态检查漏看的那一半：fuse-overlayfs 与 /dev/fuse 都在，
+				// 但没有 fusermount3/fusermount。判据必须与 Probe 一致——
+				// 有 strace 时探测会降级，doctor 不能说"不可用"。
+				if core.ProbeFallsBackToStrace(mountErr) {
+					add("fuse", "warn", "fuse-overlayfs 在，但找不到 fusermount3/fusermount：探测将降级到 strace（覆盖不完整），装 fuse3 更稳妥")
+				} else {
+					add("fuse", "fail", "fuse-overlayfs 在，但找不到 fusermount3/fusermount，且缺少 strace：无法探测新应用")
+				}
+			default:
+				// ADR-032：挂载被拒不是"降级"，探测根本无法开始。这里必须 fail
+				// （--strict 要红），并给出可操作指引，而不是说"可用"。
+				add("fuse", "fail", "fuse-overlayfs 已安装，但挂载被拒（权限/沙盒）；不会降级 strace。请从普通桌面会话启动，确认 /dev/fuse 可读写、fusermount3 带 setuid（-rws）")
+			}
+		} else {
+			add("fuse", "ok", "fuse-overlayfs 可用（"+fusePath+"，冒烟挂载通过）")
+		}
+	default:
+		status, detail := probeBackend(fuseErr == nil, devFuseOK, straceErr == nil)
+		add("fuse", status, detail)
 	}
-	add("fuse", status, detail)
 
 	if p, err := exec.LookPath("dbus-daemon"); err == nil {
 		add("dbus", "ok", p)
@@ -326,8 +375,9 @@ func runChecks(a *app) []check {
 		add("libadwaita", st, dt)
 	}
 
-	// 数据目录可写性：doctor 是**只读**命令，不创建目录、不写探针文件——
-	// 那超出了 §4 的写入白名单，而且一个"检查环境"的命令顺手改环境会让人不敢用。
+	// 数据目录可写性：doctor 不碰状态目录（不建实例、不改档案、不写探针）。
+	// fuse 检查会建一个临时目录真挂一次 overlay，结束即删——那是"判环境"必须
+	// 付出的代价，命令描述里已写明。
 	if fi, err := os.Stat(a.env.Base); err == nil {
 		if !fi.IsDir() {
 			// 同名普通文件：Access(W_OK) 会说"可写"，然后第一次 add 就报错。

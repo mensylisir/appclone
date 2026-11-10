@@ -39,6 +39,11 @@ export AC_BASE="$ROOT/appclone-base"
 mkdir -p "$HOME/Downloads" "$XDG_CONFIG_HOME" "$XDG_DATA_HOME/applications" \
          "$XDG_STATE_HOME" "$XDG_CACHE_HOME" "$XDG_RUNTIME_DIR" "$AC_BASE"
 chmod 700 "$XDG_RUNTIME_DIR"
+# 与 core.DefaultTmpRoot 同一规则（ADR-033）：/tmp 可写就用它，否则退 runtime dir。
+# 残留检查与审计断言必须跟着同一个根，否则会在错误的目录里"全绿"。
+if [ -w /tmp ]; then WORKROOT=/tmp
+elif [ -w "$XDG_RUNTIME_DIR" ]; then WORKROOT="$XDG_RUNTIME_DIR"
+else WORKROOT=/tmp; fi
 
 # 公共目录清单：探测不允许回退默认名，必须有一份可读的 user-dirs.dirs。
 cat >"$XDG_CONFIG_HOME/user-dirs.dirs" <<'EOS'
@@ -97,8 +102,8 @@ fi
 
 echo
 echo "== 5) 探测结束后不许有残留挂载点/写层"
-left=$(find /var/tmp -maxdepth 1 -name "appclone-probe-$(id -u)-*" 2>/dev/null | wc -l)
-[ "$left" = "0" ] || { echo "有 $left 个残留目录：" >&2; find /var/tmp -maxdepth 1 -name "appclone-probe-$(id -u)-*" >&2; exit 7; }
+left=$(find "$WORKROOT" -maxdepth 1 -name "appclone-probe-$(id -u)-*" 2>/dev/null | wc -l)
+[ "$left" = "0" ] || { echo "有 $left 个残留目录：" >&2; find "$WORKROOT" -maxdepth 1 -name "appclone-probe-$(id -u)-*" >&2; exit 7; }
 mountinfo=$(grep -c "appclone-probe-$(id -u)-" /proc/self/mountinfo || true)
 [ "$mountinfo" = "0" ] || { echo "还有挂载点没卸载：" >&2; grep "appclone-probe-$(id -u)-" /proc/self/mountinfo >&2; exit 7; }
 
@@ -116,7 +121,7 @@ echo "== 7) run --audit：审计层 → 证据 → 结论"
 "$CLI" run --audit probedemo main || exit 9
 auditdir="$inst/audit"
 [ -f "$auditdir/run.toml" ] || { echo "审计结束后应留下 run.toml（正常跑完的凭证）" >&2; exit 10; }
-workdir="/var/tmp/appclone/audit.$(id -u)/probedemo.main"
+workdir="$WORKROOT/appclone/audit.$(id -u)/probedemo.main"
 [ -d "$workdir/upper" ] || { echo "审计写层不在预期位置：$workdir/upper" >&2; exit 10; }
 
 echo

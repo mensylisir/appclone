@@ -51,7 +51,7 @@ func (v Verdict) ExitCode() int {
 
 // AuditDir 返回实例的审计目录：放 `run.toml` / `summary.toml` 这类凭证，
 // 以及作废时搬进来的 `quarantine-*`（**里面可能装着用户文件，永不自动删**）。
-// overlay 的 upper/work/merged 不在这里——它们在 /var/tmp（§4.4/§6.5）。
+// overlay 的 upper/work/merged 不在这里——它们在写层根 /tmp（§4.4/§6.5，ADR-033）。
 func (e *Env) AuditDir(app, id string) string {
 	return filepath.Join(e.InstancePath(app, id), "audit")
 }
@@ -84,17 +84,27 @@ func (e *Env) latestQuarantine(app, id string) string {
 
 // AuditWorkDir 是审计 overlay 的写层位置（§4.4/§6.5）：`upper/`、`work/`、`merged/`
 // 必须在有效 HOME **之外**——overlay 的 upper 落在它自己的 lower 里会 ELOOP，
-// 而且 AC_BASE 默认就在 `$HOME` 内。所以这里落在 `/var/tmp`，与实例目录分开。
+// 而且 AC_BASE 默认就在 `$HOME` 内。所以这里落在写层根 `/tmp`（ADR-033），与实例目录分开。
 func (e *Env) AuditWorkDir(app, id string) string {
 	return filepath.Join(e.tmpRoot(), "appclone", fmt.Sprintf("audit.%d", e.UID), app+"."+id)
 }
 
-// upperDir 定位要读的 upper：优先标准位置（审计写层），回退到实例内的
-// `audit/upper`（写入器落地前，手工排障与测试把证据放这里）。
+// upperDir 定位要读的 upper：优先新写层根，其次旧根 /var/tmp（ADR-033
+// 升级路径），最后回退到实例内的 `audit/upper`（写入器落地前，手工排障与
+// 测试把证据放这里）。
 func (e *Env) upperDir(app, id string) string {
 	work := filepath.Join(e.AuditWorkDir(app, id), "upper")
 	if _, err := os.Stat(work); err == nil {
 		return work
+	}
+	// 升级路径（ADR-033）：旧版本的审计写层在 /var/tmp。若那边还留着已跑完、
+	// 尚未 verify 的证据，必须能继续消费——否则 verify 会判"证据不完整"，
+	// 用户以为审计结论丢了。新根优先，旧根只在新根没有时作为回退。
+	if e.TmpRoot == "" {
+		legacy := filepath.Join(legacyTmpRoot, "appclone", fmt.Sprintf("audit.%d", e.UID), app+"."+id, "upper")
+		if _, err := os.Stat(legacy); err == nil {
+			return legacy
+		}
 	}
 	return filepath.Join(e.AuditDir(app, id), "upper")
 }
@@ -255,20 +265,24 @@ func (e *Env) finalize(app, id string, p Profile, v Verdict) (Verdict, error) {
 	// 处置顺序：先把证据搬走/删掉，再写摘要——反过来一旦摘要写成功、
 	// 处置失败，下一次 verify 会把"已消费"当成结论，现场就再也找不回了。
 	//
-	// 搬运用 moveDir 而不是 os.Rename：写层在 /var/tmp，实例目录在 $HOME，
+	// 搬运用 moveDir 而不是 os.Rename：写层在 /tmp，实例目录在 $HOME，
 	// 两者常常不在同一个文件系统上（/home 独立分区是普通桌面配置），
 	// rename 会 EXDEV 直接失败，leak 结论永远落不了地。
 	switch {
 	case v.Conclusion == VerdictLeak || v.Reason == "extract_failed":
 		q := filepath.Join(audit, "quarantine-"+time.Now().UTC().Format("20060102T150405")+"-"+randSuffix())
-		if err := moveDir(e.upperDir(app, id), q); err != nil {
+		if err := moveDir(e.upperDir(app, id), q); err != nil && !dstComplete(err) {
+			// 副本完整、只是源删不干净时按成功处理：证据在 q，别报失败把
+			// 用户引向残缺的另一份；残留由下次清扫收拾。
 			return Verdict{}, errEnv("err.probe.quarantine_failed", map[string]any{"path": q}, err)
 		}
 		e.removeAuditWork(app, id)
 		v.Retained = true
 		v.Quarantine = q
 	case v.Conclusion == VerdictVerified:
-		if err := os.RemoveAll(e.upperDir(app, id)); err != nil {
+		// upper 里只有声明范围内的写入，删掉是对的；但应用可能把某个子目录
+		// 改成 0555，裸 RemoveAll 会让一个已验证的结论无法收尾。
+		if err := makeWritableAndRemove(e.upperDir(app, id)); err != nil {
 			return Verdict{}, errEnv("err.env.write", map[string]any{"path": e.upperDir(app, id)}, err)
 		}
 		e.removeAuditWork(app, id)

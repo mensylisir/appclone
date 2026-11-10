@@ -68,8 +68,18 @@ type ui struct {
 	softDismissFn func(adw.Banner)
 	fatal         bool
 	degraded      bool
+	// fuseBlocked：fuse 挂载不可用（缺失或权限/沙盒被拒）。与 degraded 分开：
+	// 只有前者能自动降级 strace（ADR-032）；但两者都会让克隆起步失效，所以
+	// fork 开关看 fuseBlocked，横幅看 degraded。
+	fuseBlocked bool
+	// fuseErrKey 是自检失败的 core 错误键：横幅文案要按"组件缺失 / 写层
+	// 不可写 / 挂载被拒"分流，不能把没装组件说成权限问题。
+	fuseErrKey    string
 	softDismissed bool
-	envChecked    bool
+	// softReason 记着当前横幅是哪一种原因。原因变化时重置"了解"——用户收掉
+	// 的是上一条消息，不能让它在环境恶化后继续保持沉默。
+	softReason string
+	envChecked bool
 
 	apps   []core.App
 	groups []*adw.PreferencesGroup
@@ -393,7 +403,7 @@ func (u *ui) buildWindow() {
 	u.hold(&searchcb, &esccb)
 
 	// 关窗时先取消正在跑的探测：Probe 的 defer 会卸载 overlay、按规则
-	// 保留/清掉写层；不取消就退出，/var/tmp 下会留下挂载点与现场。
+	// 保留/清掉写层；不取消就退出，写层根下会留下挂载点与现场。
 	// 创建/保存是事务态：关窗不能把事务打断在半路（半成品比多等一秒更糟），
 	// 与 Esc、返回手势同一条规则（§6.1）。
 	closecb := func(_ gtk.Window) bool {
@@ -465,18 +475,22 @@ func (u *ui) checkEnv() {
 			u.envChecked = true
 			wasFatal := u.fatal
 			u.fatal = bwrapErr != nil
-			u.degraded = bwrapErr == nil && fuseErr != nil
+			u.fuseBlocked = bwrapErr == nil && fuseErr != nil
+			u.fuseErrKey = core.ProbeErrorKey(fuseErr)
+			// 降级横幅只在"真的会改用 strace"时出现；挂载被拒是错误，
+			// 由探测页直接展示可操作提示，不能谎称已降级（ADR-032）。
+			u.degraded = bwrapErr == nil && core.ProbeFallsBackToStrace(fuseErr)
 			u.applyEnvBanners()
 			// 确认页可能先于自检落地（open/clone 直接进确认态）：开关的
 			// 可用性不能只在渲染那一刻取快照。环境变化时同步一次；降级
 			// 后已勾选的克隆起步一并撤销——它此刻不可能生效，留着只会
 			// 让用户在不知情的情况下得到一个空实例。
 			if v := u.activeSetup; v != nil && v.forkRow != nil {
-				if u.degraded && v.fork {
+				if u.fuseBlocked && v.fork {
 					v.fork = false
 					v.forkRow.SetActive(false)
 				}
-				v.forkRow.SetSensitive(!u.degraded)
+				v.forkRow.SetSensitive(!u.fuseBlocked)
 			}
 			if wasFatal != u.fatal {
 				// 只有可操作性变了才重建列表：每 30 秒无条件重建会打断滚动与焦点。
@@ -489,12 +503,51 @@ func (u *ui) checkEnv() {
 
 func (u *ui) applyEnvBanners() {
 	u.fatalBanner.SetRevealed(u.fatal)
-	u.softBanner.SetRevealed(u.degraded && !u.fatal && !u.softDismissed)
+	reason := u.softReasonNow()
+	if reason != u.softReason {
+		u.softReason = reason
+		u.softDismissed = false
+	}
+	if reason != "" {
+		u.softBanner.SetTitle(u.bannerTitle(reason))
+	}
+	u.softBanner.SetRevealed(reason != "" && !u.fatal && !u.softDismissed)
 	// 致命态下搜索也停用：搜出一排点不动的开关，只会让用户以为程序坏了。
 	u.search.SetSensitive(!u.fatal)
 }
 
 // allocText 把绝对路径换成 ~ 形式，只用于展示。
+// bannerTitle 用显式 switch 而不是把键前缀与原因拼接：i18n 测试会扫
+// tr() 的字面量键，动态拼接既查不到缺翻译，也让键名无法静态核对。
+func (u *ui) bannerTitle(reason string) string {
+	switch reason {
+	case "degraded":
+		return u.tr("ui.banner.degraded", nil)
+	case "workroot_unavailable":
+		return u.tr("ui.banner.workroot_unavailable", nil)
+	case "backend_missing":
+		return u.tr("ui.banner.backend_missing", nil)
+	default:
+		return u.tr("ui.banner.fuse_blocked", nil)
+	}
+}
+
+// softReasonNow 把自检结果归成横幅原因（也是 i18n 键后缀）。三类的处置
+// 完全不同：装组件 / 修写层目录 / 修挂载权限，不能合并成一句"兼容模式"。
+func (u *ui) softReasonNow() string {
+	switch {
+	case u.degraded:
+		return "degraded"
+	case u.fuseErrKey == "err.probe.workroot_unavailable" || u.fuseErrKey == "err.env.mkdir":
+		return "workroot_unavailable"
+	case u.fuseBlocked && core.ProbeBackendKeyMissing(u.fuseErrKey):
+		return "backend_missing"
+	case u.fuseBlocked:
+		return "fuse_blocked"
+	}
+	return ""
+}
+
 func (u *ui) allocText(p string) string {
 	home := u.env.Resolver.Home
 	if p == home {

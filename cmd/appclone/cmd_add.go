@@ -67,7 +67,7 @@ func newAddCmd(a *app) *cobra.Command {
 				return core.NewUsage("--fork 需要创建实例，不能与 --profile-only 同用")
 			}
 			// 探测会把应用跑起来，用户随时可能 Ctrl-C：信号要能传到 context，
-			// 否则 defer 全部跳过、/var/tmp 下留下挂载点与写层（§3.2.3）。
+			// 否则 defer 全部跳过、写层根下留下挂载点与写层（§3.2.3）。
 			ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 			defer stop()
 			// 写操作全程持全局锁：命名空间变更必须串行化（§4.2）。

@@ -2,6 +2,7 @@ package core
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -574,5 +575,34 @@ func TestVerifyAuditIncompletePointsToQuarantine(t *testing.T) {
 	}
 	if v.Reason != "audit_incomplete" || v.Quarantine != "" {
 		t.Fatalf("现场在工作区时不应指向旧 quarantine，得到 %+v", v)
+	}
+}
+
+// ADR-033 升级路径：新根没有证据时，verify 必须还能读到旧根 /var/tmp 下
+// 已完成、未消费的审计写层，否则升级后结论会退化成"证据不完整"。
+func TestUpperDirFallsBackToLegacyRoot(t *testing.T) {
+	old := legacyTmpRoot
+	legacyTmpRoot = t.TempDir()
+	t.Cleanup(func() { legacyTmpRoot = old })
+
+	e := probeEnv(t)
+	legacy := filepath.Join(legacyTmpRoot, "appclone",
+		fmt.Sprintf("audit.%d", e.UID), "demo.main", "upper")
+	if err := os.MkdirAll(legacy, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	// 生产形态：TmpRoot 为空才会去看旧根。
+	e.TmpRoot = ""
+	if got := e.upperDir("demo", "main"); got != legacy {
+		t.Fatalf("应回退到旧根 %s，得到 %s", legacy, got)
+	}
+	// 新根一旦有 upper，旧根不得再被选中（新证据优先）。
+	e.TmpRoot = t.TempDir()
+	fresh := filepath.Join(e.AuditWorkDir("demo", "main"), "upper")
+	if err := os.MkdirAll(fresh, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if got := e.upperDir("demo", "main"); got != fresh {
+		t.Fatalf("新根有证据时应优先新根，得到 %s", got)
 	}
 }

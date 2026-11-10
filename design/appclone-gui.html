@@ -419,7 +419,11 @@
   <div class="banner" id="banner">
     ⚠ 分身功能不可用：未检测到 bubblewrap (bwrap)。装好它之前，下面的开关不会有反应。
   </div>
-  <!-- AdwBanner · 降级：探测能力下降，可确认关闭，不影响开关 -->
+  <!-- AdwBanner · 探测能力下降：可确认关闭，不影响已有分身的开关。
+       两种原因共用这一条横幅、交互完全相同（显示 / 「了解」收起），只有文案不同：
+       ① 缺 fuse-overlayfs → 走 strace 兼容模式，结果可能不完整；
+       ② fuse 存在但挂载被拒（权限 / 沙盒）→ **不降级**，提示从普通桌面会话启动、
+          确认 /dev/fuse 与 fusermount3 的 setuid。见 ADR-032。 -->
   <div class="banner soft" id="bannerSoft">
     ⚠ 探测将在兼容模式下进行（未检测到 fuse-overlayfs），结果可能不完整。
     <button id="bannerSoftDismiss">了解</button>

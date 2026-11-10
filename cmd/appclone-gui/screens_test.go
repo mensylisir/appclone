@@ -36,20 +36,36 @@ import (
 )
 
 // noFuseMounter：闸门只验页面生命周期，不该在 $TMPDIR 做一次真实
-// fuse-overlay 冒烟挂载（checkEnv 会调 Available）。报"不可用"让界面走
-// 降级分支，同时证明降级不挡这条流程。
+// fuse-overlay 冒烟挂载（checkEnv 会调 Available）。报**后端缺失**这一
+// 精确原因（真实实现缺二进制时也是这个键），界面才会走 strace 降级分支；
+// 随便一个 error 现在按"挂载被拒"处理（ADR-032），不会降级。
+// 降级判定还要求 PATH 里有 strace——闸门环境（本机与 CI）都装。
 type noFuseMounter struct{}
 
-func (noFuseMounter) Available() error { return errors.New("gtk e2e：不做 fuse 冒烟") }
+func (noFuseMounter) Available() error {
+	return &core.Error{Code: core.CodeEnv, Key: "err.probe.no_fuse_overlayfs"}
+}
 
 func (noFuseMounter) Mount(string, string, string, string) (func() error, error) {
+	return nil, errors.New("gtk e2e：不做挂载")
+}
+
+// deniedMounter：fuse 装了、但挂载被拒（权限/沙盒）。这是 ADR-032 明确
+// 不许静默降级的那一类——界面必须报错并给出环境处置，不能显示"兼容模式"。
+type deniedMounter struct{}
+
+func (deniedMounter) Available() error {
+	return &core.Error{Code: core.CodeEnv, Key: "err.probe.mount_failed"}
+}
+
+func (deniedMounter) Mount(string, string, string, string) (func() error, error) {
 	return nil, errors.New("gtk e2e：不做挂载")
 }
 
 // availableMounter：自检报告 fuse 可用、但从不真的挂载。用于"开关必须
 // 可拨"的用例——noFuseMounter 会让界面进入降级态并按设计禁用克隆开关，
 // 用例再去拨它就成了和产品规则对抗（自检晚到的 SetSensitive 还会造成偶发
-// 回弹）。降级禁用由 TestGtkForkDisabledWhenDegraded 单独覆盖。
+// 回弹）。降级禁用由 TestGtkForkDisabledWhenFuseUnavailable 单独覆盖。
 type availableMounter struct{}
 
 func (availableMounter) Available() error { return nil }
@@ -114,7 +130,7 @@ func gtkTestEnv(t *testing.T, name string) (*core.Env, string) {
 	}
 	env.AppDirList = []string{appsDir}
 	env.Mounter = noFuseMounter{}
-	// 探测写层根默认是 /var/tmp；钉到测试根下，取消探测留下的临时目录
+	// 探测写层根默认是 /tmp；钉到测试根下，取消探测留下的临时目录
 	// 也只落在 $WORK，而不是共享临时目录。
 	env.TmpRoot = filepath.Join(root, "tmp")
 	if err := os.MkdirAll(env.TmpRoot, 0o700); err != nil {
@@ -1629,11 +1645,12 @@ func TestGtkForkTogglePersists(t *testing.T) {
 	}
 }
 
-// TestGtkForkDisabledWhenDegraded：缺 fuse-overlayfs 时「数据来源」开关必须
+// TestGtkForkDisabledWhenFuseUnavailable：fuse 不可用（后端缺失走 strace 降级，
+// 或挂载被拒）时「数据来源」开关必须
 // 禁用。允许拨动等于让用户相信克隆已生效，而 run 期每个路径都会降级跳过，
 // 最终得到一个空实例。判据是自检结果（noFuseMounter → degraded），不是渲染
 // 时刻的巧合；用例等 envChecked 再判定。
-func TestGtkForkDisabledWhenDegraded(t *testing.T) {
+func TestGtkForkDisabledWhenFuseUnavailable(t *testing.T) {
 	env, appsDir := gtkTestEnv(t, "forkdegraded")
 	env.Mounter = noFuseMounter{}
 	if err := os.WriteFile(filepath.Join(appsDir, "demo.desktop"),
@@ -1678,6 +1695,10 @@ func TestGtkForkDisabledWhenDegraded(t *testing.T) {
 			if !u.loaded || !u.envChecked {
 				return true
 			}
+			if !u.degraded || !u.fuseBlocked {
+				fail("后端缺失且 PATH 有 strace 时应判成降级（degraded=%v blocked=%v）", u.degraded, u.fuseBlocked)
+				return false
+			}
 			if !opened {
 				opened = true
 				if !u.pushSetup("demo", "open", func(bool) {}) {
@@ -1696,6 +1717,117 @@ func TestGtkForkDisabledWhenDegraded(t *testing.T) {
 			}
 			if v.forkRow.GetSensitive() {
 				fail("缺 fuse-overlayfs（降级态）时克隆起步开关必须禁用")
+				return false
+			}
+			app.Quit()
+			return false
+		}
+		glib.TimeoutAdd(50, &tick, 0)
+	}
+	app.ConnectActivate(&actcb)
+	u.hold(&actcb)
+
+	if code := app.Run(1, os.Args[:1]); code != 0 {
+		t.Fatalf("GTK 主循环退出码 %d", code)
+	}
+	if runErr != nil {
+		t.Fatal(runErr)
+	}
+	if !activated {
+		t.Fatal("activate 没有执行")
+	}
+}
+
+// TestGtkFuseDeniedIsAnErrorNotADegrade：fuse 装了但挂载被拒（权限/沙盒）
+// 时，界面必须报"不可用 + 怎么处理"，而不是显示"兼容模式"。静默降级会让
+// 用户在不知情下拿到低覆盖率结果——ADR-032 的核心禁止项。
+func TestGtkFuseDeniedIsAnErrorNotADegrade(t *testing.T) {
+	env, appsDir := gtkTestEnv(t, "fusedenied")
+	env.Mounter = deniedMounter{}
+	if err := os.WriteFile(filepath.Join(appsDir, "demo.desktop"),
+		[]byte("[Desktop Entry]\nType=Application\nName=Demo\nExec=/usr/bin/true\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := env.SaveProfile(core.Profile{
+		App: "demo", Version: core.ProfileVersion, Exec: "/usr/bin/true",
+		Paths: []string{"~/.config/Demo"}, ProbeMethod: "manual",
+		Ignored: core.DefaultIgnored(), Env: map[string]string{},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	env.CliPath = "/usr/bin/appclone"
+
+	app := adw.NewApplication("io.github.mensylisir.Appclone.GtkFuseDenied",
+		gio.GApplicationNonUniqueValue)
+	defer app.Unref()
+
+	u := &ui{app: app, env: env, lang: "zh_CN"}
+	var runErr error
+	activated, opened := false, false
+	fail := func(format string, a ...any) {
+		if runErr == nil {
+			runErr = fmt.Errorf(format, a...)
+		}
+		app.Quit()
+	}
+	actcb := func(_ gio.Application) {
+		if u.win != nil {
+			return
+		}
+		activated = true
+		u.buildWindow()
+		deadline := time.Now().Add(20 * time.Second)
+		var tick glib.SourceFunc
+		tick = func(uintptr) bool {
+			if time.Now().After(deadline) {
+				fail("等环境自检/确认页超时（loaded=%v envChecked=%v）", u.loaded, u.envChecked)
+				return false
+			}
+			if !u.loaded || !u.envChecked {
+				return true
+			}
+			if u.fatal {
+				fail("bwrap 可用时不该判成致命态")
+				return false
+			}
+			if u.degraded {
+				fail("挂载被拒不得判成 strace 降级（ADR-032）")
+				return false
+			}
+			if !u.fuseBlocked {
+				fail("挂载被拒没有记成 fuseBlocked")
+				return false
+			}
+			if !u.softBanner.GetRevealed() {
+				fail("挂载被拒时列表页没有报错横幅")
+				return false
+			}
+			if !strings.Contains(u.softBanner.GetTitle(), "FUSE") {
+				fail("横幅文案应说明 FUSE 挂载被拒，实际 %q", u.softBanner.GetTitle())
+				return false
+			}
+			if !u.search.GetSensitive() {
+				fail("挂载被拒只影响探测，不该禁用搜索")
+				return false
+			}
+			if !opened {
+				opened = true
+				if !u.pushSetup("demo", "open", func(bool) {}) {
+					fail("pushSetup 被拒绝")
+					return false
+				}
+				return true
+			}
+			v := u.activeSetup
+			if v == nil || v.state != "confirm" {
+				return true
+			}
+			if v.forkRow == nil {
+				fail("确认页没有数据来源开关")
+				return false
+			}
+			if v.forkRow.GetSensitive() {
+				fail("挂载被拒时克隆起步开关必须禁用（拨了也不会生效）")
 				return false
 			}
 			app.Quit()

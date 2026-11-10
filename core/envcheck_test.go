@@ -42,6 +42,30 @@ func TestOverlayAvailableUsesInjectedMounter(t *testing.T) {
 	}
 	e.Mounter = &fakeMounter{failOn: "available"}
 	if err := e.OverlayAvailable(); err == nil {
-		t.Fatal("fuse 不可用时必须报错（GUI 据此挂降级横幅）")
+		t.Fatal("fuse 不可用时必须报错（GUI 据此禁用克隆起步）")
+	}
+}
+
+// ADR-032：只有后端确实缺失且 strace 可用才降级；挂载被拒（权限/沙盒）
+// 不算降级——GUI 不能挂"已改用 strace"的横幅骗用户。
+func TestProbeFallsBackToStrace(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("PATH", dir)
+	missing := errEnv("err.probe.no_dev_fuse", nil, nil)
+	if ProbeFallsBackToStrace(missing) {
+		t.Fatal("PATH 里没有 strace 时不应声称会降级")
+	}
+	if err := os.WriteFile(filepath.Join(dir, "strace"), []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if !ProbeFallsBackToStrace(missing) {
+		t.Fatal("后端缺失 + strace 可用时应降级")
+	}
+	denied := errEnv("err.probe.mount_failed", map[string]any{"output": "Permission denied"}, nil)
+	if ProbeFallsBackToStrace(denied) {
+		t.Fatal("挂载被拒不能降级，必须让用户看到权限错误（ADR-032）")
+	}
+	if ProbeFallsBackToStrace(nil) {
+		t.Fatal("fuse 可用时不谈降级")
 	}
 }

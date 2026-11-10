@@ -31,9 +31,10 @@ type Env struct {
 	// RunCmd 覆盖"跑一个只读外部命令拿输出"（测试注入）。空值走 exec。
 	// 只有 L0 的 `flatpak info --show-permissions` 用它，所以抽成字段而不是多一层接口。
 	RunCmd func(ctx context.Context, name string, args ...string) (string, error)
-	// TmpRoot 是探测/审计写层的根（默认 /var/tmp，必须与 $HOME 分离）。
-	// 测试注入独立目录：否则用例之间会通过 /var/tmp 共享残留写层，
-	// 一个用例的 upper 让另一个用例的 verify 读到"证据不完整"。
+	// TmpRoot 是探测/审计写层的根（默认 $XDG_RUNTIME_DIR 或 /tmp，必须与
+	// $HOME 分离；见 tmpRoot 的注释）。测试注入独立目录：否则用例之间会通过
+	// 共享目录看到对方的残留写层，一个用例的 upper 让另一个用例的 verify
+	// 读到"证据不完整"。
 	TmpRoot string
 
 	mu sync.Mutex // 进程内先互斥，再抢 flock：GUI 的探测 goroutine 与列表刷新
@@ -41,13 +42,58 @@ type Env struct {
 	// 所以锁文件只在 OpenState 里局部持有，不挂在 Env 上。
 }
 
-// tmpRoot 是写层根目录。默认 /var/tmp：必须在 $HOME 之外（overlay 的 upper
-// 嵌在 lower 里会 ELOOP），且不与用户在 /tmp 的临时文件混在一起。
+// tmpRoot 是写层根目录。必须在 $HOME 之外（overlay 的 upper 嵌在 lower 里
+// 会 ELOOP），**且必须在 fusermount3 的 AppArmor 白名单内**。
+//
+// 不能默认 /var/tmp：Ubuntu 26.04 给 /usr/bin/fusermount3 装了 AppArmor
+// profile，只允许在 $HOME、/tmp、/run/user/<uid>、/mnt、/media 下挂 FUSE。
+// 在 /var/tmp 下挂载会被 mount(2) 拒绝（"fusermount3: mount failed:
+// Permission denied"），探测与审计直接失败。ADR-033。
+//
+// /tmp 优先于 $XDG_RUNTIME_DIR：runtime dir 一定是 tmpfs，探测会话里应用
+// 写的 ~/.cache 可能上 GB，内存盘会把 ENOSPC 变成"探测半途失败且理由难懂"
+// （§4.4）。/tmp 在部分发行版也是 tmpfs——doctor 会就这一点 warn，探测失败
+// 时也会把 ENOSPC 归到写层根而不是应用本身。runtime dir 只在 /tmp 不可写
+// 时兜底，它同样在白名单内。
 func (e *Env) tmpRoot() string {
 	if e.TmpRoot != "" {
 		return e.TmpRoot
 	}
-	return "/var/tmp"
+	return DefaultTmpRoot()
+}
+
+// DefaultTmpRoot 是生产环境的写层根。doctor 的冒烟挂载与容量检查也必须
+// 用它：冒烟在 /tmp 过、探测在别的根被拒，正是"doctor 说可用、探测报错"
+// 的来源。
+func DefaultTmpRoot() string {
+	if dirWritable("/tmp") {
+		return "/tmp"
+	}
+	if rd := os.Getenv("XDG_RUNTIME_DIR"); filepath.IsAbs(rd) && dirWritable(rd) {
+		return rd
+	}
+	return "/tmp"
+}
+
+// dirWritable 只判"当前用户能否在这个目录里建东西"，不往里写任何文件：
+// tmpRoot 会被反复调用，留临时文件等于给清扫逻辑制造假残留。
+func dirWritable(dir string) bool {
+	return unix.Access(dir, unix.W_OK) == nil
+}
+
+// quarantineRoot 是保留现场（可能含用户文件）的目录。它不参与 FUSE 挂载，
+// 所以可以放在持久的 /var/tmp：写层根在 tmpfs 上时，上层目录也不会随重启
+// 丢掉证据。测试注入 TmpRoot 时跟随它，避免写真实 /var/tmp。
+func (e *Env) quarantineRoot() string {
+	if e.TmpRoot != "" {
+		return e.TmpRoot
+	}
+	// /var/tmp 缺失/不可写（精简容器、只读根）时退回写层根：宁可只保留到
+	// 重启，也不能让"保留用户文件"这一步直接失败、把探测/审计堵死。
+	if dirWritable("/var/tmp") {
+		return "/var/tmp"
+	}
+	return e.tmpRoot()
 }
 
 // NewEnv 从真实环境构造。

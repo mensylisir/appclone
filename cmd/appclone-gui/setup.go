@@ -691,7 +691,7 @@ func (v *setupView) renderConfirm() {
 		// 缺 fuse-overlayfs 时 fork 不会生效（run 期每个路径都降级跳过），
 		// 摆一个能拨的开关等于"看起来生效、实际建了个空实例"——与 rediscover
 		// 隐藏开关同一条原则。降级横幅已经解释了原因。
-		fr.SetSensitive(!v.u.degraded)
+		fr.SetSensitive(!v.u.fuseBlocked)
 		v.forkRow = fr
 		v.scope.switchRow(fr, func() { v.fork = fr.GetActive() })
 		fg.Add(&fr.Widget)
@@ -943,7 +943,7 @@ func (v *setupView) createInstance(p core.Profile) {
 }
 
 // notifyCanceledScene：取消探测时如果 core 保留了现场（公共目录可能被写进
-// upper），必须把路径告诉用户——否则文件被搬进 /var/tmp 却无处可寻。
+// upper），必须把路径告诉用户——否则文件被搬进 quarantine 却无处可寻。
 // 普通取消没有现场，什么都不提示。
 func (v *setupView) notifyCanceledScene(err error) {
 	var ce *core.Error

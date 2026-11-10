@@ -19,12 +19,14 @@ var moveRename = os.Rename
 // moveDir 把整个目录搬到 dst。同文件系统用 rename；跨文件系统（EXDEV）退化为
 // 拷贝 + 删除源。
 //
-// 为什么不能只写 os.Rename：审计写层固定在 /var/tmp，实例目录在 $HOME，
+// 为什么不能只写 os.Rename：审计写层在 /tmp（ADR-033），实例目录在 $HOME，
 // 而 /home 独立分区是普通桌面配置。rename 跨设备直接 EXDEV，leak 结论就永远
 // 落不了地——证据还在，但每次 verify 都报错。
 //
-// **任何失败都不删源**：搬的是可能属于用户的文件。只有拷贝完整（含目录项
-// 落盘）成功后，才允许删除源目录；拷贝中途失败时只回收 dst 这个刚写出的半成品。
+// **拷贝完成前绝不动源**：搬的是可能属于用户的文件。拷贝中途失败时只回收
+// dst 这个刚写出的半成品，源原样留着。拷贝 + fsync 都成功后才会删源；删源
+// 失败（子目录 0555 之类）不代表证据丢了——dst 已是完整副本，返回
+// *dstCompleteError 让调用方按"已搬走"处理，别把用户引向残缺的另一份。
 // dst 已存在直接失败：绝不先删一个我们没建过的目录——那可能是别人正在用的证据。
 func moveDir(src, dst string) error {
 	if _, err := os.Lstat(dst); err == nil {
@@ -47,7 +49,50 @@ func moveDir(src, dst string) error {
 		_ = os.RemoveAll(dst)
 		return err
 	}
-	return os.RemoveAll(src)
+	if err := os.RemoveAll(src); err != nil {
+		// 常见原因是应用自己把子目录改成 0555：我们对副本有完整控制权，
+		// 先在源树上补写权限再删一次。仍删不掉才交给调用方按"已搬走"处理。
+		if werr := makeWritableAndRemove(src); werr == nil {
+			return nil
+		}
+		return &dstCompleteError{dst: dst, err: err}
+	}
+	return nil
+}
+
+// removeChmod 只为单测替换：制造"连 chmod 都不允许"的源，验证 dstComplete 分支。
+var removeChmod = os.Chmod
+
+func makeWritableAndRemove(root string) error {
+	_ = filepath.WalkDir(root, func(p string, d fs.DirEntry, werr error) error {
+		if werr != nil {
+			return nil // 读不到的条目照样尝试 chmod：父目录先放权就可能读到
+		}
+		if d.IsDir() {
+			_ = removeChmod(p, 0o700)
+		}
+		return nil
+	})
+	return os.RemoveAll(root)
+}
+
+// dstCompleteError 表示"副本已完整落盘，只是源没删干净"。它不是搬迁失败：
+// 调用方必须按成功处理（证据在 dst），残留的源交给下一次 sweep。
+type dstCompleteError struct {
+	dst string
+	err error
+}
+
+func (e *dstCompleteError) Error() string {
+	return fmt.Sprintf("moveDir: destination complete (%s), source not fully removed: %v", e.dst, e.err)
+}
+
+func (e *dstCompleteError) Unwrap() error { return e.err }
+
+// dstComplete 判断 moveDir 的返回值是否只是"源删不干净"。
+func dstComplete(err error) bool {
+	var dc *dstCompleteError
+	return errors.As(err, &dc)
 }
 
 // copyTree 递归拷贝目录，保留普通文件内容与权限、保留软链。

@@ -15,13 +15,25 @@ func CheckBwrap() error {
 	return nil
 }
 
-// OverlayAvailable 报告探测能否走 overlay-diff（不挂载、不写任何东西）。
-// 不可用时探测会降级到 strace（§3.4），GUI 据此在列表页挂一条可「了解」
-// 的横幅、在探测页挂一条常驻横幅——降级是事实，不是通知。
+// OverlayAvailable 报告探测能否走 overlay-diff。真实现会做一次空目录冒烟
+// 挂载（结果进程内缓存），所以它回答的是"现在真的能挂吗"，不是"装了没"。
+// GUI 据此判断 fuse 是否可用；是否降级另由 ProbeFallsBackToStrace 决定。
 func (e *Env) OverlayAvailable() error {
 	m := e.Mounter
 	if m == nil {
 		m = fuseOverlayMounter{}
 	}
 	return m.Available()
+}
+
+// ProbeFallsBackToStrace 回答"这次 overlay 不可用会不会自动降级到 strace"。
+// 只有后端确实缺失（无 fuse-overlayfs/fusermount3、打不开 /dev/fuse）且
+// strace 在 PATH 时才成立；挂载被拒（权限/沙盒）不降级，会直接把可操作的
+// 错误交给用户（ADR-032）。GUI 用它在列表页挂降级横幅。
+func ProbeFallsBackToStrace(fuseErr error) bool {
+	if fuseErr == nil || !ProbeBackendMissing(fuseErr) {
+		return false
+	}
+	_, err := exec.LookPath("strace")
+	return err == nil
 }

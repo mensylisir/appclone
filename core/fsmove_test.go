@@ -1,6 +1,7 @@
 package core
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"syscall"
@@ -174,5 +175,45 @@ func TestMoveDirRefusesExistingDestination(t *testing.T) {
 	}
 	if _, err := os.Stat(src); err != nil {
 		t.Fatalf("源不能被删：%v", err)
+	}
+}
+
+// 拷贝完成、删源失败（子目录 0555 且含文件）不是搬迁失败：完整副本必须
+// 被交出去，而不是拿残缺的源再搬一次。非 root 才有权限语义；root 跳过。
+func TestQuarantineDirKeepsCompleteCopyWhenSourceCleanupFails(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root 无视目录权限，复现不了删源失败")
+	}
+	e := probeEnv(t)
+	src := filepath.Join(e.TmpRoot, fmt.Sprintf("appclone-probe-%d-locked", e.UID))
+	locked := filepath.Join(src, "upper", "locked")
+	if err := os.MkdirAll(locked, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(locked, "user-file"), []byte("keep me"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(locked, 0o555); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = filepath.WalkDir(e.TmpRoot, func(p string, _ os.DirEntry, _ error) error {
+			return os.Chmod(p, 0o700)
+		})
+	})
+	// 强制走跨设备分支，生产里 /tmp(tmpfs)→/var/tmp 就是这条；再让补权限
+	// 那一步失败，模拟"连 chmod 都不允许"的源（root 拥有的子树等）。
+	old := moveRename
+	moveRename = func(string, string) error { return &os.LinkError{Op: "rename", Err: syscall.EXDEV} }
+	oldChmod := removeChmod
+	removeChmod = func(string, os.FileMode) error { return syscall.EPERM }
+	t.Cleanup(func() { moveRename = old; removeChmod = oldChmod })
+
+	q, err := e.quarantineDir(src)
+	if err != nil {
+		t.Fatalf("拷贝已完成时不应报失败：%v", err)
+	}
+	if _, err := os.Stat(filepath.Join(q, "upper", "locked", "user-file")); err != nil {
+		t.Fatalf("返回的路径应是完整副本：%v", err)
 	}
 }

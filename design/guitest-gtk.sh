@@ -14,6 +14,9 @@
 #     事件走 libinput → GDK → 控件。窗口在用例期间全屏，结束即恢复。
 #     X11/Xvfb 下不启用：事件进宿主 seat，可能落到别的应用上。
 #
+# 注意：这个闸门在当前桌面**真的开窗口**（uinput 用例还会全屏并抢焦点）。
+# 不要在有用户操作的会话里循环重跑；无人值守时用 xvfb-run（真实输入会自动 SKIP）。
+#
 # 需要可用的显示与宿主 `bwrap`（缺任何一个都直接报错，不要让它跑 45 秒
 # 超时后才发现环境不对）；在假 HOME 下运行（不碰真实主目录），并临时构建
 # 一份 `appclone` CLI 放进 PATH——创建分身要生成指向 CLI 的桌面入口。
@@ -113,7 +116,7 @@ for name in TestGtkScreensLifecycle TestGtkLandsOnClonesView TestGtkEmptyStateMa
             TestGtkSetupStates TestGtkErrorState TestGtkRetryableError \
             TestGtkRapidRepush TestGtkFatalBanner TestGtkEnglishStrings \
             TestGtkDetailShowsStopWhenRunning TestGtkForkTogglePersists \
-            TestGtkForkDisabledWhenDegraded TestGtkAppIconFallback \
+            TestGtkForkDisabledWhenFuseUnavailable TestGtkAppIconFallback \
             TestGtkDialogResponses TestGtkCloseSwitchDialog \
             TestDetachedRunnerSpawn \
             TestDetachLogHelpers TestDetachedTargetEnv TestGtkRealInputUinput \

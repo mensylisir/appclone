@@ -288,8 +288,9 @@ func (e *Env) quarantinePendingAudit(in Instance) error {
 			return errEnv("err.env.mkdir", map[string]any{"path": audit}, err)
 		}
 		q := filepath.Join(audit, "quarantine-"+time.Now().UTC().Format("20060102T150405")+"-"+randSuffix())
-		if err := moveDir(upper, q); err != nil {
-			// 搬不动就拒绝开始：覆盖现场才是真正的数据丢失。
+		if err := moveDir(upper, q); err != nil && !dstComplete(err) {
+			// 搬不动就拒绝开始：覆盖现场才是真正的数据丢失。副本完整、只是
+			// 源删不干净时按已搬走处理，残留交给下一次清扫。
 			return errEnv("err.probe.quarantine_failed", map[string]any{"path": q}, err)
 		}
 	}
@@ -307,8 +308,23 @@ func (e *Env) quarantinePendingAudit(in Instance) error {
 // 早期版本按 glob 全量清，两个实例同时审计时 B 会卸掉 A 的挂载、把 A 的
 // 证据改名——正是"不阻塞新审计"放大出来的多实例事故。
 func (e *Env) sweepStaleAudits() error {
-	dirs, _ := filepath.Glob(filepath.Join(e.tmpRoot(), "appclone", fmt.Sprintf("audit.%d", e.UID), "*"))
+	if err := e.sweepAuditRoot(e.tmpRoot()); err != nil {
+		return err
+	}
+	// ADR-033 之前审计写层在 /var/tmp：升级上来的机器里可能留着崩溃残留，
+	// 新根扫不到它们。清扫规则完全相同（按实例判活、读失败就保留）。
+	if e.TmpRoot == "" && legacyTmpRoot != e.tmpRoot() {
+		return e.sweepAuditRoot(legacyTmpRoot)
+	}
+	return nil
+}
+
+func (e *Env) sweepAuditRoot(root string) error {
+	dirs, _ := filepath.Glob(filepath.Join(root, "appclone", fmt.Sprintf("audit.%d", e.UID), "*"))
 	for _, d := range dirs {
+		if !dirOwnedBy(d, e.UID) {
+			continue
+		}
 		skip, release := e.lockAuditWork(filepath.Base(d))
 		if skip {
 			release()
@@ -327,7 +343,8 @@ func (e *Env) sweepStaleAudits() error {
 //
 // 读不出 upper（目录被 chmod 000、子树 IO 错误）时按"可能有内容"处理，搬去
 // quarantine 而不是删除：读失败恰恰说明里面有我们看不见的东西，而它们可能
-// 是用户文件。rename 不需要子树可读，搬得动。
+// 是用户文件。跨设备拷贝读不动这样的子树，quarantineDir 会退回写层根内的
+// 同 fs rename，现场仍然留下。
 func (e *Env) sweepOneAudit(d string) error {
 	merged := filepath.Join(d, "merged")
 	if mounted(merged) {
@@ -340,9 +357,7 @@ func (e *Env) sweepOneAudit(d string) error {
 		os.RemoveAll(d)
 		return nil
 	}
-	q := filepath.Join(e.tmpRoot(), fmt.Sprintf("appclone-quarantine-%d-%s", e.UID,
-		time.Now().UTC().Format("20060102T150405")+"-"+randSuffix()))
-	if err := os.Rename(d, q); err != nil {
+	if _, err := e.quarantineDir(d); err != nil {
 		return errEnv("err.probe.quarantine_failed", map[string]any{"path": d}, err)
 	}
 	return nil
