@@ -275,9 +275,17 @@
   .chkrow input:checked ~ .cb { background:var(--accent); border-color:var(--accent); color:#fff }
   .cb::before { content:"✓" }
   .chkrow input:focus-visible ~ .cb { outline:2px solid var(--accent); outline-offset:2px }
+  /* 锁定行（cache）：没有 checkbox，不能被勾选，也不计入门禁 */
+  .chkrow[data-locked] { cursor:default; opacity:.72 }
+  .chkrow[data-locked]:hover { background:transparent }
+  .lockicon { flex:none; width:17px; text-align:center; font-size:12px; margin-left:3px; color:var(--faint) }
+  .reads-hidden { margin:6px 10px 0; font-size:11.5px; color:var(--faint) }
   .chip { flex:none; font-size:11px; font-weight:600; padding:2.5px 9px; border-radius:20px }
   .chip.config { background:var(--chip-blue-bg); color:var(--accent) }
   .chip.cache { background:var(--hover); color:var(--dim) }
+  .chip.credential { background:var(--chip-blue-bg); color:var(--accent) }
+  .chip.warn { background:var(--hover); color:var(--dim) }
+  .banner.inline[data-banner] { margin:10px 14px 0 }
   .locknote {
     margin:8px 10px 2px; padding:8px 12px; border-radius:8px; background:var(--hover);
     font-size:12px; color:var(--dim); line-height:1.5;
@@ -648,11 +656,13 @@ const apps = [
     hasProfile:true,  creatable:true,  probeMethod:'overlay',
     instances:[{id:'inst2', display_name:'分身 1', size:'86 MB', last:'昨天', running:true}] },
   { id:'qq',       name:'QQ',          letter:'Q', color:'#12b7f5',
-    hasProfile:true,  creatable:true,  probeMethod:'overlay', instances:[] },
+    hasProfile:true,  creatable:true,  probeMethod:'overlay', readTrace:'ok', noHomeReads:true, instances:[] },
   { id:'firefox',  name:'火狐浏览器', letter:'F', color:'#ff7139',
     hasProfile:true,  creatable:true,  probeMethod:'overlay', singleton:false, instances:[] },
   { id:'dingtalk', name:'钉钉',        letter:'钉', color:'#0089ff',
-    hasProfile:false, creatable:false, instances:[] },
+    hasProfile:false, creatable:false, readTrace:'partial', readsHidden:4, instances:[] },
+  { id:'zcode',    name:'ZCode',       letter:'Z', color:'#5b21b6',
+    hasProfile:false, creatable:false, readTrace:'unavailable', instances:[] },
   { id:'chrome',   name:'Chrome',      letter:'C', color:'#e2432e',
     hasProfile:false, creatable:false, singleton:false, instances:[] },
   { id:'slack',    name:'Slack',       letter:'S', color:'#611f69',
@@ -660,7 +670,7 @@ const apps = [
   /* 档案在、但里面记的路径已不存在（应用升级换了数据目录）：
      这是"档案失效"，不是"从没配过"——复用它等于造一个空隔离分身，必须重探 */
   { id:'notion',   name:'Notion',      letter:'N', color:'#1f1f1f',
-    hasProfile:true,  creatable:false, probeMethod:'overlay', singleton:false, instances:[] },
+    hasProfile:true,  creatable:false, probeMethod:'overlay', readTrace:'', singleton:false, instances:[] },
   /* 主实例正在运行：探测的第一道闸门就会挡住（最高频的首启失败） */
   { id:'obsidian', name:'Obsidian',    letter:'O', color:'#7c3aed',
     hasProfile:false, creatable:false, hostRunning:true, instances:[] },
@@ -674,45 +684,52 @@ const probeFails = new Set(['chrome']);
    拿不到次数。行内必须显示它——只给路径不给观测强度，用户无法判断哪条值得勾 */
 const pathCandidates = {
   dingtalk: [
-    { path:'~/.config/DingTalk',        chip:'config', checked:true,  observed:42, why:'应用配置目录 — 建议隔离' },
-    { path:'~/.local/share/DingTalk',   chip:'config', checked:true,  observed:1287, why:'应用数据目录 — 建议隔离' },
+    { path:'~/.config/DingTalk',        chip:'config', checked:true,  observed:42, reads:18, credential:'strong', why:'应用配置目录 — 含登录态，建议隔离' },
+    { path:'~/.local/share/DingTalk',   chip:'config', checked:true,  observed:1287, reads:306, containsCredential:true, why:'应用数据目录 — 建议隔离（包含登录态）' },
     { path:'~/.dingtalk',               chip:'config', checked:true,  observed:6,  why:'写死于 $HOME 的状态目录 — 建议隔离' },
-    { path:'~/.cache/DingTalk',         chip:'cache',  checked:false, observed:310, why:'缓存 — 默认不隔离（首次启动略慢，但省空间）' },
+    { path:'~/.cache/DingTalk',         chip:'cache',  locked:true, checked:false, observed:310, why:'缓存 — 不隔离（锁定）' },
+  ],
+  zcode: [
+    { path:'~/.zcode',                  chip:'config', class:'config', checked:false, observed:0, reads:0,
+      why:'读证据不可用，无法确认登录态路径 — 请至少勾选一条' },
+    { path:'~/Downloads/zcode-export',  chip:'public', class:'config', checked:false, warning:true,
+      why:'公共目录 — 强制共享，勾选也不计入门禁' },
+    { path:'~/.cache/zcode',            chip:'cache',  locked:true, checked:false, observed:22, why:'缓存 — 不隔离（锁定）' },
   ],
   wechat: [
     { path:'~/.config/wechat',          chip:'config', checked:true,  observed:64,  why:'应用配置目录 — 建议隔离' },
     { path:'~/.local/share/wechat',     chip:'config', checked:true,  observed:2401,why:'应用数据目录 — 建议隔离' },
-    { path:'~/.cache/wechat',           chip:'cache',  checked:false, observed:512, why:'缓存 — 默认不隔离' },
+    { path:'~/.cache/wechat',           chip:'cache',  locked:true, checked:false, observed:512, why:'缓存 — 不隔离（锁定）' },
   ],
   telegram: [
     /* 有实例在运行也能进详情→新建分身，所以这份候选必须存在：
        缺了它「新建分身」会走进一个确认按钮恒灰的死入口（门禁只数 config 项） */
     { path:'~/.local/share/TelegramDesktop', chip:'config', checked:true, observed:733, why:'应用数据目录 — 建议隔离' },
-    { path:'~/.cache/TelegramDesktop',       chip:'cache',  checked:false, observed:96, why:'缓存 — 默认不隔离' },
+    { path:'~/.cache/TelegramDesktop',       chip:'cache',  locked:true, checked:false, observed:96, why:'缓存 — 不隔离（锁定）' },
   ],
   qq: [
     { path:'~/.config/QQ',              chip:'config', checked:true,  observed:31, why:'应用配置目录 — 建议隔离' },
     { path:'~/.local/share/QQ',         chip:'config', checked:true,  observed:918,why:'应用数据目录 — 建议隔离' },
-    { path:'~/.cache/QQ',               chip:'cache',  checked:false, observed:204, why:'缓存 — 默认不隔离' },
+    { path:'~/.cache/QQ',               chip:'cache',  locked:true, checked:false, observed:204, why:'缓存 — 不隔离（锁定）' },
   ],
   firefox: [
     { path:'~/.mozilla',                chip:'config', checked:true,  observed:1520, why:'写死于 $HOME 的配置目录 — 建议隔离' },
-    { path:'~/.cache/mozilla',          chip:'cache',  checked:false, observed:880,  why:'缓存 — 默认不隔离' },
+    { path:'~/.cache/mozilla',          chip:'cache',  locked:true, checked:false, observed:880,  why:'缓存 — 不隔离（锁定）' },
   ],
   chrome: [],
   /* 从未配过的普通应用：演示"点亮开关 = 首次配置"这条入口（qq 已有档案，走的是「开启分身」） */
   slack: [
     { path:'~/.config/Slack',           chip:'config', checked:true,  observed:57, why:'应用配置目录 — 建议隔离' },
     { path:'~/.local/share/Slack',      chip:'config', checked:true,  observed:402,why:'应用数据目录 — 建议隔离' },
-    { path:'~/.cache/Slack',            chip:'cache',  checked:false, observed:163, why:'缓存 — 默认不隔离' },
+    { path:'~/.cache/Slack',            chip:'cache',  locked:true, checked:false, observed:163, why:'缓存 — 不隔离（锁定）' },
   ],
   notion: [
     { path:'~/.config/notion-desktop',  chip:'config', checked:true,  observed:88, why:'应用配置目录 — 旧档案记的 ~/.config/Notion 已不存在' },
-    { path:'~/.cache/notion-desktop',   chip:'cache',  checked:false, observed:241, why:'缓存 — 默认不隔离' },
+    { path:'~/.cache/notion-desktop',   chip:'cache',  locked:true, checked:false, observed:241, why:'缓存 — 不隔离（锁定）' },
   ],
   obsidian: [
     { path:'~/.config/obsidian',        chip:'config', checked:true,  observed:19, why:'应用配置目录 — 建议隔离' },
-    { path:'~/.cache/obsidian',         chip:'cache',  checked:false, observed:74, why:'缓存 — 默认不隔离' },
+    { path:'~/.cache/obsidian',         chip:'cache',  locked:true, checked:false, observed:74, why:'缓存 — 不隔离（锁定）' },
   ],
 };
 
@@ -1031,22 +1048,53 @@ function renderDialog() {
   /* confirm */
   sub.textContent = '勾选属于「应用自身数据」的目录——它们会被隔离，其余文件与主空间保持共享。';
   const cands = pathCandidates[a.id] || [];
-  const chk = (p, kind) => `
-    <label class="chkrow">
-      <input type="checkbox" data-chk data-kind="${kind}" ${p.checked ? 'checked' : ''}>
-      <span class="cb"></span>
+  const rt = a.readTrace === undefined ? 'ok' : a.readTrace;
+  const readsBanner = rt === 'partial'
+    ? `<div class="banner soft inline show" data-banner="reads-partial">⚠ 本次读证据不完整，登录态可能未覆盖。确认前请核对带「登录态」标记的路径。</div>`
+    : rt === 'unavailable'
+      ? `<div class="banner soft inline show" data-banner="reads-unavailable">⚠ 本次读证据不完整，登录态可能未覆盖。请至少勾选一条要隔离的路径。</div>`
+      : rt === ''
+        ? `<div class="banner soft inline show" data-banner="reads-legacy">旧档案，重新探测可获取读证据。</div>`
+        : `<div class="banner soft inline show" data-banner="reads-ok">读证据只覆盖 open/openat 观察到的路径；openat2 被移除、setuid 子进程等盲区不在其中。</div>`;
+  const noHomeReads = a.noHomeReads
+    ? `<div class="banner soft inline show" data-banner="no-home-reads" id="no-home-reads">本次没有观察到读取路径；登录态可能仍然未被覆盖。</div>`
+    : '';
+  const gateCands = cands.filter(p => p.chip === 'config' && !p.locked);
+  const selectedGate = gateCands.filter(p => p.checked).length;
+  const confirmEmpty = dlgMode === 'setup' && rt === 'unavailable'
+    && gateCands.length > 0 && selectedGate === 0;
+  const hidden = a.readsHidden || 0;
+  const chk = (p, kind) => {
+    const locked = !!p.locked;
+    const obs = [];
+    if (p.observed) obs.push(`${p.observed} 个写入条目`);
+    if (p.reads) obs.push(`${p.reads} 条读取路径`);
+    const badges = [];
+    if (p.credential === 'strong') badges.push('<span class="chip credential" data-credential="strong">登录态</span>');
+    if (p.containsCredential) badges.push('<span class="chip warn" data-contains-credential="1">包含登录态</span>');
+    if (kind === 'cache') badges.push('<span class="chip cache">缓存</span>');
+    else if (kind === 'public') badges.push('<span class="chip warn">公共目录</span>');
+    else badges.push('<span class="chip config">配置</span>');
+    return `
+    <div class="chkrow" ${locked ? 'data-locked="1"' : ''}>
+      ${locked ? '<span class="lockicon" aria-hidden="true">🔒</span>'
+               : `<input type="checkbox" data-chk data-class="${p.class || (kind === 'cache' ? 'cache' : 'config')}" data-kind="${kind}" ${p.checked ? 'checked' : ''}><span class="cb"></span>`}
       <div class="tt">
         <div class="path">${p.path}</div>
         <div class="why">${p.why}</div>
       </div>
-      <span class="obs">${p.observed} 个写入条目</span>
-      <span class="chip ${p.chip}">${p.chip === 'config' ? '配置' : '缓存'}</span>
-    </label>`;
+      <span class="obs">${obs.join(' · ') || '未观察到写入'}</span>
+      ${badges.join('')}
+    </div>`;
+  };
   body.innerHTML = `
+    ${readsBanner}
+    ${noHomeReads}
     <div class="dlg-group">
       <div class="group-label">应用自身数据（建议隔离）</div>
-      ${cands.filter(p => p.chip === 'config').map(p => chk(p, 'config')).join('')}
+      ${cands.filter(p => p.chip === 'config' || p.chip === 'public').map(p => chk(p, p.chip)).join('')}
       ${cands.filter(p => p.chip === 'cache').map(p => chk(p, 'cache')).join('')}
+      ${hidden > 0 ? `<div class="reads-hidden" id="reads-hidden">+${hidden} 条读取路径未显示</div>` : ''}
     </div>
     ${dlgMode === 'rediscover' ? '' : `
     <div class="dlg-group">
@@ -1056,7 +1104,7 @@ function renderDialog() {
         <span class="cb"></span>
         <div class="tt">
           <div class="path">从现有应用数据克隆起步</div>
-          <div class="why">写时复制继承当前应用数据，不复制文件，主实例数据不会被改动；需要 fuse-overlayfs。</div>
+          <div class="why">写时复制继承当前应用数据，不复制文件，主实例数据不会被改动；需要 fuse-overlayfs。登录状态目录不参与克隆，应用可能从空数据开始。</div>
         </div>
       </label>
     </div>`}
@@ -1088,6 +1136,7 @@ function renderDialog() {
         <span class="path">${s.path}</span><span class="shared-tag">共享</span></div>
         <div class="readonly-row" style="border-top:none;padding-top:0;font-size:11.5px">${s.why}</div>`).join('')}
     </div>`;
+  body.dataset.state = confirmEmpty ? 'confirm-empty' : 'confirm';
   foot.textContent = dlgMode === 'rediscover' ? '保存档案'
     : dlgMode === 'open' ? '开启分身' : '创建分身';
   refreshConfirm();
@@ -1098,7 +1147,7 @@ function refreshConfirm() {
   const btn = $('#dlgConfirm');
   if (dlgState === 'creating') { btn.disabled = true; return; }
   if (dlgState === 'error') { btn.disabled = false; return; }
-  btn.disabled = !$$('[data-chk][data-kind="config"]').some(c => c.checked);
+  btn.disabled = !$$('[data-chk][data-class="config"]:not([data-kind="public"]):not([data-locked])').some(c => c.checked);
 }
 
 /* ============ 交互 ============ */
@@ -1301,8 +1350,8 @@ document.addEventListener('click', e => {
   if (t.closest('#dlgConfirm')) {
     if (dlgState === 'error') { startProbe(currentApp); return; }   // error 态的唯一主操作是重试
     if (dlgState === 'creating') return;                            // 重复提交：不得建出两个实例
-    /* 门禁只数"应用自身数据"（config），但 toast 报的是实际隔离条数（config + 勾选的缓存） */
-    const nIsolated = $$('[data-chk][data-kind="config"], [data-chk][data-kind="cache"]')
+    /* 门禁只数"应用自身数据"（config）；缓存行已锁定，不参与隔离计数 */
+    const nIsolated = $$('[data-chk][data-class="config"]:not([data-kind="public"]):not([data-locked])')
       .filter(c => c.checked).length;
     if (dlgMode === 'rediscover') {
       currentApp.probeMethod = 'overlay';

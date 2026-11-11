@@ -1,5 +1,6 @@
-// 交互回归（62 项）：三屏 + 探测四态（probing/confirm/creating/error）+ 五入口 + 三处破坏性确认
+// 交互回归（68 项）：三屏 + 探测四态（probing/confirm/creating/error）+ 五入口 + 三处破坏性确认
 //                    + 门禁 + 搜索 + 横幅语义 + 空态可达性 + 运行/停止状态
+//                    + 读证据四态/锁定缓存行/credential 徽标/confirm-empty
 // 运行：node design/guitest.js        （退出码 0 = EXPECTED 全过，非 0 = 设计基线被破坏）
 // 依赖：任一本机 Chromium + puppeteer-core；路径可用环境变量覆盖：
 //   CHROMIUM=/path/to/chromium  PUPPETEER_CORE=/path/to/puppeteer-core
@@ -7,7 +8,7 @@ const path = require('path');
 const fs = require('fs');
 const { pathToFileURL } = require('url');
 
-const EXPECTED = 62;   // 断言总数；改动断言必须同步改这里（否则退出码永远是 1）
+const EXPECTED = 68;   // 断言总数；改动断言必须同步改这里（否则退出码永远是 1）
 
 function loadPuppeteer() {
   const cands = [
@@ -177,9 +178,28 @@ const pp = loadPuppeteer();
         const inp = r.querySelector('[data-chk]');
         return inp && inp.dataset.kind !== 'singleton';
       });
-      return rows.length > 0 && rows.every(r => /\d+ 个写入条目/.test(r.textContent))
+      return rows.length > 0 && rows.every(r => /(\d+ 个写入条目|\d+ 条读取路径|\d+ 个写入条目 · \d+ 条读取路径)/.test(r.textContent))
         && !document.querySelector('#dlgBody').textContent.includes('命中');
     }); });
+  await t('登录态行带「登录态」/「包含登录态」标记', async () => {
+    return ev(() => {
+      const txt = document.querySelector('#dlgBody').textContent;
+      return !!document.querySelector('[data-credential="strong"]')
+        && !!document.querySelector('[data-contains-credential]')
+        && txt.includes('登录态');
+    }); });
+  await t('超过 20 条的读取路径显示「+N 未显示」', async () => {
+    return ev(() => {
+      const el = document.querySelector('#reads-hidden');
+      return !!el && /^\+\d+ 条读取路径未显示$/.test(el.textContent);
+    }); });
+  await t('读证据不完整 → partial 横幅常驻确认页', async () => {
+    return ev(() => {
+      const el = document.querySelector('[data-banner="reads-partial"]');
+      return !!el && el.offsetParent !== null
+        && el.textContent.includes('登录态可能未覆盖');
+    });
+  });
   /* 第五组「共享但可写」：档案字段 shared_writes 的界面可见性。
      代价（两个分身的最近文件会混）不写出来，用户遇到就判定产品坏了 */
   await t('共享但可写组存在、只读、且写清代价', async () => {
@@ -197,12 +217,12 @@ const pp = loadPuppeteer();
       return document.querySelector('#dlgConfirm').disabled;
     });
   });
-  await t('只勾"缓存" → 仍禁用（门禁只数应用自身数据）', async () => {
+  await t('缓存行锁定、无 checkbox，门禁不受其影响', async () => {
     return ev(() => {
-      const cache = document.querySelector('[data-chk][data-kind="cache"]');
-      if (!cache) return '找不到缓存项';
-      cache.click();
-      return document.querySelector('#dlgConfirm').disabled;
+      const locked = document.querySelector('.chkrow[data-locked] .chip.cache');
+      const cacheInputs = document.querySelectorAll('[data-chk][data-kind="cache"]');
+      return !!locked && cacheInputs.length === 0
+        && document.querySelector('#dlgConfirm').disabled;
     });
   });
   await t('恢复勾选 → 确认可用', async () => {
@@ -514,6 +534,14 @@ const pp = loadPuppeteer();
         && !document.querySelector('.spinner')          // 直接进确认态，不跑探测
         && !!document.querySelector('[data-chk]')
         && document.querySelector('#dlgConfirm').textContent === '开启分身'; }); });
+  await t('ok 读证据 → 盲区文案 + no_home_reads 可见', async () => {
+    return ev(() => {
+      const ok = document.querySelector('[data-banner="reads-ok"]');
+      const no = document.querySelector('#no-home-reads');
+      return !!ok && ok.offsetParent !== null && ok.textContent.includes('open/openat')
+        && !!no && no.offsetParent !== null && no.textContent.includes('没有观察到读取路径');
+    });
+  });
   await t('开启确认 → 开关打开且 1 个分身', async () => { await confirmAndWait();
     return ev(() => { const s=document.querySelector('[data-sw="qq"]'); return s.checked
       && s.closest('.row').querySelector('[data-sub]').textContent.includes('1 个分身'); }); });
@@ -597,6 +625,38 @@ const pp = loadPuppeteer();
       return new Set(now).size === now.length
         && document.querySelector('#toast').textContent.includes('同名');
     }) || '撞名被接受了：' + await textOf('#toast');
+  });
+
+  /* 读证据不可用且零勾选：不直接报 no_writes，进入可补选的降级确认页；
+     确认按钮初始禁用，勾选一条后启用（保存前仍要求 paths>0） */
+  await t('读证据不可用 → confirm-empty，勾选后可继续', async () => {
+    await click('#btnBack');
+    await showView('all');
+    await click('[data-sw="zcode"]');
+    const arrived = await waitFor(() => document.querySelector('#dlgBody')?.dataset.state === 'confirm-empty');
+    if (!arrived) return '没进入 confirm-empty';
+    const banner = await ev(() => {
+      const el = document.querySelector('[data-banner="reads-unavailable"]');
+      return !!el && el.offsetParent !== null && el.textContent.includes('登录态可能未覆盖');
+    });
+    const disabled = await ev(() => document.querySelector('#dlgConfirm').disabled);
+    await ev(() => document.querySelector('[data-chk][data-kind="public"]').click());
+    const publicStillDisabled = await ev(() => document.querySelector('#dlgConfirm').disabled);
+    await ev(() => document.querySelector('[data-chk][data-kind="config"]').click());
+    const enabled = await ev(() => !document.querySelector('#dlgConfirm').disabled);
+    await click('#dlgCancel');
+    return (banner && disabled && publicStillDisabled && enabled) || 'banner/门禁状态不对';
+  });
+
+  await t('旧档案（read_trace=""）→ 提示重新探测可获取读证据', async () => {
+    await click('[data-sw="notion"]');
+    const arrived = await waitFor(() => !!document.querySelector('[data-banner="reads-legacy"]'));
+    const ok = arrived && await ev(() => {
+      const el = document.querySelector('[data-banner="reads-legacy"]');
+      return el.offsetParent !== null && el.textContent.includes('旧档案');
+    });
+    await click('#dlgCancel');
+    return ok || '旧档案没有独立文案';
   });
 
   console.log(`\n结果: ${pass} 通过 / ${fail} 失败`);
