@@ -164,6 +164,33 @@ func isVarChar(c byte) bool {
 	return c == '_' || c >= '0' && c <= '9' || c >= 'A' && c <= 'Z' || c >= 'a' && c <= 'z'
 }
 
+// expandLexical 与 Expand 相同，但不解析软链。credential_paths 的子集校验
+// 必须词法优先（§8.4）：软链 HOME 下，词法在 paths 内、真实路径在外时不能
+// 因此拒绝加载；词法不命中才退回 Real 比较。
+func (r *PathResolver) expandLexical(s string) (string, error) {
+	if strings.TrimSpace(s) == "" {
+		return "", errInput("err.path.empty", nil)
+	}
+	orig := s
+	switch {
+	case s == "~":
+		s = r.Home
+	case strings.HasPrefix(s, "~/"):
+		s = filepath.Join(r.Home, s[2:])
+	}
+	s = expandKnownVars(s, r.Vars())
+	if strings.ContainsRune(s, '$') {
+		return "", errInput("err.path.unknown_var", map[string]any{"path": orig})
+	}
+	if !filepath.IsAbs(s) {
+		return "", errInput("err.path.not_absolute", map[string]any{"path": orig})
+	}
+	if hasDotDot(orig) {
+		return "", errInput("err.path.dotdot", map[string]any{"path": orig})
+	}
+	return filepath.Clean(s), nil
+}
+
 // ToStoreForm 把绝对路径转成落盘形式：能用有效 HOME 无损还原就用 ~/...，
 // 否则保留绝对路径（软链到 $HOME 之外、XDG 指向别处的情况）。§5 paths
 func (r *PathResolver) ToStoreForm(abs string) string {
@@ -172,6 +199,17 @@ func (r *PathResolver) ToStoreForm(abs string) string {
 	}
 	if rel, ok := relUnder(r.Home, abs); ok {
 		return "~/" + rel
+	}
+	// HOME 是软链时（Silverblue 的 /var/home/u → /home/u），Expand 返回真实
+	// 路径，而 r.Home 是词法路径。必须再用真实 HOME 还原一次，否则保存既有
+	// 档案会把 ~/.config/App 改写成 /home/u/.config/App，换机即失效。
+	if homeReal := Real(r.Home); homeReal != r.Home {
+		if abs == homeReal {
+			return "~"
+		}
+		if rel, ok := relUnder(homeReal, abs); ok {
+			return "~/" + rel
+		}
 	}
 	return abs
 }

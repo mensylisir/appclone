@@ -60,7 +60,7 @@ func (e *Env) newProbeWorkDir(app string) (string, error) {
 		os.RemoveAll(root)
 		return "", errEnv("err.env.chmod", map[string]any{"path": root}, err)
 	}
-	for _, sub := range []string{"upper", "work", "merged", "runtime", "dbus"} {
+	for _, sub := range []string{"upper", "work", "merged", "runtime", "dbus", "trace"} {
 		if err := os.Mkdir(filepath.Join(root, sub), 0o700); err != nil {
 			os.RemoveAll(root)
 			return "", errEnv("err.env.mkdir", map[string]any{"path": filepath.Join(root, sub)}, err)

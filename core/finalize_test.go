@@ -11,6 +11,39 @@ import (
 //
 // observed 必须是**预填后**的候选数：模板补进来的灰色路径虽然进不了 paths，
 // 用户看到的"观测到 N 个写入条目"要能对上确认页上的行数。
+// 降级确认页只允许"读证据确实不可用 + 至少一条能进 paths 的行"；
+// 否则空确认页会把用户卡死（§11.4）。
+func TestFinalizeProbeAllowEmpty(t *testing.T) {
+	e := testEnv(t)
+	r := e.Resolver
+	cfg := filepath.Join(r.XDG["CONFIG_HOME"], "Demo")
+	cands := []Candidate{{Path: cfg, Class: ClassConfig, Checked: false}}
+	res := ProbeResult{Candidates: cands, ReadTrace: ReadTraceUnavailable}
+
+	p, _, _, err := e.FinalizeProbe("demo", res, ProbeFinalize{AllowEmpty: true})
+	if err != nil {
+		t.Fatalf("读证据不可用且有可勾选行时应允许空档案：%v", err)
+	}
+	if len(p.Paths) != 0 {
+		t.Fatalf("未勾选时 paths 应为空：%v", p.Paths)
+	}
+
+	// 读证据正常时 AllowEmpty 不生效：零写入仍然是错误。
+	res.ReadTrace = ReadTraceOK
+	if _, _, _, err := e.FinalizeProbe("demo", res, ProbeFinalize{AllowEmpty: true}); errKey(err) != "err.probe.no_writes" {
+		t.Fatalf("读证据可用时不能走降级确认页：%v", err)
+	}
+
+	// 没有任何能进 paths 的行：空确认页无路可走，必须报 no_writes。
+	res.ReadTrace = ReadTraceUnavailable
+	res.Candidates = []Candidate{{
+		Path: filepath.Join(r.XDG["CACHE_HOME"], "demo"), Class: ClassCache, Locked: true,
+	}}
+	if _, _, _, err := e.FinalizeProbe("demo", res, ProbeFinalize{AllowEmpty: true}); errKey(err) != "err.probe.no_writes" {
+		t.Fatalf("没有可勾选行时不能进入空确认页：%v", err)
+	}
+}
+
 func TestFinalizeProbeRefusesEmptyProfile(t *testing.T) {
 	e := testEnv(t)
 	r := e.Resolver
@@ -158,5 +191,78 @@ func TestFinalizeProbeBundledAsBase(t *testing.T) {
 	}
 	if p.Ignored == nil {
 		t.Fatal("探测产物自带的默认噪声表不能丢")
+	}
+}
+
+// 旧档案里属于公共目录/keyring 的凭据被丢弃时，原因应报"该范围不支持"，
+// 而不是"范围收窄"（§8.4）。
+func TestDeriveProfileDroppedCredentialScopeWarn(t *testing.T) {
+	e := testEnv(t)
+	r := e.Resolver
+	cfg := filepath.Join(r.XDG["CONFIG_HOME"], "Demo")
+	pubCred := filepath.Join(r.Home, "Downloads", "token")
+	base := Profile{App: "demo", CredentialPaths: []string{r.ToStoreForm(pubCred)}}
+	p := r.DeriveProfile(Profile{App: "demo"}, &base, "overlay", ReadTraceOK,
+		[]Candidate{{Path: cfg, Class: ClassConfig, Checked: true}})
+	if !containsString(p.Warnings, "credential_scope_unsupported") {
+		t.Fatalf("公共目录凭据应报 unsupported：%v", p.Warnings)
+	}
+	if len(p.CredentialPaths) != 0 {
+		t.Fatalf("公共目录凭据不能留下：%v", p.CredentialPaths)
+	}
+}
+
+// 本次探测的 merge 告警（cache 凭据 / 凭据行超限）必须随档案交给展示层；
+// 但既有档案里的旧告警不能在重探时复活。
+func TestFinalizeProbeKeepsRunWarningsOnly(t *testing.T) {
+	e := testEnv(t)
+	r := e.Resolver
+	cfg := filepath.Join(r.XDG["CONFIG_HOME"], "Demo")
+	cands := []Candidate{{Path: cfg, Class: ClassConfig, Checked: true}}
+	res := ProbeResult{
+		Candidates: cands,
+		ReadTrace:  ReadTraceOK,
+		Profile: Profile{
+			App: "demo", ProbeMethod: "overlay", Paths: []string{cfg},
+			Warnings: []string{"cache_credential", "credential_rows_truncated"},
+		},
+	}
+	p, _, _, err := e.FinalizeProbe("demo", res, ProbeFinalize{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, w := range []string{"cache_credential", "credential_rows_truncated"} {
+		if !containsString(p.Warnings, w) {
+			t.Fatalf("探测告警 %q 必须保留，得到 %v", w, p.Warnings)
+		}
+	}
+
+	// 重探时 base 里有过期告警，但本次探测没再产生它 → 不得复活。
+	res.Profile.Warnings = nil
+	p, _, _, err = e.FinalizeProbe("demo", res, ProbeFinalize{
+		Existing:    Profile{App: "demo", Warnings: []string{"cache_credential"}},
+		HasExisting: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if containsString(p.Warnings, "cache_credential") {
+		t.Fatalf("旧档案告警不得在重探后复活：%v", p.Warnings)
+	}
+}
+
+// 确认门禁判据：公共目录即使被界面勾上也不算数；cache/locked 同理。
+func TestCountsTowardGate(t *testing.T) {
+	if CountsTowardGate(Candidate{Class: ClassConfig, DisplayClass: ClassPublic}, true) {
+		t.Fatal("公共目录不能点亮确认按钮")
+	}
+	if CountsTowardGate(Candidate{Class: ClassConfig, Locked: true}, true) {
+		t.Fatal("锁定行不能点亮确认按钮")
+	}
+	if CountsTowardGate(Candidate{Class: ClassConfig}, false) {
+		t.Fatal("未勾选的行不能点亮确认按钮")
+	}
+	if !CountsTowardGate(Candidate{Class: ClassConfig}, true) {
+		t.Fatal("普通配置行应计入门禁")
 	}
 }

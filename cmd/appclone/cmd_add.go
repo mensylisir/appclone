@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 
 	"github.com/spf13/cobra"
@@ -25,6 +26,7 @@ func newAddCmd(a *app) *cobra.Command {
 		rediscover  bool
 		profileOnly bool
 		fork        bool
+		noReadTrace bool
 	)
 	c := &cobra.Command{
 		Use:   "add <app> [id]",
@@ -106,6 +108,9 @@ func newAddCmd(a *app) *cobra.Command {
 			}
 
 			var p core.Profile
+			// 本次探测的读证据告警只对这一次运行有意义（run-scoped），不写进
+			// 档案；`--json` 直接展示，GUI 用同一个字段。
+			var readsWarns []string
 			needProfile := !hasProfile || !creatable || rediscover
 			if needProfile {
 				if !rediscover && hasProfile && !creatable {
@@ -131,9 +136,16 @@ func newAddCmd(a *app) *cobra.Command {
 				// 在跑时应用会发现锁被占用、把参数转发过去然后自己退出（§3.2.2）。
 				hints := a.env.StaticHints(ctx, d)
 				res, perr := a.env.Probe(ctx, appKey, core.ProbeOptions{
-					Command:  cmdline,
-					LockFile: hints.LockFiles,
-					Stderr:   cmd.ErrOrStderr(),
+					Command:          cmdline,
+					LockFile:         hints.LockFiles,
+					StaticPaths:      hints.Paths,
+					Stderr:           cmd.ErrOrStderr(),
+					DisableReadTrace: noReadTrace,
+					OnReadsWarn: func(reason string) {
+						// 读证据一旦不完整，用户必须在探测过程中就知道，
+						// 而不是等确认页/档案落盘后才发现（§11.1）。
+						fmt.Fprintf(cmd.ErrOrStderr(), "appclone: %s\n", a.tr("probe.reads."+reason, nil))
+					},
 				})
 				if perr != nil {
 					// 用户取消不是失败：有保留现场时让 main 打出路径（错误码
@@ -160,6 +172,7 @@ func newAddCmd(a *app) *cobra.Command {
 					return ferr
 				}
 				p = fin
+				readsWarns = res.ReadsWarns
 			} else if hasOld {
 				p = old
 			} else if p, err = a.env.LoadProfile(appKey); err != nil {
@@ -169,6 +182,11 @@ func newAddCmd(a *app) *cobra.Command {
 			if profileOnly {
 				// 只落档案这条路径不经过 CreateInstance 的事务，校验必须自己补一遍：
 				// 存档前一个字节都不能写（§11 CreateInstance 事务第 1 步的原则）。
+				if len(p.Paths) == 0 {
+					// CLI 永不进入"降级空确认"分支（AllowEmpty 只给 GUI 首次配置）；
+					// 空 paths 的档案等于没隔离，保存它只会制造一份假承诺。
+					return core.NewProbeNoWrites(appKey, 0)
+				}
 				if err := core.ValidateProfile(p, a.env.BuildOptions()); err != nil {
 					return err
 				}
@@ -178,11 +196,15 @@ func newAddCmd(a *app) *cobra.Command {
 				if err := a.env.SaveProfile(p); err != nil {
 					return err
 				}
-				a.ok(map[string]any{
+				payload := map[string]any{
 					"app": appKey, "profile_saved": true, "probe_method": p.ProbeMethod,
-				}, func() {
+					"read_trace": p.ReadTrace, "credential_paths": p.CredentialPaths,
+				}
+				addProbeEvidence(payload, readsWarns, p)
+				a.ok(payload, func() {
 					fmt.Printf("已保存「%s」的隔离档案（%d 条路径，来源 %s），未创建分身。\n",
 						appKey, len(p.Paths), p.ProbeMethod)
+					a.printReadEvidence(p, readsWarns)
 				})
 				return nil
 			}
@@ -191,16 +213,20 @@ func newAddCmd(a *app) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			a.ok(map[string]any{
+			payload := map[string]any{
 				"app": in.App, "id": in.ID, "display_name": in.DisplayName,
 				"created_at": in.CreatedAt, "probe_method": in.ProbeMethod, "fork": in.Fork,
-			}, func() {
+				"read_trace": p.ReadTrace, "credential_paths": p.CredentialPaths,
+			}
+			addProbeEvidence(payload, readsWarns, p)
+			a.ok(payload, func() {
 				fmt.Printf("已创建「%s（分身 %s）」\n", appKey, in.DisplayName)
 				fmt.Printf("  桌面入口：%s\n", a.env.LauncherPath(in.App, in.ID))
 				fmt.Printf("  数据目录：%s\n", in.Root)
 				if in.Fork {
 					fmt.Println("  首次启动会继承主实例现有数据（需要 fuse-overlayfs）；之后的修改只写入这个分身。")
 				}
+				a.printReadEvidence(p, readsWarns)
 			})
 			return nil
 		},
@@ -208,5 +234,45 @@ func newAddCmd(a *app) *cobra.Command {
 	c.Flags().BoolVar(&rediscover, "rediscover", false, "强制重新探测（会建实例）")
 	c.Flags().BoolVar(&profileOnly, "profile-only", false, "只更新档案，不创建实例")
 	c.Flags().BoolVar(&fork, "fork", false, "新分身从主实例现有数据克隆起步（写时复制）")
+	// 隐藏开关只给基准/排障用：关闭读追踪后档案的 read_trace 会是
+	// unavailable，产品路径不应该让用户自己关掉登录态发现能力。
+	c.Flags().BoolVar(&noReadTrace, "no-read-trace", false, "关闭读追踪（排障/基准用）")
+	_ = c.Flags().MarkHidden("no-read-trace")
 	return c
+}
+
+// addProbeEvidence 把 run-scoped 的读证据字段加进 `--json` 输出。空值不写，
+// 避免脚本把"没有告警"误读成"告警字段为空数组"。
+func addProbeEvidence(payload map[string]any, readsWarns []string, p core.Profile) {
+	if len(readsWarns) > 0 {
+		payload["reads_warns"] = readsWarns
+	}
+	if len(p.CredentialDropped) > 0 {
+		// 字段名沿用契约：这里携带的是被收缩/丢弃的**旧凭据路径**，不是告警键。
+		payload["credential_scope_narrowed"] = p.CredentialDropped
+	}
+}
+
+// printReadEvidence 是人类输出里的读证据摘要：三态 + 告警。
+func (a *app) printReadEvidence(p core.Profile, readsWarns []string) {
+	switch p.ReadTrace {
+	case core.ReadTraceUnavailable:
+		fmt.Println("  读证据：不可用（本次只依据写入证据）")
+	case core.ReadTracePartial:
+		fmt.Println("  读证据：不完整（登录态可能没有被完全发现）")
+	case core.ReadTraceOK:
+		fmt.Println("  读证据：完整")
+	}
+	for _, w := range readsWarns {
+		fmt.Printf("  - %s\n", a.tr("probe.reads."+w, nil))
+	}
+	if len(p.CredentialPaths) > 0 {
+		fmt.Printf("  登录态目录：%s\n", strings.Join(p.CredentialPaths, "、"))
+	}
+	for _, w := range p.Warnings {
+		fmt.Printf("  档案告警：%s\n", a.tr("probe.profile."+w, nil))
+	}
+	if len(p.CredentialDropped) > 0 {
+		fmt.Printf("  已丢弃的旧登录态路径：%s\n", strings.Join(p.CredentialDropped, "、"))
+	}
 }

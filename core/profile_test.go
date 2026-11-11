@@ -2,6 +2,7 @@ package core
 
 import (
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -90,5 +91,67 @@ func TestProfileIgnoredValuesRoundTrip(t *testing.T) {
 	}
 	if len(got.Ignored) != 2 || got.Ignored[0] != "~/.cache" || got.Ignored[1] != "~/.config/App/Cache" {
 		t.Fatalf("ignored 未原样往返：%v", got.Ignored)
+	}
+}
+
+// read_trace / credential_paths 必须双入口（SaveProfile 与 encodeProfile）往返，
+// 且旧档案缺键时读回 ""（未知）而不是猜成 ok。
+func TestProfileReadTraceCredentialRoundTrip(t *testing.T) {
+	e := testEnv(t)
+	p := Profile{
+		App:             "testapp",
+		Exec:            "/opt/app",
+		Paths:           []string{"~/.zcode"},
+		CredentialPaths: []string{"~/.zcode"},
+		ReadTrace:       "ok",
+		ProbeMethod:     "overlay",
+	}
+	if err := e.SaveProfile(p); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+	raw := readRawProfile(t, e, "testapp")
+	if !strings.Contains(raw, `read_trace = "ok"`) || !strings.Contains(raw, `credential_paths = ["~/.zcode"]`) {
+		t.Fatalf("新字段没落盘：\n%s", raw)
+	}
+	got, err := e.LoadProfile("testapp")
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if got.ReadTrace != "ok" || len(got.CredentialPaths) != 1 || got.CredentialPaths[0] != "~/.zcode" {
+		t.Fatalf("往返丢字段：read_trace=%q credential_paths=%v", got.ReadTrace, got.CredentialPaths)
+	}
+
+	b, err := encodeProfile(p)
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	if !strings.Contains(string(b), "read_trace") || !strings.Contains(string(b), "credential_paths") {
+		t.Fatalf("encodeProfile 丢新字段：\n%s", b)
+	}
+}
+
+func TestProfileReadTraceLegacyEmpty(t *testing.T) {
+	e := testEnv(t)
+	raw := "version = 1\nexec = \"/opt/app\"\npaths = [\"~/.config/App\"]\nprobe_method = \"overlay\"\n"
+	if err := os.MkdirAll(filepath.Dir(e.ProfilePath("old")), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(e.ProfilePath("old"), []byte(raw), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	p, err := e.LoadProfile("old")
+	if err != nil {
+		t.Fatalf("旧档案应可加载：%v", err)
+	}
+	if p.ReadTrace != "" || len(p.CredentialPaths) != 0 {
+		t.Fatalf("旧档案缺键应读成空值：%q %v", p.ReadTrace, p.CredentialPaths)
+	}
+}
+
+func TestProfileStringShowsReadEvidence(t *testing.T) {
+	p := Profile{Exec: "/opt/app", Paths: []string{"~/.zcode"}, ReadTrace: "partial", CredentialPaths: []string{"~/.zcode"}}
+	s := p.String()
+	if !strings.Contains(s, "read_trace=\"partial\"") || !strings.Contains(s, "credential_paths=[~/.zcode]") {
+		t.Fatalf("String 必须同时显示 read_trace 与凭据路径：%s", s)
 	}
 }

@@ -110,6 +110,9 @@ type ui struct {
 	// 这两个指针只用于"当前该刷新谁"与去重。
 	activeSetup  *setupView
 	activeDetail *detailView
+	// profileWarns 保存本次运行里 DeriveProfile 产生的档案告警（不落盘，
+	// 只用于确认页横幅与刚创建后的详情页解释"范围为什么变了"）。
+	profileWarns map[string][]string
 
 	// cb 是全部信号回调的唯一入口（见 handlers.go 的回调纪律）。
 	cb *callbacks
@@ -228,6 +231,7 @@ func (u *ui) buildWindow() {
 	u.suppress = map[string]bool{}
 	u.pending = map[string]bool{}
 	u.toggled = map[toggleMark]bool{}
+	u.profileWarns = map[string][]string{}
 	u.cb = newCallbacks()
 	u.pages = map[uintptr]func(){}
 
@@ -1173,4 +1177,21 @@ func (u *ui) deleteAllInstances(key string) deleteOutcome {
 		out.deleted++
 	}
 	return out
+}
+
+// setProfileWarns 记下本次运行 DeriveProfile 产生的档案告警（run-scoped，
+// 不落盘）。确认页横幅与刚创建后的详情页据此解释"范围为什么变了"。
+func (u *ui) setProfileWarns(appKey string, warns []string) {
+	if u.profileWarns == nil {
+		u.profileWarns = map[string][]string{}
+	}
+	if len(warns) == 0 {
+		delete(u.profileWarns, appKey)
+		return
+	}
+	u.profileWarns[appKey] = append([]string{}, warns...)
+}
+
+func (u *ui) profileWarnings(appKey string) []string {
+	return u.profileWarns[appKey]
 }

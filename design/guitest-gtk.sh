@@ -117,6 +117,7 @@ for name in TestGtkScreensLifecycle TestGtkLandsOnClonesView TestGtkEmptyStateMa
             TestGtkRapidRepush TestGtkFatalBanner TestGtkEnglishStrings \
             TestGtkDetailShowsStopWhenRunning TestGtkForkTogglePersists \
             TestGtkForkDisabledWhenFuseUnavailable TestGtkAppIconFallback \
+            TestGtkConfirmReuseEvidence \
             TestGtkDialogResponses TestGtkCloseSwitchDialog \
             TestDetachedRunnerSpawn \
             TestDetachLogHelpers TestDetachedTargetEnv TestGtkRealInputUinput \

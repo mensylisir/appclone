@@ -28,6 +28,9 @@ func probeEnv(t *testing.T) *Env {
 	}
 	e.Trasher = func(paths ...string) error { return nil }
 	e.CliPath = "/usr/bin/appclone"
+	// 单测不依赖宿主是否装了 strace/bwrap；默认给"读写都可用、-y 可用"，
+	// 需要降级场景的用例自行覆盖。
+	e.ProbeCapsOverride = &ProbeCaps{Read: true, Write: true, Openat2: true, Y: true}
 
 	if err := os.MkdirAll(r.XDG["CONFIG_HOME"], 0o700); err != nil {
 		t.Fatal(err)
@@ -883,4 +886,29 @@ func chmodTestTree(t *testing.T, root string) {
 		}
 		return nil
 	})
+}
+
+func TestProbeBwrapArgsTraceDirMasked(t *testing.T) {
+	argv, err := ProbeBwrapArgs(ProbeSpec{
+		Home: "/home/u", Merged: "/m", TraceDir: "/w/trace",
+		Command: []string{"/bin/true"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	joined := strings.Join(argv, " ")
+	if !strings.Contains(joined, "--bind / / --tmpfs /w/trace --dev-bind /dev /dev") {
+		t.Fatalf("trace 目录必须在 --bind / / 之后被 tmpfs 遮蔽：%s", joined)
+	}
+	// 降级路径（NoOverlay）同样要遮蔽。
+	argv, err = ProbeBwrapArgs(ProbeSpec{
+		Home: "/home/u", NoOverlay: true, TraceDir: "/w/trace",
+		Command: []string{"/bin/true"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(strings.Join(argv, " "), "--tmpfs /w/trace") {
+		t.Fatal("NoOverlay 也必须遮蔽 trace 目录")
+	}
 }

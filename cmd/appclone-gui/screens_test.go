@@ -2025,3 +2025,168 @@ func TestDetachedTargetEnv(t *testing.T) {
 		t.Fatalf("标记齐全时应分流：ok=%v app=%q id=%q", ok, app, id)
 	}
 }
+
+// 复用档案的确认页必须按 ADR-034 展示读证据四态与凭据行；探测候选里的
+// 公共目录只能是只读行（不能点亮确认按钮），读证据不可用时要有
+// confirm-empty 提示行。
+func TestGtkConfirmReuseEvidence(t *testing.T) {
+	env, appsDir := gtkTestEnv(t, "reuse-evidence")
+	if err := os.WriteFile(filepath.Join(appsDir, "cred.desktop"),
+		[]byte("[Desktop Entry]\nType=Application\nName=Cred\nExec=/usr/bin/true\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	r := env.Resolver
+	pub := filepath.Join(r.Home, "Downloads")
+	cfg := filepath.Join(r.XDG["CONFIG_HOME"], "Demo")
+	cred := filepath.Join(cfg, "credentials.json")
+	profile := core.Profile{
+		App: "cred", Version: core.ProfileVersion, Exec: "/usr/bin/true",
+		ProbeMethod: "manual", ReadTrace: core.ReadTraceUnavailable,
+		Paths: []string{cfg}, CredentialPaths: []string{cred},
+		Ignored: core.DefaultIgnored(),
+	}
+	if err := env.SaveProfile(profile); err != nil {
+		t.Fatal(err)
+	}
+
+	app := adw.NewApplication("io.github.mensylisir.Appclone.GtkReuseEvidence",
+		gio.GApplicationNonUniqueValue)
+	defer app.Unref()
+
+	u := &ui{app: app, env: env, lang: "zh_CN"}
+	var runErr error
+	fail := func(format string, a ...any) {
+		if runErr == nil {
+			runErr = fmt.Errorf(format, a...)
+		}
+		app.Quit()
+	}
+	step := 0
+	actcb := func(_ gio.Application) {
+		if u.win != nil {
+			return
+		}
+		u.buildWindow()
+		deadline := time.Now().Add(20 * time.Second)
+		var tick glib.SourceFunc
+		tick = func(uintptr) bool {
+			if time.Now().After(deadline) {
+				state, desc := "<nil>", ""
+				if v := u.activeSetup; v != nil {
+					state = v.state
+					if v.errPage != nil {
+						desc = v.errPage.GetTitle() + " / " + v.errPage.GetDescription()
+					}
+				}
+				fail("复用确认页断言超时（step=%d state=%s desc=%q）", step, state, desc)
+				return false
+			}
+			switch step {
+			case 0:
+				if !u.loaded {
+					return true
+				}
+				if !u.pushSetup("cred", "open", func(bool) {}) {
+					fail("凭据档案的确认页没有推出来")
+					return false
+				}
+				step++
+			case 1:
+				v := u.activeSetup
+				if v == nil || v.state != "confirm" {
+					return true
+				}
+				row, ok := v.rows[0]
+				if !ok {
+					fail("凭据档案的配置路径没有可勾选行")
+					return false
+				}
+				if !strings.Contains(row.GetSubtitle(), "credentials.json") {
+					fail("凭据行必须标出登录态路径：%q", row.GetSubtitle())
+					return false
+				}
+				if !v.confirmBtn.GetSensitive() {
+					fail("勾选了应用自身数据后确认按钮必须可用")
+					return false
+				}
+				if !v.banner.GetRevealed() ||
+					!strings.Contains(v.banner.GetTitle(), u.tr("ui.setup.reads.unavailable", nil)) {
+					fail("unavailable 档案必须显示读证据横幅：%q", v.banner.GetTitle())
+					return false
+				}
+
+				// 探测候选里的公共目录：只读行 + 不计门禁 + confirm-empty 提示。
+				v2 := &setupView{u: u, appKey: "cred", mode: "setup",
+					onClose: func(bool) {}, rows: map[int]*adw.SwitchRow{}}
+				v2.build()
+				v2.applyProbeResult(core.ProbeResult{
+					Candidates: []core.Candidate{
+						{Path: pub, Class: core.ClassPublic, DisplayClass: core.ClassPublic, Why: "probe.why.public"},
+						{Path: cfg, Class: core.ClassConfig, Checked: true,
+							Credential: core.CredentialStrong, CredentialPath: cred},
+					},
+					ReadTrace: core.ReadTraceUnavailable,
+					Profile:   core.Profile{App: "cred", ProbeMethod: "overlay"},
+				})
+				if v2.state != "confirm" {
+					fail("候选确认页没有进入 confirm：%s", v2.state)
+					return false
+				}
+				if _, ok := v2.rows[1]; !ok || len(v2.rows) != 1 {
+					fail("公共候选不能成为可勾选行：%d 行", len(v2.rows))
+					return false
+				}
+				if findListRowByTitle(v2.confirmPage, u.allocText(pub)) == nil {
+					fail("公共目录必须渲染成只读行（现有行：%v）", listRowTitles(v2.confirmPage))
+					return false
+				}
+				if findListRowByTitle(v2.confirmPage, u.tr("ui.setup.confirm.empty", nil)) == nil {
+					fail("读证据不可用时必须显示 confirm-empty 提示行")
+					return false
+				}
+				v2.scope.close()
+				v2.fixed.close()
+				app.Quit()
+				return false
+			}
+			return true
+		}
+		glib.TimeoutAdd(50, &tick, 0)
+	}
+	app.ConnectActivate(&actcb)
+	if code := app.Run(1, os.Args[:1]); code != 0 {
+		t.Fatalf("GApplication 退出码 %d", code)
+	}
+	if runErr != nil {
+		t.Fatal(runErr)
+	}
+	if step != 1 {
+		t.Fatalf("用例没有走完（step=%d）", step)
+	}
+}
+
+func listRowTitles(page *adw.PreferencesPage) []string {
+	var out []string
+	for _, box := range findWidgets(&page.Widget, func(w *gtk.Widget) bool {
+		return typeNameOf(w) == "GtkListBox"
+	}) {
+		for c := box.GetFirstChild(); c != nil; c = c.GetNextSibling() {
+			out = append(out, stringProp(c, "title"))
+		}
+	}
+	return out
+}
+
+// findListRowByTitle 在确认页里按 title 找行（SwitchRow/ActionRow 都适用）。
+func findListRowByTitle(page *adw.PreferencesPage, title string) *gtk.Widget {
+	for _, box := range findWidgets(&page.Widget, func(w *gtk.Widget) bool {
+		return typeNameOf(w) == "GtkListBox"
+	}) {
+		for c := box.GetFirstChild(); c != nil; c = c.GetNextSibling() {
+			if stringProp(c, "title") == title {
+				return c
+			}
+		}
+	}
+	return nil
+}

@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/sys/unix"
@@ -36,6 +37,14 @@ type Env struct {
 	// 共享目录看到对方的残留写层，一个用例的 upper 让另一个用例的 verify
 	// 读到"证据不完整"。
 	TmpRoot string
+	// ProbeCapsOverride 覆盖读/写追踪预检（测试注入）。空值走真实 ProbeCaps；
+	// 单测不能依赖宿主是否装了 strace/bwrap，也不能每次等 5 秒超时。
+	ProbeCapsOverride *ProbeCaps
+
+	// probeReaderLeaked 是进程级"读追踪采集线程没停下"标记（ADR-034 §5.2）。
+	// reader 仍持有 FIFO 读端时，再开一次探测会与旧 reader 抢同一份数据，
+	// 现场也不再可解释；必须重启 GUI / 显式 reset 才能继续。
+	probeReaderLeaked atomic.Bool
 
 	mu sync.Mutex // 进程内先互斥，再抢 flock：GUI 的探测 goroutine 与列表刷新
 	// 在同一进程里各开一次文件锁会自锁（flock 是进程级的，同进程不互斥），
@@ -122,6 +131,16 @@ func NewEnvAt(base string, r *PathResolver) *Env {
 		Trasher:  Trash,
 	}
 }
+
+// markProbeReaderLeaked 由 traceReader 在 2 秒 join 超时时调用。
+func (e *Env) markProbeReaderLeaked() { e.probeReaderLeaked.Store(true) }
+
+// probeReaderBlocked 报告是否还有上一次探测的 reader 没退出。
+func (e *Env) probeReaderBlocked() bool { return e.probeReaderLeaked.Load() }
+
+// resetProbeReaderLeak 只给显式 reset（测试/重启）用：真实泄漏无法通过
+// 本进程"忘记"来修复，reader 仍持有 fd；生产路径不调用它。
+func (e *Env) resetProbeReaderLeak() { e.probeReaderLeaked.Store(false) }
 
 // AuditLayers 是 `run --audit` 才有的那一层（§6.5）：overlay 的 merged 视图
 // 与"绑回真实"的公共目录。放在 BuildOptions 里而不是另写一个 argv 构造器，

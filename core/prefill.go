@@ -23,7 +23,10 @@ func (r *PathResolver) PrefillCandidates(tmpl Profile, existing []Candidate) []C
 		if class == ClassPublic || class == ClassKeyring {
 			continue
 		}
-		out = append(out, Candidate{Path: abs, Class: class, Checked: checked, Why: why, Warning: warn})
+		out = append(out, Candidate{
+			Path: abs, Class: class, DisplayClass: class,
+			Checked: checked, Why: why, Warning: warn,
+		})
 		seen[abs] = true
 	}
 	return out

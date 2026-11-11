@@ -381,3 +381,34 @@ func TestClassifySharedXbelWithSymlinkedHome(t *testing.T) {
 		t.Fatal("~/.gtk-bookmarks 在软链 HOME 下必须仍判共享")
 	}
 }
+
+// cache 候选即使被误标 Checked 也不得进入 paths；Locked 同理。
+func TestProfileFromCandidatesSkipsLockedAndCache(t *testing.T) {
+	r := classifyEnv(t)
+	cands := []Candidate{
+		{Path: filepath.Join(r.Home, ".cache", "App"), Class: ClassCache, Checked: true, Locked: true},
+		{Path: filepath.Join(r.Home, ".config", "App"), Class: ClassConfig, Checked: true, Locked: true},
+		{Path: filepath.Join(r.Home, ".config", "Keep"), Class: ClassConfig, Checked: true},
+	}
+	p := r.ProfileFromCandidates("x", "overlay", cands)
+	if len(p.Paths) != 1 || p.Paths[0] != "~/.config/Keep" {
+		t.Fatalf("cache/locked 必须跳过，得到 %v", p.Paths)
+	}
+}
+
+// XDG_CACHE_HOME 可能不含 "cache" 段；cache.db 是单文件缓存。两者都必须
+// 判为 cache，否则缓存会被隔离（§7.3）。
+func TestClassifyCustomCacheHomeAndCacheFile(t *testing.T) {
+	r := classifyEnv(t)
+	custom := filepath.Join(filepath.Dir(r.Home), "xyz")
+	r.XDG["CACHE_HOME"] = custom
+	if cls, _, _, _ := r.Classify(filepath.Join(custom, "App", "data.db")); cls != ClassCache {
+		t.Fatalf("XDG_CACHE_HOME 下的路径应判缓存，得到 %s", cls)
+	}
+	if cls, _, _, _ := r.Classify(filepath.Join(r.Home, ".config", "App", "cache.db")); cls != ClassCache {
+		t.Fatalf("cache.db 应判缓存，得到 %s", cls)
+	}
+	if cls, _, _, _ := r.Classify(filepath.Join(r.Home, ".config", "App", "CacheManager", "settings.ini")); cls == ClassCache {
+		t.Fatal("名字里的 cache 不是缓存段")
+	}
+}

@@ -64,6 +64,12 @@ type setupView struct {
 	// prefilled 记录内置模板预填了几条路径（0 = 没有模板或没有新增）。
 	// 只用于在确认页说明来源，不改变"探测定案"的事实。
 	prefilled int
+	// readsWarns 是本次探测的读证据告警（run-scoped，不落盘）；readTrace 是
+	// 四态。确认页/错误页都从这里取，不在界面层重新推导。
+	readsWarns []string
+	readTrace  string
+	// degraded 记录降级横幅是否已起：读证据告警要拼在它后面，不能把它顶掉。
+	degraded bool
 
 	state  string
 	cancel context.CancelFunc
@@ -332,10 +338,11 @@ func (v *setupView) updateConfirmGate() {
 		if !row.GetActive() || i >= len(v.cands) {
 			continue
 		}
-		if v.cands[i].Class == core.ClassCache {
-			continue
+		// 判据只在 core 一处：cache/locked/公共目录（含既有档案里
+		// Class=Config、DisplayClass=Public 的行）都不算数。
+		if core.CountsTowardGate(v.cands[i], row.GetActive()) {
+			n++
 		}
-		n++
 	}
 	v.confirmBtn.SetSensitive(n > 0)
 }
@@ -353,9 +360,18 @@ func (v *setupView) start() {
 		switch {
 		case err == nil:
 			v.profile = p
-			v.cands = candidatesFromProfile(v.u, p)
+			// 复用入口也要展示四态与档案告警：用户开一个 partial/unavailable/
+			// 旧档案时，和重新探测看到的是同一份读证据结论。
+			v.readTrace = p.ReadTrace
+			// 档案 → 候选只有 core 一份实现（§8.3）：缓存/公共/keyring 行与
+			// 凭据展示必须和 CLI、重探测一致。
+			cands, cwarns := v.u.env.Resolver.CandidatesFromProfileWithWarns(p)
+			v.cands = cands
+			v.profile.Warnings = mergeWarnKeys(v.profile.Warnings, cwarns)
+			v.u.setProfileWarns(v.appKey, v.profile.Warnings)
 			v.setState("confirm")
 			v.renderConfirm()
+			v.showReadsBanner()
 			return
 		case errorKey(err) == "err.profile.not_found":
 			// 列表扫描与用户拨开关之间档案被删（另一个 CLI 执行了
@@ -432,7 +448,7 @@ func (v *setupView) probe() {
 					v.finish(false)
 					return false
 				}
-				v.retry = v.probe
+				v.retry = v.retryAction(err)
 				v.showError(err)
 				return false
 			})
@@ -464,8 +480,9 @@ func (v *setupView) probe() {
 		hints := v.u.env.StaticHints(ctx, d)
 		cmdline := append([]string{d.Exec}, d.ExecArgs...)
 		res, perr := v.u.env.Probe(ctx, v.appKey, core.ProbeOptions{
-			Command:  cmdline,
-			LockFile: hints.LockFiles,
+			Command:     cmdline,
+			LockFile:    hints.LockFiles,
+			StaticPaths: hints.Paths,
 			Progress: func(pp core.ProbeProgress) {
 				v.u.goIdle(func(uintptr) bool {
 					if v.done {
@@ -480,7 +497,23 @@ func (v *setupView) probe() {
 					if v.state != "probing" {
 						return false
 					}
-					v.countLabel.SetText(v.u.tr("ui.setup.probing.count", map[string]any{"n": pp.Entries}))
+					if pp.Reads > 0 {
+						v.countLabel.SetText(v.u.tr("ui.setup.probing.count_reads",
+							map[string]any{"n": pp.Entries, "r": pp.Reads}))
+					} else {
+						v.countLabel.SetText(v.u.tr("ui.setup.probing.count", map[string]any{"n": pp.Entries}))
+					}
+					return false
+				})
+			},
+			OnReadsWarn: func(reason string) {
+				// 读证据不完整必须在探测过程中就告诉用户，而不是等确认页
+				// 落定后才补一条横幅（§11.1）。
+				v.u.goIdle(func(uintptr) bool {
+					if v.done {
+						return false
+					}
+					v.addReadsWarn(reason)
 					return false
 				})
 			},
@@ -496,7 +529,7 @@ func (v *setupView) probe() {
 					v.finish(false)
 					return false
 				}
-				v.retry = v.probe
+				v.retry = v.retryAction(perr)
 				v.showError(perr)
 				return false
 			}
@@ -530,11 +563,16 @@ func (v *setupView) release() {
 // 零写入门槛、非路径字段合并）全在 core.FinalizeProbe——CLI 的 `add` 用同一份，
 // 两个视图不会对同一探测结果落出两份语义不同的档案（§6.1）。
 func (v *setupView) applyProbeResult(res core.ProbeResult) {
+	v.readsWarns = append([]string{}, res.ReadsWarns...)
+	v.readTrace = res.ReadTrace
+	// AllowEmpty 只给 GUI 首次配置：读证据不可用时允许先进入确认页由用户
+	// 勾选；CLI 永不进入这条分支（§11.4）。
 	p, cands, prefilled, err := v.u.env.FinalizeProbe(v.appKey, res, core.ProbeFinalize{
 		Bundled:     v.bundled,
 		HasBundled:  v.hasBundled,
 		Existing:    v.existing,
 		HasExisting: v.hasExisting,
+		AllowEmpty:  v.mode == "setup" && !v.hasExisting,
 	})
 	if err != nil {
 		// 目前唯一可能的失败是"零写入"（只有缓存/共享/凭证被写过）：重探是
@@ -544,15 +582,104 @@ func (v *setupView) applyProbeResult(res core.ProbeResult) {
 		return
 	}
 	v.profile, v.cands, v.prefilled = p, cands, prefilled
+	v.u.setProfileWarns(v.appKey, p.Warnings)
 	v.setState("confirm")
 	v.renderConfirm()
+	v.showReadsBanner()
 }
 
 // showDegraded 起降级横幅（看不到 fuse-overlayfs 时走 strace）。
 // 文案不承诺完整：strace 只记录实际跑到的路径。
 func (v *setupView) showDegraded() {
-	v.banner.SetTitle(v.u.tr("ui.setup.degraded.banner", nil))
+	v.degraded = true
+	v.showReadsBanner()
+}
+
+// addReadsWarn 记一条读证据告警并立刻刷新横幅（去重，保持到达顺序）。
+func (v *setupView) addReadsWarn(reason string) {
+	if reason == "" || slices.Contains(v.readsWarns, reason) {
+		return
+	}
+	v.readsWarns = append(v.readsWarns, reason)
+	v.showReadsBanner()
+}
+
+// mergeWarnKeys 合并两组告警键并去重，保持先到顺序（探测告警在前，
+// 候选派生告警在后）。档案里的告警与本次候选冲突可能重叠。
+func mergeWarnKeys(a, b []string) []string {
+	seen := map[string]bool{}
+	out := make([]string, 0, len(a)+len(b))
+	for _, list := range [][]string{a, b} {
+		for _, w := range list {
+			if w == "" || seen[w] {
+				continue
+			}
+			seen[w] = true
+			out = append(out, w)
+		}
+	}
+	return out
+}
+
+// showReadsBanner 把降级原因与读证据告警拼成一条常驻横幅（§11.1：多条
+// 原因不能只显示最后一条）。
+func (v *setupView) showReadsBanner() {
+	parts := v.readsBannerParts()
+	if len(parts) == 0 {
+		return
+	}
+	v.banner.SetTitle(strings.Join(parts, " · "))
 	v.banner.SetRevealed(true)
+}
+
+// readsBannerParts 是横幅的纯文本来源，便于在无 GTK 的单测里逐态断言。
+func (v *setupView) readsBannerParts() []string {
+	var parts []string
+	if v.degraded {
+		parts = append(parts, v.u.tr("ui.setup.degraded.banner", nil))
+	}
+	// 四态只在确认页展示：探测中的 OnReadsWarn 也会走这里，此时 readTrace
+	// 还是零值，不能把"旧档案"误报给正在探测的用户。
+	if v.state == "confirm" {
+		switch v.readTrace {
+		case core.ReadTracePartial:
+			parts = append(parts, v.u.tr("ui.setup.reads.partial", nil))
+		case core.ReadTraceUnavailable:
+			parts = append(parts, v.u.tr("ui.setup.reads.unavailable", nil))
+		case "":
+			parts = append(parts, v.u.tr("ui.setup.reads.legacy", nil))
+		default:
+			parts = append(parts, v.u.tr("ui.setup.reads.ok", nil))
+		}
+	}
+	for _, w := range v.readsWarns {
+		parts = append(parts, v.u.tr("probe.reads."+w, nil))
+	}
+	for _, w := range v.profile.Warnings {
+		switch w {
+		case "credential_scope_narrowed", "credential_scope_unsupported",
+			"cache_credential", "cache_path_dropped", "profile_conflict",
+			"credential_rows_truncated":
+			parts = append(parts, v.u.tr("probe.profile."+w, nil))
+		}
+	}
+	if len(v.profile.CredentialDropped) > 0 {
+		// 与 CLI 的 `credential_scope_narrowed` 对齐：告警键只说"范围收缩"，
+		// 用户还需要看到具体丢了哪条旧路径才能核对自动决策。
+		parts = append(parts, v.u.tr("ui.setup.reads.dropped",
+			map[string]any{"paths": strings.Join(v.profile.CredentialDropped, "、")}))
+	}
+	return parts
+}
+
+// retryAction 决定错误页的「重试」按钮做什么。采集线程泄漏是进程级
+// 不可恢复状态：同一进程里重试会在 Probe 入口被直接拒绝，按钮等于
+// 死循环，只能重启 appclone（ADR-034）。
+func (v *setupView) retryAction(err error) func() {
+	if errorKey(err) == "err.probe.reader_stuck" {
+		return nil
+	}
+	return v.probe
 }
 
 func (v *setupView) showError(err error) {
@@ -647,7 +774,36 @@ func (v *setupView) renderConfirm() {
 	own.SetDescription(desc)
 	for i := range v.cands {
 		c := v.cands[i]
-		if c.Class == core.ClassPublic || c.Class == core.ClassShared || c.Class == core.ClassKeyring {
+		if c.Class == core.ClassShared || c.Class == core.ClassKeyring {
+			continue
+		}
+		// 公共目录按 DisplayClass 判：既有档案里的公共路径 Class 是 Config，
+		// 只看 Class 会把它渲染成能拨的开关，用户勾上后保存必然失败
+		// （err.profile.public_path），门禁也会被它点亮。
+		if c.DisplayClass == core.ClassPublic || c.Class == core.ClassPublic {
+			row := adw.NewActionRow()
+			v.scope.own(&row.Widget)
+			row.SetTitle(v.u.allocText(c.Path))
+			ic := v.u.symbolicIcon("folder-symbolic")
+			v.scope.own(&ic.Widget)
+			row.AddPrefix(&ic.Widget)
+			row.SetSubtitle(v.u.tr("ui.setup.row.public.subtitle", nil))
+			row.SetSensitive(false)
+			own.Add(&row.Widget)
+			continue
+		}
+		// cache / 锁定行只展示，不提供 checkbox：缓存永远不进 paths（§8.4），
+		// 给一个拨不动的开关只会让用户以为"这次没生效"。
+		if c.Locked || c.Class == core.ClassCache {
+			row := adw.NewActionRow()
+			v.scope.own(&row.Widget)
+			row.SetTitle(v.u.allocText(c.Path))
+			ic := v.u.symbolicIcon("folder-symbolic")
+			v.scope.own(&ic.Widget)
+			row.AddPrefix(&ic.Widget)
+			row.SetSubtitle(v.u.tr("ui.setup.row.cache_locked", nil))
+			row.SetSensitive(false)
+			own.Add(&row.Widget)
 			continue
 		}
 		row := adw.NewSwitchRow()
@@ -659,6 +815,13 @@ func (v *setupView) renderConfirm() {
 		d := v.u.tr(c.Why, nil)
 		if c.Observed > 0 {
 			d = v.u.tr("ui.setup.row.observed", map[string]any{"why": d, "n": c.Observed})
+		}
+		if c.ContainsCredential && c.CredentialPath != "" {
+			d += " · " + v.u.tr("ui.setup.row.contains_credential",
+				map[string]any{"path": v.u.allocText(c.CredentialPath)})
+		}
+		if c.Credential == core.CredentialStrong {
+			d += " · " + v.u.tr("ui.setup.row.credential_strong", nil)
 		}
 		row.SetSubtitle(d)
 		row.SetActive(c.Checked)
@@ -672,6 +835,15 @@ func (v *setupView) renderConfirm() {
 		v.scope.own(&row.Widget)
 		row.SetTitle(v.u.tr("ui.setup.no_paths.title", nil))
 		row.SetSubtitle(v.u.tr("ui.setup.no_paths.subtitle", nil))
+		row.SetSensitive(false)
+		own.Add(&row.Widget)
+	}
+	if v.readTrace == core.ReadTraceUnavailable {
+		// 降级确认页：读证据不可用，用户必须自己勾选至少一条；否则保存会被
+		// 拒绝（§11.4）。把这句放在确认按钮之前，别让人点了才看到错误。
+		row := adw.NewActionRow()
+		v.scope.own(&row.Widget)
+		row.SetTitle(v.u.tr("ui.setup.confirm.empty", nil))
 		row.SetSensitive(false)
 		own.Add(&row.Widget)
 	}
@@ -811,9 +983,10 @@ func (v *setupView) buildProfile() core.Profile {
 	if v.runtimeRow != nil {
 		eff.IsolateRuntime = v.runtimeRow.GetActive()
 	}
-	p := v.u.env.Resolver.ProfileFromCandidates(v.appKey, eff.ProbeMethod, v.selectedCandidates())
-	p = core.MergeNonPathFieldsWith(v.u.env.Resolver, p, eff)
-	// ProfileFromCandidates 会给 ignored 填默认噪声表；复用档案（open/clone）
+	// 落案只走 DeriveProfile（§8.1）：它负责 paths、credential_paths 的
+	// 派生/收窄与告警。GUI 自己调 ProfileFromCandidates 会漏掉凭据适配。
+	p := v.u.env.Resolver.DeriveProfile(eff, &eff, eff.ProbeMethod, eff.ReadTrace, v.selectedCandidates())
+	// DeriveProfile 会给 ignored 填默认噪声表；复用档案（open/clone）
 	// 时必须让 nil 透传：CLI 复用就是原样落盘（`p = old`），GUI 凭空补一份
 	// 默认清单会把"跟随未来默认表"固化成今天这份默认值，两边字节也不一致
 	// （P3，复审发现）。探测流程的 eff 自带默认表，行为不变。用 slices.Clone
@@ -846,12 +1019,23 @@ func (v *setupView) submit() {
 	if v.state != "confirm" {
 		return
 	}
-	if v.mode == "rediscover" {
-		// 只保存档案，不建实例（GUI 详情页的「重新探测」）。
-		v.saveProfile(v.buildProfile())
+	p := v.buildProfile()
+	// 用户取消勾选会改变凭据范围；详情页应看到最终落盘版本的告警。
+	v.u.setProfileWarns(v.appKey, p.Warnings)
+	if len(p.Paths) == 0 {
+		// 确认页允许"读证据不可用"时进入，但绝不允许落一份空档案：
+		// 空 paths 的分身没有隔离任何东西（§11.4）。不挂重试——重探不会
+		// 替用户做勾选。
+		v.retry = nil
+		v.showError(core.NewProbeNoWrites(v.appKey, len(v.cands)))
 		return
 	}
-	v.createInstance(v.buildProfile())
+	if v.mode == "rediscover" {
+		// 只保存档案，不建实例（GUI 详情页的「重新探测」）。
+		v.saveProfile(p)
+		return
+	}
+	v.createInstance(p)
 }
 
 // saveProfile 也是事务态：写档案要持全局写锁并按 creating 处理（ADR-022）。
@@ -972,39 +1156,4 @@ func (v *setupView) finish(success bool) {
 	// 收尾（注销处理器、回调 onClose）在 popped 里做：这时页面已经真的
 	// 离开导航栈，onClose 里 push 详情页不会和 pop 动画打架。
 	v.u.nav.Pop()
-}
-
-// candidatesFromProfile 把已有档案（复用档案）还原成确认页的候选集。
-// 只用于展示与勾选；落盘仍走 ProfileFromCandidates，保证落点规则只有一份。
-func candidatesFromProfile(u *ui, p core.Profile) []core.Candidate {
-	var out []core.Candidate
-	for _, raw := range p.Paths {
-		abs, err := u.env.Resolver.Expand(raw)
-		if err != nil {
-			continue
-		}
-		out = append(out, core.Candidate{Path: abs, Class: core.ClassConfig, Checked: true, Why: "probe.why.config"})
-	}
-	for _, raw := range p.SharedWrites {
-		abs, err := u.env.Resolver.Expand(raw)
-		if err != nil {
-			continue
-		}
-		out = append(out, core.Candidate{Path: abs, Class: core.ClassShared, Checked: false, Why: "probe.why.shared"})
-	}
-	for _, un := range p.Unsupported {
-		// 只有 keyring 类在文件路径上（`~/.local/share/keyrings/*.keyring`）。
-		// 其它 kind（dbus/secret-service 等）不是可勾选路径；把它们硬塞进
-		// 候选会被 ProfileFromCandidates 改写成 kind=keyring，凭空改变档案
-		// 的白名单语义（P3，复审发现）。它们原样经 MergeNonPathFields 保留。
-		if un.Kind != "keyring" {
-			continue
-		}
-		abs, err := u.env.Resolver.Expand(un.Path)
-		if err != nil {
-			continue
-		}
-		out = append(out, core.Candidate{Path: abs, Class: core.ClassKeyring, Checked: false, Why: "probe.why.keyring"})
-	}
-	return out
 }

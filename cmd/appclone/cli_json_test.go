@@ -200,3 +200,29 @@ func TestDoctorJSONShape(t *testing.T) {
 		}
 	}
 }
+
+// add --json 的读证据字段是脚本契约：reads_warns 保持固定顺序，
+// credential_scope_narrowed 携带被丢弃的旧凭据路径；空值不写键。
+func TestAddProbeEvidenceShape(t *testing.T) {
+	p := core.Profile{
+		ReadTrace:         core.ReadTracePartial,
+		CredentialPaths:   []string{"~/.config/App/credentials.json"},
+		CredentialDropped: []string{"~/Downloads/token"},
+		Warnings:          []string{"credential_scope_unsupported"},
+	}
+	payload := map[string]any{}
+	addProbeEvidence(payload, []string{"parse_error", "no_fd_annotation"}, p)
+	warns, ok := payload["reads_warns"].([]string)
+	if !ok || len(warns) != 2 || warns[0] != "parse_error" || warns[1] != "no_fd_annotation" {
+		t.Fatalf("reads_warns 形状/顺序错：%#v", payload["reads_warns"])
+	}
+	dropped, ok := payload["credential_scope_narrowed"].([]string)
+	if !ok || len(dropped) != 1 || dropped[0] != "~/Downloads/token" {
+		t.Fatalf("credential_scope_narrowed 应携带丢弃路径：%#v", payload["credential_scope_narrowed"])
+	}
+	empty := map[string]any{}
+	addProbeEvidence(empty, nil, core.Profile{})
+	if len(empty) != 0 {
+		t.Fatalf("空值不应写键：%#v", empty)
+	}
+}

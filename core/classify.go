@@ -22,17 +22,35 @@ const (
 	ClassUnknown PathClass = "unknown" // 规则表没覆盖：灰区
 )
 
+// CredentialStrength 是"这条路径像不像登录态/凭据"的证据强度。
+// 空值 = 无证据；weak = 目录名/文件名里出现 session/account 等弱词；
+// strong = 命中 credentials/logins.json/Login Data/key4.db/Cookies/token 等
+// 强凭据文件名。只有 strong 会直接进入 credential_paths（见 docs/discover.md）。
+type CredentialStrength string
+
+const (
+	CredentialNone   CredentialStrength = ""
+	CredentialWeak   CredentialStrength = "weak"
+	CredentialStrong CredentialStrength = "strong"
+)
+
 // Candidate 是屏3 的一行（= 档案的一次预填建议）。
 //
 // Observed 是**写入条目数**，不是"命中次数"：overlay 只知道某个路径被写过或
 // 删过，拿不到次数。文案红线见 docs/方案设计.md §6.1。
 type Candidate struct {
-	Path     string    `json:"path"`     // 绝对路径；展示用 ToStoreForm 转 ~ 形式
-	Class    PathClass `json:"class"`    // 分组与 chip
-	Checked  bool      `json:"checked"`  // 默认是否勾选；灰区一律 false
-	Observed int       `json:"observed"` // 写入条目数
-	Why      string    `json:"why"`      // i18n 键，由视图层翻译
-	Warning  bool      `json:"warning"`  // 需要用户确认（灰区）
+	Path               string             `json:"path"`                          // 绝对路径；展示用 ToStoreForm 转 ~ 形式
+	Class              PathClass          `json:"class"`                         // 字段路由：决定进 paths/shared/unsupported
+	DisplayClass       PathClass          `json:"display_class"`                 // UI 分组/徽标；绝不参与路由
+	Checked            bool               `json:"checked"`                       // 默认是否勾选；灰区一律 false
+	Observed           int                `json:"observed"`                      // 写入条目数
+	Reads              int                `json:"reads"`                         // 读取路径数（按路径去重）
+	Why                string             `json:"why"`                           // i18n 键，由视图层翻译
+	Warning            bool               `json:"warning"`                       // 需要用户确认（灰区）
+	Credential         CredentialStrength `json:"credential,omitempty"`          // 展示：登录态证据强度
+	ContainsCredential bool               `json:"contains_credential,omitempty"` // 父路径包含凭据
+	CredentialPath     string             `json:"-"`                             // 实际观察到的最强凭据路径（内部）
+	Locked             bool               `json:"locked,omitempty"`              // cache 行：不渲染 checkbox
 }
 
 // isPublic 判定公共目录本身或其中任何路径（§5 规则 1，最高优先级）。
@@ -132,6 +150,16 @@ func samePathLoose(a, b string) bool {
 // 只看**主目录之内**的部分：绝对路径的祖先段与本判定无关，而 `$TMPDIR` 恰好
 // 常常在 `~/.cache` 下（测试环境即如此），扫全路径会把整棵临时树判成缓存。
 func (r *PathResolver) hasCacheComponent(abs string) bool {
+	// XDG_CACHE_HOME 可能指向不含 "cache" 段的目录（如 /tmp/xyz）：只靠段名
+	// 会把它判成普通数据目录，缓存被隔离（§7.3）。
+	if ch := r.XDG["CACHE_HOME"]; ch != "" && isUnderLoose(ch, abs) {
+		return true
+	}
+	// 单文件缓存库：`~/.config/App/cache.db` 不是"名字里带 cache 的目录"，
+	// 但它显然是缓存。
+	if strings.EqualFold(filepath.Base(abs), "cache.db") {
+		return true
+	}
 	rel, ok := "", false
 	if _, rel, ok = looseRel(r.Home, abs); !ok || rel == "" {
 		rel = abs

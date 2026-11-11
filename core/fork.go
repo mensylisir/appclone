@@ -37,9 +37,28 @@ func (e *Env) forkMounts(p Profile, in Instance, stop func() bool, warn func(str
 		}
 	}
 	paths, err := normalizePaths(p.Paths, e.BuildOptions())
-	if err != nil || len(paths) == 0 {
+	if err != nil {
+		say("无法解析隔离路径，这个分身将从空数据启动")
 		return nil, func() {}
 	}
+	if len(paths) == 0 {
+		return nil, func() {}
+	}
+	// 凭据路径不参与克隆（§10.2）：lower 等于凭据路径、包含凭据路径或位于
+	// 凭据路径之下都不挂。粒度取舍是 owner——浏览器这类"登录态与历史同目录"
+	// 的应用会从空配置起步，宁可少继承业务数据，也不泄漏登录态。
+	//
+	// 词法形态必须与真实形态一起保留：`~/.config/App/credentials.json` 可能
+	// 是指向 `/mnt/token` 的软链，只比 Real 会让 fork 克隆整条 App 目录，
+	// 分身在 `--bind / /` 下打开软链仍读到宿主登录态。
+	creds, cerr := normalizePaths(p.CredentialPaths, e.BuildOptions())
+	if cerr != nil {
+		// 解析不了凭据范围时**不能**当作"没有凭据"继续克隆——那会把登录态
+		// 原样复制进分身。宁可这次不继承，让应用从空数据起步。
+		say("无法解析登录状态目录，这个分身将从空数据启动")
+		return nil, func() {}
+	}
+	creds = append(creds, e.lexicalCredentialPaths(p.CredentialPaths)...)
 	mounter := e.Mounter
 	if mounter == nil {
 		mounter = fuseOverlayMounter{}
@@ -79,6 +98,10 @@ func (e *Env) forkMounts(p Profile, in Instance, stop func() bool, warn func(str
 	for _, abs := range paths {
 		if stop != nil && stop() {
 			break
+		}
+		if blocked, msg := credentialBlocksFork(abs, creds); blocked {
+			say(msg)
+			continue
 		}
 		// 只对“主实例里已经有内容”的目录做 overlay：空目录挂一份空视图
 		// 除了多一次挂载没有任何收益。
@@ -132,6 +155,34 @@ func (e *Env) forkMounts(p Profile, in Instance, stop func() bool, warn func(str
 		return nil, func() {}
 	}
 	return sources, cleanup
+}
+
+// lexicalCredentialPaths 返回凭据路径的词法绝对形态（不解析软链）。
+// fork 的阻断必须同时看词法与真实形态，见 forkMounts 的注释。
+func (e *Env) lexicalCredentialPaths(raw []string) []string {
+	var out []string
+	for _, s := range raw {
+		if abs, err := e.Resolver.expandLexical(s); err == nil {
+			out = append(out, abs)
+		}
+	}
+	return out
+}
+
+// credentialBlocksFork 判定一条 lower 是否因凭据范围而不能克隆（§10.2）：
+// lower 等于凭据路径、包含凭据路径（嵌套）或位于凭据路径之下都不挂。
+func credentialBlocksFork(lower string, creds []string) (bool, string) {
+	for _, cp := range creds {
+		switch {
+		case samePathLoose(lower, cp):
+			return true, "「" + lower + "」是登录状态目录，克隆时不继承（避免把登录态带进分身）"
+		case isUnderLoose(lower, cp):
+			return true, "「" + lower + "」包含登录状态目录，克隆时不继承（避免把登录态带进分身）"
+		case isUnderLoose(cp, lower):
+			return true, "「" + lower + "」位于登录状态目录内，克隆时不继承"
+		}
+	}
+	return false, ""
 }
 
 // resetForkBase 清掉上一次运行留下的挂载点与工作区。

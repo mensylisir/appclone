@@ -46,6 +46,8 @@ fuse 检查会在写层根建一个临时目录真挂一次 overlay，结束即�
 
 			var command string
 			var forkInstance bool
+			var readTrace string
+			var credPaths []string
 			if len(args) >= 1 {
 				appKey := args[0]
 				id := "main"
@@ -71,6 +73,9 @@ fuse 检查会在写层根建一个临时目录真挂一次 overlay，结束即�
 				}
 				command = strings.Join(argv, " ")
 				data["command"] = command
+				data["read_trace"] = p.ReadTrace
+				data["credential_paths"] = p.CredentialPaths
+				readTrace, credPaths = p.ReadTrace, p.CredentialPaths
 				forkInstance = in.Fork
 				if forkInstance {
 					// 脚本/JSON 消费者也要知道 command 是基线 argv。
@@ -88,6 +93,12 @@ fuse 检查会在写层根建一个临时目录真挂一次 overlay，结束即�
 				if command != "" {
 					fmt.Println("\n将执行的命令：")
 					fmt.Println("  " + command)
+					if readTrace != "" {
+						fmt.Printf("读证据：%s\n", readTrace)
+					}
+					if len(credPaths) > 0 {
+						fmt.Printf("登录态目录：%s\n", strings.Join(credPaths, "、"))
+					}
 					if forkInstance {
 						// 真正 run 时 paths 的 bind 源会换成 .fork/<hash>/merged
 						// （挂载点要到运行时才存在），这里只能给基线 argv。

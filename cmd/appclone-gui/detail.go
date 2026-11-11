@@ -184,6 +184,20 @@ func (v *detailView) apply(d detailData, force bool) {
 		return
 	}
 	v.profile = d.profile
+	// 档案告警不落盘；本次运行刚派生出来的那些由 ui 暂存，详情页据此解释
+	// "范围为什么变了"（scheme §10.1，run-scoped）。
+	if extra := v.u.profileWarnings(v.appKey); len(extra) > 0 {
+		seen := map[string]bool{}
+		var merged []string
+		for _, w := range append(append([]string{}, d.profile.Warnings...), extra...) {
+			if w == "" || seen[w] {
+				continue
+			}
+			seen[w] = true
+			merged = append(merged, w)
+		}
+		v.profile.Warnings = merged
+	}
 	v.insts = d.insts
 	v.running = d.running
 	v.audits = d.audits
@@ -205,6 +219,11 @@ func (d detailData) sig() string {
 		fmt.Fprintf(&b, "%s|%s|%s;", a.conclusion, a.reason, a.at)
 	}
 	fmt.Fprintf(&b, "|p:%d|r:%t|d:%t", len(d.profile.Paths), d.profile.IsolateRuntime, d.profile.IsolateDBus)
+	// 读证据/凭据/告警可能在详情页打开期间被 CLI 重新探测改掉，路径条数
+	// 不变时也必须触发重建，否则页面会一直显示旧结论。
+	fmt.Fprintf(&b, "|rt:%s|cp:%s|w:%s", d.profile.ReadTrace,
+		strings.Join(d.profile.CredentialPaths, ","),
+		strings.Join(d.profile.Warnings, ","))
 	return b.String()
 }
 
@@ -426,6 +445,54 @@ func (v *detailView) build() {
 	v.prefix(conf, "system-search-symbolic")
 	conf.SetSensitive(false)
 	pg.Add(&conf.Widget)
+
+	rt := adw.NewActionRow()
+	v.scope.own(&rt.Widget)
+	rt.SetTitle(v.u.tr("ui.detail.read_trace", nil))
+	switch p.ReadTrace {
+	case core.ReadTraceOK:
+		rt.SetSubtitle(v.u.tr("ui.detail.read_trace.ok", nil))
+	case core.ReadTracePartial:
+		rt.SetSubtitle(v.u.tr("ui.detail.read_trace.partial", nil))
+	case core.ReadTraceUnavailable:
+		rt.SetSubtitle(v.u.tr("ui.detail.read_trace.unavailable", nil))
+	default:
+		rt.SetSubtitle(v.u.tr("ui.detail.read_trace.legacy", nil))
+	}
+	v.prefix(rt, "system-search-symbolic")
+	rt.SetSensitive(false)
+	pg.Add(&rt.Widget)
+
+	if len(p.CredentialPaths) > 0 {
+		cr := adw.NewActionRow()
+		v.scope.own(&cr.Widget)
+		cr.SetTitle(v.u.tr("ui.detail.credentials", nil))
+		cl := make([]string, 0, len(p.CredentialPaths))
+		for _, raw := range p.CredentialPaths {
+			if abs, err := v.u.env.Resolver.Expand(raw); err == nil {
+				cl = append(cl, v.u.allocText(abs))
+			}
+		}
+		cr.SetSubtitle(strings.Join(cl, " · "))
+		cr.SetSubtitleLines(0)
+		cr.SetSensitive(false)
+		pg.Add(&cr.Widget)
+	}
+
+	if len(p.Warnings) > 0 {
+		wr := adw.NewActionRow()
+		v.scope.own(&wr.Widget)
+		wr.SetTitle(v.u.tr("ui.detail.profile_warnings", nil))
+		wl := make([]string, 0, len(p.Warnings))
+		for _, w := range p.Warnings {
+			wl = append(wl, v.u.tr("probe.profile."+w, nil))
+		}
+		wr.SetSubtitle(strings.Join(wl, " · "))
+		wr.SetSubtitleLines(0)
+		v.prefix(wr, "dialog-warning-symbolic")
+		wr.SetSensitive(false)
+		pg.Add(&wr.Widget)
+	}
 
 	if len(p.SharedWrites) > 0 {
 		sh := adw.NewActionRow()

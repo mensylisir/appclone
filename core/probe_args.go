@@ -25,7 +25,10 @@ type ProbeSpec struct {
 	// NoOverlay 是 strace 降级模式：不罩 overlay（HOME 就是真实的），
 	// 因此也没有"把公共目录绑回去"这回事——那句话的前提是 overlay 罩住了它们。
 	NoOverlay bool
-	Command   []string // 应用命令（argv[0] 之后全部原样）
+	// TraceDir 是会话 FIFO 所在目录；非空时在 --bind / / 之后用 --tmpfs 遮蔽，
+	// 防止沙箱内看到宿主 strace 的 FIFO/日志（ADR-034）。
+	TraceDir string
+	Command  []string // 应用命令（argv[0] 之后全部原样）
 }
 
 // ProbeBwrapArgs 产出探测会话的完整 argv（纯函数，golden 断言）。
@@ -59,9 +62,14 @@ func ProbeBwrapArgs(s ProbeSpec) ([]string, error) {
 		"bwrap",
 		"--unshare-user", "--unshare-pid", "--unshare-ipc",
 		"--bind", "/", "/",
+	}
+	if s.TraceDir != "" {
+		argv = append(argv, "--tmpfs", s.TraceDir)
+	}
+	argv = append(argv,
 		"--dev-bind", "/dev", "/dev",
 		"--proc", "/proc",
-	}
+	)
 	if !s.NoOverlay {
 		argv = append(argv, "--bind", s.Merged, s.Home)
 		for _, pb := range s.PublicBinds {
@@ -212,7 +220,9 @@ func (e *Env) probePublicBinds() ([]BindPair, error) {
 		if !ok || pub == "" {
 			continue // 这一项用户没配：不是错误，跳过
 		}
-		rel, under := relUnder(home, pub)
+		// HOME 可能是软链，user-dirs.dirs 里也可能写真实路径；用 looseRel
+		// 两种形态都认，否则合法配置会被硬判成 bad_public_dir、整个探测被禁用。
+		base, rel, under := looseRel(home, pub)
 		if !under || rel == "" {
 			// 指向家目录之外或就是家目录本身：禁用探测，不要"猜一个"。
 			return nil, errInput("err.probe.bad_public_dir", map[string]any{"path": pub, "home": home})
@@ -220,7 +230,7 @@ func (e *Env) probePublicBinds() ([]BindPair, error) {
 		if st, err := os.Stat(pub); err != nil || !st.IsDir() {
 			continue // 目录还没建：没必要 bind，也不会有人往这里存文件
 		}
-		out = append(out, BindPair{Src: pub, Dst: filepath.Join(home, rel)})
+		out = append(out, BindPair{Src: pub, Dst: filepath.Join(base, rel)})
 	}
 	return out, nil
 }

@@ -16,28 +16,38 @@ import (
 // 猜新字段语义 = 用旧代码解释新数据，最坏情况是把该隔离的路径漏掉。
 const ProfileVersion = 1
 
+// ReadTrace 的四种状态（ADR-034 §4.5）。"" 是旧档案（本版本之前生成）。
+const (
+	ReadTraceLegacy      = ""
+	ReadTraceOK          = "ok"
+	ReadTracePartial     = "partial"
+	ReadTraceUnavailable = "unavailable"
+)
+
 // Profile 是 per-app 路径知识库。字段语义见 docs/方案设计.md §5。
 type Profile struct {
 	// App 不落盘：档案文件名就是应用 key 的权威来源。它只用来让
 	// LoadProfile/SaveProfile 的方法签名保持一元（否则每个调用点都要
 	// 自己把 app 传两遍，传错一次就写错文件）。
-	App            string `toml:"-"`
-	Version        int
-	Exec           string
-	ExecArgs       []string
-	Paths          []string
-	SharedWrites   []string
-	LockFiles      []string
-	Sockets        []string
-	ExtraBinds     []BindPair
-	IsolateDBus    bool
-	IsolateRuntime bool
-	Env            map[string]string
-	Cwd            string
-	ProbeMethod    string // overlay | strace | manual
-	Audit          bool
-	Unsupported    []Unsupported
-	Ignored        []string
+	App             string `toml:"-"`
+	Version         int
+	Exec            string
+	ExecArgs        []string
+	Paths           []string
+	SharedWrites    []string
+	LockFiles       []string
+	Sockets         []string
+	ExtraBinds      []BindPair
+	IsolateDBus     bool
+	IsolateRuntime  bool
+	Env             map[string]string
+	Cwd             string
+	ProbeMethod     string // overlay | strace | manual
+	ReadTrace       string // "" | ok | partial | unavailable
+	CredentialPaths []string
+	Audit           bool
+	Unsupported     []Unsupported
+	Ignored         []string
 
 	// Unknown 保存本版本不认识的键，重写档案时原样回填（§5.5）。
 	// 否则用旧版改一次显示名就把新版字段抹掉了。
@@ -45,6 +55,9 @@ type Profile struct {
 
 	// Warnings 是本次加载/校验产生的告警（父子路径归一之类），不落盘。
 	Warnings []string
+	// CredentialDropped 是本次派生中被收缩/丢弃的旧凭据路径（run-scoped，
+	// 不落盘）。`add --json` / GUI 详情用它说明"为什么某个登录态不再隔离"。
+	CredentialDropped []string `toml:"-"`
 }
 
 // Unsupported 是"根本不在文件路径上、这个方案隔离不了"的项（keyring 等）。
@@ -79,21 +92,23 @@ func (in Instance) Dir() string { return filepath.Dir(in.Root) }
 // profileWire 是落盘形状。它与 Profile 分开的理由：ExtraBinds 在 TOML 里是
 // "源|目标" 字符串，而内存里是结构体；混用会让 Load/Save 各自做一次转换。
 type profileWire struct {
-	Version        int               `toml:"version"`
-	Exec           string            `toml:"exec"`
-	ExecArgs       []string          `toml:"exec_args,omitempty"`
-	Paths          []string          `toml:"paths"`
-	SharedWrites   []string          `toml:"shared_writes,omitempty"`
-	LockFiles      []string          `toml:"lock_files,omitempty"`
-	Sockets        []string          `toml:"sockets,omitempty"`
-	ExtraBinds     []string          `toml:"extra_binds,omitempty"`
-	IsolateDBus    bool              `toml:"isolate_dbus,omitempty"`
-	IsolateRuntime bool              `toml:"isolate_runtime,omitempty"`
-	Env            map[string]string `toml:"env,omitempty"`
-	Cwd            string            `toml:"cwd,omitempty"`
-	ProbeMethod    string            `toml:"probe_method,omitempty"`
-	Audit          bool              `toml:"audit,omitempty"`
-	Unsupported    []unsupportedWire `toml:"unsupported,omitempty"`
+	Version         int               `toml:"version"`
+	Exec            string            `toml:"exec"`
+	ExecArgs        []string          `toml:"exec_args,omitempty"`
+	Paths           []string          `toml:"paths"`
+	SharedWrites    []string          `toml:"shared_writes,omitempty"`
+	LockFiles       []string          `toml:"lock_files,omitempty"`
+	Sockets         []string          `toml:"sockets,omitempty"`
+	ExtraBinds      []string          `toml:"extra_binds,omitempty"`
+	IsolateDBus     bool              `toml:"isolate_dbus,omitempty"`
+	IsolateRuntime  bool              `toml:"isolate_runtime,omitempty"`
+	Env             map[string]string `toml:"env,omitempty"`
+	Cwd             string            `toml:"cwd,omitempty"`
+	ProbeMethod     string            `toml:"probe_method,omitempty"`
+	ReadTrace       string            `toml:"read_trace,omitempty"`
+	CredentialPaths []string          `toml:"credential_paths,omitempty"`
+	Audit           bool              `toml:"audit,omitempty"`
+	Unsupported     []unsupportedWire `toml:"unsupported,omitempty"`
 	// Ignored 用指针区分"没写"与"写了空表"：`ignored = []` 是用户要求
 	// "全部隔离、不要默认忽略表"的显式声明，nil 才是"没声明"（用默认表）。
 	// 用 []string + omitempty 会把空表当零值丢掉，重新加载后又变回 nil，
@@ -125,7 +140,8 @@ var knownProfileKeys = map[string]bool{
 	"version": true, "exec": true, "exec_args": true, "paths": true,
 	"shared_writes": true, "lock_files": true, "sockets": true, "extra_binds": true,
 	"isolate_dbus": true, "isolate_runtime": true, "env": true, "cwd": true,
-	"probe_method": true, "audit": true, "unsupported": true, "ignored": true,
+	"probe_method": true, "read_trace": true, "credential_paths": true,
+	"audit": true, "unsupported": true, "ignored": true,
 }
 
 // decodeKnown 把 Primitive 表按已知字段解码进 wire 结构。
@@ -143,6 +159,7 @@ func decodeKnown(md toml.MetaData, prims map[string]toml.Primitive, w *profileWi
 		"sockets": &w.Sockets, "extra_binds": &w.ExtraBinds,
 		"isolate_dbus": &w.IsolateDBus, "isolate_runtime": &w.IsolateRuntime,
 		"env": &w.Env, "cwd": &w.Cwd, "probe_method": &w.ProbeMethod,
+		"read_trace": &w.ReadTrace, "credential_paths": &w.CredentialPaths,
 		"audit": &w.Audit, "unsupported": &w.Unsupported, "ignored": &w.Ignored,
 	} {
 		if err := get(key, dst); err != nil {
@@ -186,7 +203,16 @@ func (e *Env) LoadProfile(app string) (Profile, error) {
 		return p, errInternal("err.internal.read_profile", map[string]any{"path": path}, err)
 	}
 
-	return parseProfile(app, path, data)
+	p, err = parseProfile(app, path, data)
+	if err != nil {
+		return p, err
+	}
+	// 轻量校验：手改档案把 credential_paths 写到 paths 之外时，加载即拒绝，
+	// 不让 fork 拿着一条"看起来像凭据、实际不在隔离范围"的路径去跳过克隆。
+	if err := ValidateCredentialPaths(p, e.BuildOptions()); err != nil {
+		return p, err
+	}
+	return p, nil
 }
 
 // parseProfile 把档案字节解析成 Profile。模板（内置 profiles/）与运行时档案
@@ -216,20 +242,22 @@ func parseProfile(app, path string, data []byte) (Profile, error) {
 	}
 
 	p = Profile{
-		Version:        w.Version,
-		Exec:           w.Exec,
-		ExecArgs:       w.ExecArgs,
-		Paths:          w.Paths,
-		SharedWrites:   w.SharedWrites,
-		LockFiles:      w.LockFiles,
-		Sockets:        w.Sockets,
-		IsolateDBus:    w.IsolateDBus,
-		IsolateRuntime: w.IsolateRuntime,
-		Env:            w.Env,
-		Cwd:            w.Cwd,
-		ProbeMethod:    w.ProbeMethod,
-		Audit:          w.Audit,
-		Unknown:        unknownFields(prims),
+		Version:         w.Version,
+		Exec:            w.Exec,
+		ExecArgs:        w.ExecArgs,
+		Paths:           w.Paths,
+		SharedWrites:    w.SharedWrites,
+		LockFiles:       w.LockFiles,
+		Sockets:         w.Sockets,
+		IsolateDBus:     w.IsolateDBus,
+		IsolateRuntime:  w.IsolateRuntime,
+		Env:             w.Env,
+		Cwd:             w.Cwd,
+		ProbeMethod:     w.ProbeMethod,
+		ReadTrace:       w.ReadTrace,
+		CredentialPaths: w.CredentialPaths,
+		Audit:           w.Audit,
+		Unknown:         unknownFields(prims),
 	}
 	// `ignored = []` 与"没写 ignored"语义不同：前者是用户显式声明空表，
 	// 后者才走默认忽略表。指针保留这个区别，不能折叠成同一个 nil。
@@ -261,20 +289,22 @@ func (e *Env) SaveProfile(p Profile) error {
 		p.Version = ProfileVersion
 	}
 	w := profileWire{
-		Version:        p.Version,
-		Exec:           p.Exec,
-		ExecArgs:       p.ExecArgs,
-		Paths:          p.Paths,
-		SharedWrites:   p.SharedWrites,
-		LockFiles:      p.LockFiles,
-		Sockets:        p.Sockets,
-		IsolateDBus:    p.IsolateDBus,
-		IsolateRuntime: p.IsolateRuntime,
-		Env:            p.Env,
-		Cwd:            p.Cwd,
-		ProbeMethod:    p.ProbeMethod,
-		Audit:          p.Audit,
-		Ignored:        ignoredWire(p.Ignored),
+		Version:         p.Version,
+		Exec:            p.Exec,
+		ExecArgs:        p.ExecArgs,
+		Paths:           p.Paths,
+		SharedWrites:    p.SharedWrites,
+		LockFiles:       p.LockFiles,
+		Sockets:         p.Sockets,
+		IsolateDBus:     p.IsolateDBus,
+		IsolateRuntime:  p.IsolateRuntime,
+		Env:             p.Env,
+		Cwd:             p.Cwd,
+		ProbeMethod:     p.ProbeMethod,
+		ReadTrace:       p.ReadTrace,
+		CredentialPaths: p.CredentialPaths,
+		Audit:           p.Audit,
+		Ignored:         ignoredWire(p.Ignored),
 	}
 	for _, b := range p.ExtraBinds {
 		w.ExtraBinds = append(w.ExtraBinds, b.Src+"|"+b.Dst)
@@ -307,20 +337,22 @@ func ignoredWire(v []string) *[]string {
 // 由提交点的 rename 决定是否真的落盘，所以不能直接调 SaveProfile。
 func encodeProfile(p Profile) ([]byte, error) {
 	w := profileWire{
-		Version:        p.Version,
-		Exec:           p.Exec,
-		ExecArgs:       p.ExecArgs,
-		Paths:          p.Paths,
-		SharedWrites:   p.SharedWrites,
-		LockFiles:      p.LockFiles,
-		Sockets:        p.Sockets,
-		IsolateDBus:    p.IsolateDBus,
-		IsolateRuntime: p.IsolateRuntime,
-		Env:            p.Env,
-		Cwd:            p.Cwd,
-		ProbeMethod:    p.ProbeMethod,
-		Audit:          p.Audit,
-		Ignored:        ignoredWire(p.Ignored),
+		Version:         p.Version,
+		Exec:            p.Exec,
+		ExecArgs:        p.ExecArgs,
+		Paths:           p.Paths,
+		SharedWrites:    p.SharedWrites,
+		LockFiles:       p.LockFiles,
+		Sockets:         p.Sockets,
+		IsolateDBus:     p.IsolateDBus,
+		IsolateRuntime:  p.IsolateRuntime,
+		Env:             p.Env,
+		Cwd:             p.Cwd,
+		ProbeMethod:     p.ProbeMethod,
+		ReadTrace:       p.ReadTrace,
+		CredentialPaths: p.CredentialPaths,
+		Audit:           p.Audit,
+		Ignored:         ignoredWire(p.Ignored),
 	}
 	for _, b := range p.ExtraBinds {
 		w.ExtraBinds = append(w.ExtraBinds, b.Src+"|"+b.Dst)
@@ -431,5 +463,6 @@ func DefaultIgnored() []string {
 }
 
 func (p Profile) String() string {
-	return fmt.Sprintf("profile(exec=%s paths=%d)", p.Exec, len(p.Paths))
+	return fmt.Sprintf("profile(exec=%s paths=%d read_trace=%q credential_paths=%v)",
+		p.Exec, len(p.Paths), p.ReadTrace, p.CredentialPaths)
 }

@@ -23,6 +23,7 @@ type SessionRunner interface {
 type SessionResult struct {
 	ExitCode int
 	Signaled bool
+	Started  bool // cmd.Start 成功即 true，与读追踪能力无关
 	Elapsed  time.Duration
 }
 
@@ -128,7 +129,7 @@ func (setsidRunner) Run(ctx context.Context, argv []string, stderr io.Writer) (S
 	if cmd.Stderr == nil {
 		cmd.Stderr = os.Stderr
 	}
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true, Pdeathsig: syscall.SIGTERM}
 	if err := cmd.Start(); err != nil {
 		return SessionResult{}, errEnv("err.probe.start_failed", map[string]any{"exec": argv[0]}, err)
 	}
@@ -146,10 +147,10 @@ func (setsidRunner) Run(ctx context.Context, argv []string, stderr io.Writer) (S
 	case <-ctx.Done():
 		terminateGroup(cmd.Process.Pid)
 		<-done
-		return SessionResult{Elapsed: time.Since(start)}, ctx.Err()
+		return SessionResult{Started: true, Elapsed: time.Since(start)}, ctx.Err()
 	case err := <-done:
 		terminateGroup(cmd.Process.Pid) // 收掉应用 fork 出去的后代
-		res := SessionResult{Elapsed: time.Since(start)}
+		res := SessionResult{Started: true, Elapsed: time.Since(start)}
 		if ee, ok := err.(*exec.ExitError); ok {
 			if ws, ok := ee.Sys().(syscall.WaitStatus); ok && ws.Signaled() {
 				res.Signaled = true

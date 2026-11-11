@@ -78,6 +78,12 @@ func ValidateProfile(p Profile, o BuildOptions) error {
 		return err
 	}
 	p.Paths = paths
+	if err := ValidateReadTrace(p.ReadTrace); err != nil {
+		return err
+	}
+	if err := ValidateCredentialPaths(p, o); err != nil {
+		return err
+	}
 
 	// lock_files 与 sockets 不能是同一路径：一个 bind 空文件、一个靠私有 runtime，
 	// 混着写会让实现只能二选一，另一条静默失效（§6.2 末尾的 ENOTSOCK 事故）。
@@ -200,6 +206,68 @@ func ValidateProfile(p Profile, o BuildOptions) error {
 // "最上层"而不是"最具体"：`paths` 里的每一项都会被 bind 到实例目录的同名子路径，
 // 父目录已经覆盖子目录，保留子项只会多一条冗余 bind；反过来若只留子项，
 // 父目录的其余内容就留在了共享层——那才是真正的漏隔离。
+// ValidateReadTrace 只接受四种取值；旧档案的 "" 表示未知。
+func ValidateReadTrace(v string) error {
+	switch v {
+	case "", "ok", "partial", "unavailable":
+		return nil
+	}
+	return errInput("err.profile.read_trace", map[string]any{"value": v})
+}
+
+// ValidateCredentialPaths 校验 credential_paths ⊆ paths（相等或位于其下）。
+// 词法优先、Real 兜底（§8.4）：软链 HOME 下词法在 paths 内就接受，不因真实
+// 路径在外而拒绝加载。
+func ValidateCredentialPaths(p Profile, o BuildOptions) error {
+	paths, err := normalizePaths(p.Paths, o)
+	if err != nil {
+		return err
+	}
+	var lexPaths []string
+	if o.Resolver != nil {
+		for _, raw := range p.Paths {
+			if abs, lerr := o.Resolver.expandLexical(raw); lerr == nil {
+				lexPaths = append(lexPaths, abs)
+			}
+		}
+	}
+	for _, raw := range p.CredentialPaths {
+		if o.Resolver != nil {
+			if lex, lerr := o.Resolver.expandLexical(raw); lerr == nil {
+				if underAnyLexical(lexPaths, lex) {
+					continue
+				}
+			}
+		}
+		abs, err := o.expand(raw)
+		if err != nil {
+			return err
+		}
+		ok := false
+		for _, parent := range paths {
+			if abs == parent || IsUnder(parent, abs) {
+				ok = true
+				break
+			}
+		}
+		if !ok {
+			return errInput("err.profile.credential_outside_paths", map[string]any{
+				"credential": abs,
+			})
+		}
+	}
+	return nil
+}
+
+func underAnyLexical(paths []string, child string) bool {
+	for _, p := range paths {
+		if _, ok := relUnder(p, child); ok {
+			return true
+		}
+	}
+	return false
+}
+
 func normalizePaths(raw []string, o BuildOptions) ([]string, error) {
 	if len(raw) == 0 {
 		return nil, nil
@@ -246,8 +314,23 @@ func checkDangerous(abs string, o BuildOptions, field string) error {
 	if abs == "/" {
 		return errInput("err.profile.root_path", map[string]any{"field": field})
 	}
-	if abs == filepath.Clean(o.Home) {
-		return errInput("err.profile.home_path", map[string]any{"field": field})
+	// HOME 本身及其祖先：paths 里出现它等于把整个家目录（或包含家目录的树）
+	// 隔离进实例。Expand 会把软链 HOME 解析成真实路径，所以词法与真实形态都
+	// 必须判；o.RealHome 来自 os.UserHomeDir，也可能是词法值，同样要取 Real。
+	home := filepath.Clean(o.Home)
+	if home != "" {
+		for _, h := range []string{home, Real(home)} {
+			if abs == h || IsUnder(abs, h) {
+				return errInput("err.profile.home_path", map[string]any{"field": field})
+			}
+		}
+	}
+	if o.RealHome != "" {
+		for _, h := range []string{filepath.Clean(o.RealHome), Real(o.RealHome)} {
+			if abs == h || IsUnder(abs, h) {
+				return errInput("err.profile.home_path", map[string]any{"field": field})
+			}
+		}
 	}
 	// 公共目录之下的任何路径同样拒绝：`~/Downloads/work` 被隔离成实例私有，
 	// 正是"两个分身各存一份下载"这种用户最不能接受的失误（§5 paths）。
@@ -262,9 +345,14 @@ func checkDangerous(abs string, o BuildOptions, field string) error {
 		}
 	}
 	// AC_BASE 及其之下：把分身自己的运行时根写进 paths 会让 bind 自指
-	// （instances/<app>/<id>/root 变成它自己的子目录）。
-	if o.Base != "" && IsUnder(o.Base, abs) {
-		return errInput("err.profile.base_path", map[string]any{"path": abs, "field": field})
+	// （instances/<app>/<id>/root 变成它自己的子目录）。paths 已经过 Expand
+	// （真实形态），自定义 AC_BASE 若是软链，词法比较会漏判。
+	if o.Base != "" {
+		for _, base := range []string{o.Base, Real(o.Base)} {
+			if IsUnder(base, abs) {
+				return errInput("err.profile.base_path", map[string]any{"path": abs, "field": field})
+			}
+		}
 	}
 	// 整个命名空间级目录（~/.config、~/.local/share、~/.local/state）**及其祖先**：
 	// `~/.local` 是 DATA_HOME/STATE_HOME 的祖先，也是默认 AC_BASE 的祖先，

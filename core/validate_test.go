@@ -234,3 +234,60 @@ func TestValidateProfileRejectsIsolateAndShare(t *testing.T) {
 		t.Fatalf("共享项落在隔离目录之下也应被拒（2），得到 %v", err)
 	}
 }
+
+func TestValidateProfileReadTraceEnum(t *testing.T) {
+	root := t.TempDir()
+	r := newResolver(root+"/home", root+"/home", 1000, func(string) string { return "" })
+	e := NewEnvAt(root+"/home/.local/share/appclone", r)
+	p := Profile{App: "x", Version: 1, Exec: "/bin/true", Paths: []string{"~/.config/App"}}
+	for _, v := range []string{"", "ok", "partial", "unavailable"} {
+		p.ReadTrace = v
+		if err := ValidateProfile(p, e.opts()); err != nil {
+			t.Fatalf("%q 应合法：%v", v, err)
+		}
+	}
+	p.ReadTrace = "complete"
+	if err := ValidateProfile(p, e.opts()); errKey(err) != "err.profile.read_trace" {
+		t.Fatalf("未知 read_trace 必须拒绝，得到 %v", err)
+	}
+}
+
+func TestValidateCredentialPathsSubset(t *testing.T) {
+	root := t.TempDir()
+	r := newResolver(root+"/home", root+"/home", 1000, func(string) string { return "" })
+	e := NewEnvAt(root+"/home/.local/share/appclone", r)
+	o := e.opts()
+	p := Profile{App: "x", Version: 1, Exec: "/bin/true", Paths: []string{"~/.config/App"}}
+
+	p.CredentialPaths = []string{"~/.config/App"}
+	if err := ValidateProfile(p, o); err != nil {
+		t.Fatalf("credential == path 应合法：%v", err)
+	}
+	p.CredentialPaths = []string{"~/.config/App/credentials.json"}
+	if err := ValidateProfile(p, o); err != nil {
+		t.Fatalf("credential 位于 path 之下应合法：%v", err)
+	}
+	p.CredentialPaths = []string{"~/.config/Other"}
+	if err := ValidateProfile(p, o); errKey(err) != "err.profile.credential_outside_paths" {
+		t.Fatalf("paths 之外的 credential 必须拒绝，得到 %v", err)
+	}
+}
+
+// 自定义 AC_BASE 是软链时，词法比较会漏掉"实例根位于被隔离目录内"；
+// 必须同时按真实路径判定（否则 bwrap 自指）。
+func TestCheckDangerousBaseSymlink(t *testing.T) {
+	root := t.TempDir()
+	realBase := filepath.Join(root, "real")
+	if err := os.MkdirAll(realBase, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	linkBase := filepath.Join(root, "link")
+	if err := os.Symlink(realBase, linkBase); err != nil {
+		t.Fatal(err)
+	}
+	abs := filepath.Join(realBase, "instances", "demo")
+	o := BuildOptions{Home: filepath.Join(root, "home"), Base: linkBase}
+	if err := checkDangerous(abs, o, "paths"); err == nil {
+		t.Fatal("真实路径落在 AC_BASE 之下必须拒绝")
+	}
+}
