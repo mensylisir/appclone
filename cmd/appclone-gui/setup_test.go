@@ -1,3 +1,8 @@
+//go:build linux && gtk_e2e
+
+// 这个包 import puregotk，init 阶段会 dlopen GTK：无 GTK 运行库的机器上
+// `go test ./...`（CI 的 Go 门禁）会直接 panic，而不是 skip。纯逻辑单测也
+// 只能和 GTK 闸门一起跑（design/guitest-gtk.sh），不能留在默认门禁里。
 package main
 
 import (
