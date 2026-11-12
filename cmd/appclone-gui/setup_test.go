@@ -7,9 +7,14 @@ package main
 
 import (
 	"errors"
+	"io/fs"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"codeberg.org/puregotk/puregotk/v4/adw"
+	"codeberg.org/puregotk/puregotk/v4/gtk"
 
 	"github.com/mensylisir/appclone/core"
 )
@@ -124,5 +129,114 @@ func TestRetryActionReaderStuck(t *testing.T) {
 	}
 	if v.retryAction(errors.New("other")) == nil {
 		t.Fatal("其它探测错误应保留重试")
+	}
+}
+
+// F3：保存档案只校验能力，绝不预先建 keyring 目录或密码。目录/密码属于
+// 运行期（EnsureKeyring）；保存阶段替用户造状态，会让「取消创建」或
+// 「保存了但没建实例」留下半截数据，也会让后续探测把空 keyring 当证据。
+func TestSaveProfileLeavesNoKeyringState(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
+	t.Setenv("XDG_DATA_HOME", filepath.Join(home, ".local", "share"))
+	t.Setenv("XDG_CACHE_HOME", filepath.Join(home, ".cache"))
+	t.Setenv("XDG_STATE_HOME", filepath.Join(home, ".local", "state"))
+	t.Setenv("AC_BASE", filepath.Join(home, "appclone"))
+	e, err := core.NewEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := core.Profile{
+		App: "demo", Version: core.ProfileVersion, Exec: "/bin/true",
+		Paths: []string{"~/.config/demo"}, ProbeMethod: "overlay",
+		Ignored: core.DefaultIgnored(), Env: map[string]string{},
+		IsolateKeyring: true, KeyringSet: true,
+	}
+	if err := core.ValidateProfile(p, e.BuildOptions()); err != nil {
+		t.Fatalf("档案应通过校验：%v", err)
+	}
+	if err := e.SaveProfile(p); err != nil {
+		t.Fatalf("保存失败：%v", err)
+	}
+	got, err := e.LoadProfile("demo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.IsolateKeyring || !got.KeyringSet {
+		t.Fatalf("显式开启必须原样回读：%+v", got)
+	}
+	err = filepath.WalkDir(e.Base, func(path string, d fs.DirEntry, werr error) error {
+		if werr != nil {
+			return werr
+		}
+		if d.Name() == "keyring" || d.Name() == "keyring.pw" {
+			t.Fatalf("保存档案不得创建 keyring 状态：%s", path)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+// 「独立密钥环」行写回档案时必须是显式三态（KeyringSet），且开启后
+// DBus/runtime 行被点亮并锁住——界面上看到的隐含关系与 bwrap 实际行为一致。
+func TestBuildProfileKeyringExplicitAndRowSync(t *testing.T) {
+	if os.Getenv("APPCLONE_GTK_TEST") != "1" {
+		t.Skip("GTK 回归需要显式开关：design/guitest-gtk.sh")
+	}
+	if os.Getenv("DISPLAY") == "" && os.Getenv("WAYLAND_DISPLAY") == "" {
+		t.Skip("没有可用的显示（DISPLAY / WAYLAND_DISPLAY）")
+	}
+	gtk.Init()
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
+	t.Setenv("XDG_DATA_HOME", filepath.Join(home, ".local", "share"))
+	t.Setenv("XDG_CACHE_HOME", filepath.Join(home, ".cache"))
+	t.Setenv("XDG_STATE_HOME", filepath.Join(home, ".local", "state"))
+	e, err := core.NewEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	u := &ui{env: e, lang: "zh_CN"}
+	cfg := filepath.Join(e.Resolver.XDG["CONFIG_HOME"], "demo")
+	v := &setupView{
+		u: u, appKey: "demo",
+		profile: core.Profile{App: "demo", Exec: "/bin/true", ProbeMethod: "overlay"},
+		cands: []core.Candidate{{
+			Path: cfg, Class: core.ClassConfig, DisplayClass: core.ClassConfig,
+			Checked: true,
+		}},
+	}
+	v.keyringRow = adw.NewSwitchRow()
+	defer v.keyringRow.Unref()
+	v.dbusRow = adw.NewSwitchRow()
+	defer v.dbusRow.Unref()
+	v.runtimeRow = adw.NewSwitchRow()
+	defer v.runtimeRow.Unref()
+
+	v.keyringRow.SetActive(true)
+	v.syncKeyringRows()
+	if !v.dbusRow.GetActive() || !v.runtimeRow.GetActive() {
+		t.Fatal("开启独立密钥环必须隐含私有总线与 runtime")
+	}
+	if v.dbusRow.GetSensitive() || v.runtimeRow.GetSensitive() {
+		t.Fatal("隐含开启的行应锁定，避免视觉与行为不一致")
+	}
+	p := v.buildProfile()
+	if !p.IsolateKeyring || !p.KeyringSet {
+		t.Fatalf("开启必须写成显式 true：%+v", p)
+	}
+
+	v.keyringRow.SetActive(false)
+	v.syncKeyringRows()
+	if !v.dbusRow.GetSensitive() || !v.runtimeRow.GetSensitive() {
+		t.Fatal("关闭后应恢复可操作")
+	}
+	p = v.buildProfile()
+	if p.IsolateKeyring || !p.KeyringSet {
+		t.Fatalf("关闭必须写成显式 false（不是「未设置」）：%+v", p)
 	}
 }

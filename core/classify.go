@@ -68,6 +68,18 @@ func (r *PathResolver) isPublic(abs string) bool {
 // 把它当普通 config 隔离，分身里就会出现"另一个 keyring 文件"，
 // 而真正的凭证查询走的是主实例的 secret service——那是彻底的假隔离（§5.4）。
 func (r *PathResolver) isKeyring(abs string) bool {
+	if r.isKeyringDir(abs) {
+		return true
+	}
+	// 落在 keyring 目录之外的 `.keyring` 文件同样是凭证存储（旧档案、
+	// 应用自建副本）；分类与凭据派生要认它，但 **paths 校验不能**：
+	// paths 支持精确文件（方案 §5），`~/.config/app/foo.keyring` 可能是
+	// 应用自己的合法文件，见 ValidateProfile 用 isKeyringDir。
+	return strings.HasSuffix(filepath.Base(abs), ".keyring")
+}
+
+// isKeyringDir 只判定两个 keyring 目录本身及其子路径。
+func (r *PathResolver) isKeyringDir(abs string) bool {
 	for _, base := range []string{
 		filepath.Join(r.XDG["CONFIG_HOME"], "keyrings"),
 		filepath.Join(r.XDG["DATA_HOME"], "keyrings"),
@@ -76,7 +88,7 @@ func (r *PathResolver) isKeyring(abs string) bool {
 			return true
 		}
 	}
-	return strings.HasSuffix(filepath.Base(abs), ".keyring")
+	return false
 }
 
 // sharedWriteDirs 是"隔离后功能立刻坏掉"的硬排除目录（§5 规则 2）。

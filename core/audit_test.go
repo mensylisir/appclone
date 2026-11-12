@@ -79,7 +79,7 @@ func TestAuditSessionLifecycle(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	sess, layers, err := e.beginAudit(in, p)
+	sess, layers, err := e.beginAudit(in, p, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -167,7 +167,7 @@ func TestAuditQuarantinesPendingEvidence(t *testing.T) {
 	// 崩掉时会被当成"本次正常跑完"。
 	seedRunRecord(t, filepath.Join(e.AuditDir(app, id), "run.toml"), runRecord{App: app, ID: id})
 
-	if _, _, err := e.beginAudit(in, p); err != nil {
+	if _, _, err := e.beginAudit(in, p, nil); err != nil {
 		t.Fatalf("有残留写层时应搬走后继续，而不是拒绝：%v", err)
 	}
 	qs, _ := filepath.Glob(filepath.Join(e.AuditDir(app, id), "quarantine-*"))
@@ -203,7 +203,7 @@ func TestAuditDoesNotBlockOnExistingQuarantine(t *testing.T) {
 	if err := os.MkdirAll(filepath.Join(e.AuditDir(app, id), "quarantine-20260101T000000"), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := e.beginAudit(in, p); err != nil {
+	if _, _, err := e.beginAudit(in, p, nil); err != nil {
 		t.Fatalf("已有 quarantine 不应阻塞新审计：%v", err)
 	}
 }
@@ -327,7 +327,7 @@ func TestNewAuditAttemptDoesNotReplayOldSummary(t *testing.T) {
 	e.Mounter = &fakeMounter{entries: []string{".cache/TestApp/blob"}}
 
 	// 先完成一次能判 verified 的审计，留下 summary.toml。
-	sess, _, err := e.beginAudit(in, p)
+	sess, _, err := e.beginAudit(in, p, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -343,7 +343,7 @@ func TestNewAuditAttemptDoesNotReplayOldSummary(t *testing.T) {
 	}
 
 	// 再开一轮，并在写层建立后立即放弃（模拟失败/被杀）。
-	sess, _, err = e.beginAudit(in, p)
+	sess, _, err = e.beginAudit(in, p, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

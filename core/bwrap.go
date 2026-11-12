@@ -22,7 +22,12 @@ func BuildBwrapArgs(p Profile, in Instance, o BuildOptions) ([]string, error) {
 	// 私有总线只有真的会生成 bind/setenv 时才算数。isolate_dbus 隐含
 	// runtime 隔离；总线启动失败（DBusAddress 为空）时退回共享宿主总线，
 	// 此时 runtime 目录仍然隔离，但宿主 bus 必须经 RuntimeSocks 绑回来。
-	needRuntime := p.IsolateRuntime || (p.IsolateDBus && o.DBusAddress != "")
+	//
+	// isolate_keyring 隐含 isolate_dbus（ADR-035）：五个站点统一用
+	// isolateBus 判据，否则手写 `isolate_keyring=true`/`isolate_dbus=false`
+	// 会把宿主 bus 只读带进来，直接绕过独立 keyring。
+	isolateBus := p.IsolateDBus || p.IsolateKeyring
+	needRuntime := p.IsolateRuntime || p.IsolateKeyring || (p.IsolateDBus && o.DBusAddress != "")
 	// 校验 2（§3.1）：Base 不得等于或位于**tmpfs 之后**的任一 bind 目标之下，
 	// 也不得包含它们。runtime 目录与每个 socket 都是 tmpfs 之后才绑的：
 	// AC_BASE 若在 $XDG_RUNTIME_DIR/X11-unix 下，`--ro-bind-try` 会把整个
@@ -45,19 +50,6 @@ func BuildBwrapArgs(p Profile, in Instance, o BuildOptions) ([]string, error) {
 		"--proc", "/proc",
 	}
 
-	// ④.1 宿主会话总线遮蔽：`--bind / /` 会让 dbus-launch 之类放在 /tmp 的
-	// 宿主总线在沙箱里仍然可见，应用可以绕过私有总线连回宿主（进而触达宿主
-	// keyring）。只在私有总线**确实在跑**时遮蔽：总线启动失败走的是"降级为
-	// 共享宿主总线"，那时遮蔽等于把应用彻底断网。
-	// 用 `--bind` 而不是 `--bind-try`：清单已按"真实存在的 socket"过滤过
-	// （core/dbus_session.go，含软链解析），-try 的容错没有意义；stat 与 bwrap
-	// 之间 socket 消失的极小窗口可能留下 0444 占位文件，fail-closed 可接受。
-	if p.IsolateDBus && o.DBusAddress != "" {
-		for _, pth := range o.HostBusPaths {
-			args = append(args, "--bind", "/dev/null", pth)
-		}
-	}
-
 	// ④.5 审计层（§6.5）：只在 `run --audit` 时存在。顺序写死——
 	//   overlay 先罩住 HOME，再把**公共目录**绑回真实位置，
 	//   最后才是 ⑤ 的实例私有目录。反过来（实例 bind 在前）会被公共目录的
@@ -73,6 +65,19 @@ func BuildBwrapArgs(p Profile, in Instance, o BuildOptions) ([]string, error) {
 		}
 	}
 
+	// ④.1 宿主会话总线遮蔽：`--bind / /` 会让 dbus-launch 之类放在 /tmp 的
+	// 宿主总线在沙箱里仍然可见，应用可以绕过私有总线连回宿主（进而触达宿主
+	// keyring）。只在私有总线**确实在跑**时遮蔽：总线启动失败走的是"降级为
+	// 共享宿主总线"，那时遮蔽等于把应用彻底断网。
+	// 用 `--bind` 而不是 `--bind-try`：清单已按"真实存在的 socket"过滤过
+	// （core/dbus_session.go，含软链解析），-try 的容错没有意义；stat 与 bwrap
+	// 之间 socket 消失的极小窗口可能留下 0444 占位文件，fail-closed 可接受。
+	if isolateBus && o.DBusAddress != "" {
+		for _, pth := range o.HostBusPaths {
+			args = append(args, "--bind", "/dev/null", pth)
+		}
+	}
+
 	// ④.6 AC_BASE 遮蔽：--bind / / 会把工具自己的运行时根（其他分身的数据、
 	// keyring、私有总线 socket）暴露给应用。tmpfs 只盖真实路径：bwrap 拒绝
 	// 在软链目标上挂载（Can't mount on symlink destination），解析一次后软链
@@ -81,9 +86,24 @@ func BuildBwrapArgs(p Profile, in Instance, o BuildOptions) ([]string, error) {
 		args = append(args, "--tmpfs", base)
 	}
 
-	// ④.7 审计写层对应用不可见：分身 A 不该读到分身 B 的 upper 副本。
-	// 写层根在 XDG_RUNTIME_DIR 内时随后的 runtime bind 会覆盖它，tmpfs 冗余
-	// 但无害；golden 不断言该情形。
+	// ④.7 审计写层对**所有**分身不可见：写层根下保留着各实例的 upper 副本
+	// （含尚未 verify 的证据）。只在审计会话里遮自己的 per-instance 目录不够，
+	// 普通 run 的 `--bind / /` 同样能按真实路径读到/改掉别人的证据（§6.5）。
+	// 写层根已被 Base tmpfs 覆盖、或反过来包含 HOME（极端布局）时不重复挂载，
+	// 后者会把 HOME 连同实例 bind 一起遮掉。
+	if ar := o.AuditRoot; ar != "" {
+		base := o.baseReal()
+		hide := ar != o.RealHome && !IsUnder(ar, o.RealHome)
+		if base != "" && (ar == base || IsUnder(base, ar)) {
+			hide = false
+		}
+		if hide {
+			args = append(args, "--tmpfs", ar)
+		}
+	}
+
+	// ④.8 审计会话自己的写层：④.7 已按根遮蔽，这里保留是为了兼容旧 golden
+	// 与"写层根恰好等于 Base"的兜底；冗余但无害。
 	if o.Audit != nil && o.Audit.WriteRoot != "" {
 		args = append(args, "--tmpfs", o.Audit.WriteRoot)
 	}
@@ -131,6 +151,16 @@ func BuildBwrapArgs(p Profile, in Instance, o BuildOptions) ([]string, error) {
 		args = append(args, "--bind", src, dst)
 	}
 
+	// ⑦.5 独立 keyring：两个 XDG keyring 目标 bind 到**同一来源**（实例自己的
+	// keyring 数据，ADR-035）。必须排在 paths/extra_binds 之后：`paths` 可能
+	// 声明了 ~/.config 这样的父目录，keyring 目标要在它之上盖回实例数据。
+	if p.IsolateKeyring {
+		src := keyringDataDir(in)
+		for _, dst := range o.keyringBinds() {
+			args = append(args, "--bind", src, dst)
+		}
+	}
+
 	// ⑧ 普通文件锁：挂一个 inode 不同的私有空文件，flock 自然不再互斥。
 	// 文件名用目标路径的哈希而不是数组下标：档案顺序一变私有锁就换名，旧文件永久残留。
 	locks := make([]string, 0, len(p.LockFiles))
@@ -166,7 +196,7 @@ func BuildBwrapArgs(p Profile, in Instance, o BuildOptions) ([]string, error) {
 			// 应用继承的宿主地址指向一个不存在的 socket，工具却打印"共用总线"。
 			// 判据是"直接位于宿主 runtime 下的 bus"；旧写法取了两级 Dir，
 			// 对 /run/user/1000/bus 永远不成立（二级 Dir 是 /run/user）。
-			if p.IsolateDBus && o.DBusAddress != "" && filepath.Base(s.Src) == "bus" && filepath.Dir(s.Src) == o.RuntimeDir {
+			if isolateBus && o.DBusAddress != "" && filepath.Base(s.Src) == "bus" && filepath.Dir(s.Src) == o.RuntimeDir {
 				continue
 			}
 			// 只读、只 bind socket/目录本身：把整个 $XDG_RUNTIME_DIR 带进来
@@ -174,7 +204,7 @@ func BuildBwrapArgs(p Profile, in Instance, o BuildOptions) ([]string, error) {
 			args = append(args, "--ro-bind-try", s.Src, s.Dst)
 		}
 	}
-	if p.IsolateDBus && o.DBusAddress != "" {
+	if isolateBus && o.DBusAddress != "" {
 		appAddr := o.DBusAppAddress
 		if appAddr == "" {
 			appAddr = o.DBusAddress

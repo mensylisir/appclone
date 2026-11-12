@@ -111,6 +111,12 @@ func newAddCmd(a *app) *cobra.Command {
 			// 本次探测的读证据告警只对这一次运行有意义（run-scoped），不写进
 			// 档案；`--json` 直接展示，GUI 用同一个字段。
 			var readsWarns []string
+			// 探测证据（run-scoped，不落盘）：keyring_evidence 只在本次真的
+			// 探测过时才有意义；复用档案时是空串（"没有证据"而不是"没有 keyring"）。
+			var keyringEvidence string
+			// 证据扫描被上限截断时非零：没有观测到 keyring 不等于应用不用，
+			// 必须让脚本能区分"证据完整但没有"与"证据被截断"。
+			var keyringDropped int
 			needProfile := !hasProfile || !creatable || rediscover
 			if needProfile {
 				if !rediscover && hasProfile && !creatable {
@@ -173,6 +179,8 @@ func newAddCmd(a *app) *cobra.Command {
 				}
 				p = fin
 				readsWarns = res.ReadsWarns
+				keyringEvidence = res.KeyringEvidence
+				keyringDropped = res.KeyringTraceDropped
 			} else if hasOld {
 				p = old
 			} else if p, err = a.env.LoadProfile(appKey); err != nil {
@@ -199,6 +207,8 @@ func newAddCmd(a *app) *cobra.Command {
 				payload := map[string]any{
 					"app": appKey, "profile_saved": true, "probe_method": p.ProbeMethod,
 					"read_trace": p.ReadTrace, "credential_paths": p.CredentialPaths,
+					"isolate_keyring": p.IsolateKeyring, "keyring_evidence": keyringEvidence,
+					"keyring_trace_dropped": keyringDropped,
 				}
 				addProbeEvidence(payload, readsWarns, p)
 				a.ok(payload, func() {
@@ -217,6 +227,8 @@ func newAddCmd(a *app) *cobra.Command {
 				"app": in.App, "id": in.ID, "display_name": in.DisplayName,
 				"created_at": in.CreatedAt, "probe_method": in.ProbeMethod, "fork": in.Fork,
 				"read_trace": p.ReadTrace, "credential_paths": p.CredentialPaths,
+				"isolate_keyring": p.IsolateKeyring, "keyring_evidence": keyringEvidence,
+				"keyring_trace_dropped": keyringDropped,
 			}
 			addProbeEvidence(payload, readsWarns, p)
 			a.ok(payload, func() {

@@ -448,6 +448,9 @@ func (e *Env) judge(p Profile, entries []UpperEntry, rec *runRecord) Verdict {
 		// 凭空产生的 extract_failed，会让审计永远作废。
 		mustBind = append(mustBind, rec.PublicBinds...)
 		mustBind = append(mustBind, rec.SharedBinds...)
+		// keyring 目标也必须实际 bind：目录下出现未 bind 的写入说明独立
+		// 密钥环没生效（v1.0.3 起）。
+		mustBind = append(mustBind, rec.KeyringBinds...)
 		// AC_BASE 现在是 `--tmpfs` 遮蔽路径，不再是 bind：Base 下出现写入
 		// 说明遮蔽没生效。新记录用 MaskedBase；异常缺字段时退回 Base，
 		// 方向仍是 extract_failed（不能掉成普通 leak），并记一条 warning。

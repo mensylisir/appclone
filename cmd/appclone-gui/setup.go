@@ -47,6 +47,12 @@ type setupView struct {
 	lockRow     *adw.SwitchRow
 	dbusRow     *adw.SwitchRow
 	runtimeRow  *adw.SwitchRow
+	// keyringRow 是「独立密钥环」开关（ADR-035）。组始终出现：这是用户
+	// 唯一能手动开启它的入口，证据只决定默认值与副标题。
+	keyringRow       *adw.SwitchRow
+	keyringEvidence  string
+	keyringAvailable bool
+	keyringWhy       string
 	// forkRow 是「从现有应用数据克隆起步」开关（§8.1）。默认关，与 CLI
 	// `add` 不带 --fork 的默认一致；只有真正建实例的入口才出现。
 	forkRow *adw.SwitchRow
@@ -565,6 +571,8 @@ func (v *setupView) release() {
 func (v *setupView) applyProbeResult(res core.ProbeResult) {
 	v.readsWarns = append([]string{}, res.ReadsWarns...)
 	v.readTrace = res.ReadTrace
+	// keyring 证据只来自本次探测；复用档案（open/clone）时没有证据。
+	v.keyringEvidence = res.KeyringEvidence
 	// AllowEmpty 只给 GUI 首次配置：读证据不可用时允许先进入确认页由用户
 	// 勾选；CLI 永不进入这条分支（§11.4）。
 	p, cands, prefilled, err := v.u.env.FinalizeProbe(v.appKey, res, core.ProbeFinalize{
@@ -759,6 +767,7 @@ func (v *setupView) renderConfirm() {
 	v.lockRow = nil
 	v.dbusRow = nil
 	v.runtimeRow = nil
+	v.keyringRow = nil
 	v.forkRow = nil
 
 	own := adw.NewPreferencesGroup()
@@ -905,6 +914,51 @@ func (v *setupView) renderConfirm() {
 		pg.Add(sg)
 	}
 
+	// 登录状态（ADR-035）：独立密钥环开关。组**始终出现**（rediscover 也出现），
+	// 因为这是用户手动开启它的唯一入口；能力缺失时 disabled 并说明原因，
+	// 但已开启时始终允许关闭。
+	v.keyringAvailable = true
+	v.keyringWhy = ""
+	if caps := v.u.env.KeyringCapability(); !caps.Available {
+		v.keyringAvailable = false
+		switch {
+		case caps.Daemon == "":
+			v.keyringWhy = v.u.tr("ui.setup.row.keyring.unavailable", map[string]any{"why": "gnome-keyring-daemon"})
+		default:
+			v.keyringWhy = v.u.tr("ui.setup.row.keyring.unavailable", map[string]any{"why": "dbus-send"})
+		}
+	}
+	kg := adw.NewPreferencesGroup()
+	v.scope.own(&kg.Widget)
+	kg.SetTitle(v.u.tr("ui.setup.group.keyring", nil))
+	kr := adw.NewSwitchRow()
+	v.scope.own(&kr.Widget)
+	kr.SetTitle(v.u.tr("ui.setup.row.keyring.title", nil))
+	sub := v.u.tr("ui.setup.row.keyring.subtitle", nil)
+	switch v.keyringEvidence {
+	case core.KeyringEvidenceObserved:
+		sub += v.u.tr("ui.setup.row.keyring.observed", nil)
+	case core.KeyringEvidenceLinked:
+		sub += v.u.tr("ui.setup.row.keyring.linked", nil)
+	}
+	// 迁移提示：升级后私有总线不再激活宿主 keyring。只对"已有私有总线、
+	// 还没开独立密钥环"的档案出现；isolate_dbus=false 时应用仍能访问宿主
+	// 总线与 keyring，不需要提示。
+	if v.profile.IsolateDBus && !v.profile.IsolateKeyring {
+		sub += v.u.tr("ui.setup.row.keyring.migrate", nil)
+	}
+	kr.SetSubtitle(sub)
+	kr.SetActive(v.profile.IsolateKeyring)
+	if !v.keyringAvailable && !v.profile.IsolateKeyring {
+		kr.SetSensitive(false)
+		kr.SetSubtitle(sub + v.keyringWhy)
+	}
+	v.keyringRow = kr
+	v.scope.switchRow(kr, func() { v.syncKeyringRows() })
+	kg.Add(&kr.Widget)
+	pg.Add(kg)
+	v.syncKeyringRows()
+
 	// 公共目录：只读，永远是"没乱来"的证据。
 	pub := adw.NewPreferencesGroup()
 	v.scope.own(&pub.Widget)
@@ -969,6 +1023,28 @@ func (v *setupView) selectedCandidates() []core.Candidate {
 	return out
 }
 
+// syncKeyringRows 让「独立密钥环」与单例组联动：开启时 DBus/runtime 行同步
+// 点亮并禁用（避免视觉状态与隐含关系冲突），关闭时恢复可操作。行不存在
+// （单例组未出现）时无需处理：BuildBwrapArgs 已按 IsolateKeyring 隐含处理。
+func (v *setupView) syncKeyringRows() {
+	if v.keyringRow == nil {
+		return
+	}
+	on := v.keyringRow.GetActive()
+	if v.dbusRow != nil {
+		if on {
+			v.dbusRow.SetActive(true)
+		}
+		v.dbusRow.SetSensitive(!on)
+	}
+	if v.runtimeRow != nil {
+		if on {
+			v.runtimeRow.SetActive(true)
+		}
+		v.runtimeRow.SetSensitive(!on)
+	}
+}
+
 func (v *setupView) buildProfile() core.Profile {
 	// 界面开关先落到"生效的非路径字段"上；字段搬运与合并规则只留一份
 	// （core.MergeNonPathFieldsWith），CLI 用同一份。GUI 再写一套的话，
@@ -982,6 +1058,11 @@ func (v *setupView) buildProfile() core.Profile {
 	}
 	if v.runtimeRow != nil {
 		eff.IsolateRuntime = v.runtimeRow.GetActive()
+	}
+	if v.keyringRow != nil {
+		// 显式状态：界面上看到的就是用户的选择，合并时它压过探测默认值。
+		eff.IsolateKeyring = v.keyringRow.GetActive()
+		eff.KeyringSet = true
 	}
 	// 落案只走 DeriveProfile（§8.1）：它负责 paths、credential_paths 的
 	// 派生/收窄与告警。GUI 自己调 ProfileFromCandidates 会漏掉凭据适配。

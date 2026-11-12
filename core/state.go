@@ -40,6 +40,9 @@ type Env struct {
 	// ProbeCapsOverride 覆盖读/写追踪预检（测试注入）。空值走真实 ProbeCaps；
 	// 单测不能依赖宿主是否装了 strace/bwrap，也不能每次等 5 秒超时。
 	ProbeCapsOverride *ProbeCaps
+	// KeyringCapsOverride 覆盖独立密钥环的能力结论（测试注入）。空值走
+	// KeyringCapability()：单测不能依赖宿主是否装了 gnome-keyring-daemon。
+	KeyringCapsOverride *KeyringCaps
 
 	// probeReaderLeaked 是进程级"读追踪采集线程没停下"标记（ADR-034 §5.2）。
 	// reader 仍持有 FIFO 读端时，再开一次探测会与旧 reader 抢同一份数据，
@@ -165,7 +168,7 @@ func (e *Env) BuildOptions() BuildOptions {
 	if e.Base != "" {
 		baseReal = Real(e.Base)
 	}
-	return BuildOptions{
+	o := BuildOptions{
 		Resolver:     e.Resolver,
 		RealHome:     e.Resolver.RealHome,
 		Home:         e.Resolver.Home,
@@ -175,7 +178,13 @@ func (e *Env) BuildOptions() BuildOptions {
 		RuntimeDir:   e.Resolver.XDG["RUNTIME_DIR"],
 		XDG:          e.Resolver.Vars(),
 		HostBusPaths: e.hostBusPaths(),
+		AuditRoot:    e.auditRoot(),
 	}
+	// keyring 目标是否可 bind 取决于当前文件系统：`~/.config/keyrings` 可能是
+	// 指向 `~/.local/share/keyrings` 的软链，bwrap 会拒绝在软链目标上挂载。
+	// 在这里解析一次（与 HostBusPaths 同理），BuildBwrapArgs 仍是纯函数。
+	o.KeyringTargets = resolveKeyringTargets(o.keyringTargets())
+	return o
 }
 
 // State 是全局写锁的持有者。作用域只覆盖"命名空间变更"

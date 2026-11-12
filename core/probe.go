@@ -68,6 +68,13 @@ type ProbeResult struct {
 	ReadsHidden    int      `json:"reads_hidden"`
 	ReadsWarns     []string `json:"reads_warns,omitempty"`
 	ReadTrace      string   `json:"read_trace"`
+	// KeyringEvidence 是 "" / linked / observed（方案 §6）。它只描述证据，
+	// 默认值由 KeyringDefault 与能力检查共同决定。
+	KeyringEvidence string `json:"keyring_evidence"`
+	// KeyringTraceDropped 是 sendmsg 证据扫描被单独上限截断后丢弃的行数。
+	// 非零表示"未观测到 keyring"可能是证据不全，而不是应用真的不用——
+	// 必须可诊断，否则探测结论会静默降级。
+	KeyringTraceDropped int `json:"keyring_trace_dropped,omitempty"`
 }
 
 const probeTimeoutDefault = 30 * time.Minute
@@ -109,6 +116,11 @@ func (e *Env) Probe(ctx context.Context, app string, opt ProbeOptions) (ProbeRes
 	}
 	if len(opt.Command) == 0 {
 		return ProbeResult{}, errInput("err.probe.no_command", map[string]any{"app": app})
+	}
+	// 审计写层根提前以 0700 建好：探测会话同样要 tmpfs 遮蔽它，且不能让
+	// bwrap 在宿主父目录里自建一个默认权限的挂载点。
+	if err := e.ensureAuditRoot(); err != nil {
+		return ProbeResult{}, err
 	}
 	mounter := opt.Mounter
 	if mounter == nil {
@@ -183,6 +195,26 @@ func warnProbeBus(opt ProbeOptions) {
 	}
 }
 
+// startProbeBus 起探测私有总线与临时 keyring，返回应用侧地址与合并的停止
+// 函数。总线失败 → 不存在的私有地址 + 告警（fail-closed，绝不继承宿主总线）；
+// keyring 失败只告警，探测继续（方案 §6）。
+func (e *Env) startProbeBus(work string, opt ProbeOptions) (string, func()) {
+	busDir := filepath.Join(work, "dbus")
+	sess, err := e.startSessionBus(busDir)
+	if err != nil || sess == nil {
+		warnProbeBus(opt)
+		return unavailableBusAddress(busDir), nil
+	}
+	kr := e.startProbeKeyring(sess.Addr(), opt)
+	stop := func() {
+		if kr != nil {
+			kr.Stop()
+		}
+		sess.Stop()
+	}
+	return sess.Addr(), stop
+}
+
 func (e *Env) probeStrace(ctx context.Context, app string, opt ProbeOptions, runner SessionRunner) (ProbeResult, error) {
 	if running, err := e.AppRunning(opt.Command[0]); err != nil {
 		return ProbeResult{}, err
@@ -222,18 +254,7 @@ func (e *Env) probeStrace(ctx context.Context, app string, opt ProbeOptions, run
 	if err := os.MkdirAll(traceDir, 0o700); err != nil {
 		return ProbeResult{}, errEnv("err.env.mkdir", map[string]any{"path": traceDir}, err)
 	}
-	busDir := filepath.Join(work, "dbus")
-	bus := ""
-	sess, berr := e.startSessionBus(busDir)
-	var stopBus func()
-	if berr == nil && sess != nil {
-		bus = sess.Addr()
-		stopBus = sess.Stop
-	} else {
-		// fail-closed：总线起不来时注入不存在的私有地址，绝不回落到宿主总线。
-		warnProbeBus(opt)
-		bus = unavailableBusAddress(busDir)
-	}
+	bus, stopBus := e.startProbeBus(work, opt)
 	if stopBus != nil {
 		// 用闭包而不是 defer stopBus()：重跑会换 work 并重启总线，
 		// defer 必须在返回时停**当前**那一个。
@@ -268,7 +289,8 @@ func (e *Env) probeStrace(ctx context.Context, app string, opt ProbeOptions, run
 	for round := 0; round < rounds; round++ {
 		inner, aerr := ProbeBwrapArgs(ProbeSpec{
 			Home:         e.Resolver.Home,
-			Base:         e.Base,
+			Base:         Real(e.Base), // 软链 Base 不能作为 bwrap 挂载目标
+			AuditRoot:    e.auditRoot(),
 			RuntimeDir:   runtimeDir,
 			RuntimeSock:  probeRuntimeSocks(e.Resolver.XDG["RUNTIME_DIR"], runtimeDir),
 			DBusAddress:  bus,
@@ -331,6 +353,7 @@ func (e *Env) probeStrace(ctx context.Context, app string, opt ProbeOptions, run
 		entries, trace.reads, trace.flagsHidden, e.Base, app)
 	cands = e.Resolver.AppendStaticCandidates(cands, opt.StaticPaths)
 
+	evidence := e.keyringEvidence(opt.Command[0], cands, trace.reads, trace.keyringHits)
 	probe := Profile{
 		App:       app,
 		Exec:      opt.Command[0],
@@ -338,27 +361,37 @@ func (e *Env) probeStrace(ctx context.Context, app string, opt ProbeOptions, run
 		Ignored:   DefaultIgnored(),
 		LockFiles: e.lockHostPaths(locks),
 	}
+	// 默认策略（方案 §6）：只有 observed 且能力可用才默认开启。KeyringSet
+	// 保持 false——这是"探测默认"，不是用户显式选择，合并时既有档案优先。
+	if on, _ := e.keyringDefault(evidence); on {
+		probe.IsolateKeyring = true
+	}
 	probe.Unsupported = append(probe.Unsupported, probeUnsupported(e)...)
 	sort.Slice(probe.Unsupported, func(i, j int) bool { return probe.Unsupported[i].Path < probe.Unsupported[j].Path })
 	p := e.Resolver.DeriveProfile(probe, nil, "strace", trace.readTrace(), cands)
 	p.Warnings = append(p.Warnings, credWarns...)
+	if _, warn := e.keyringDefault(evidence); warn != "" {
+		p.Warnings = append(p.Warnings, warn)
+	}
 	return ProbeResult{
-		Profile:        p,
-		Candidates:     cands,
-		Whiteouts:      whiteouts,
-		ExitCode:       last.ExitCode,
-		Writes:         writes,
-		HomeReads:      len(trace.reads),
-		HomeReadsNoise: trace.homeReadsNoise(),
-		Started:        last.Started,
-		ExecSeen:       trace.execSeen,
-		Activity:       activity,
-		ReadsDropped:   trace.stats.ReadsDropped,
-		ParseErrors:    trace.stats.ParseErrors,
-		SizeExceeded:   trace.stats.SizeExceeded,
-		ReadsHidden:    readsHidden,
-		ReadsWarns:     trace.warnsList(),
-		ReadTrace:      trace.readTrace(),
+		Profile:             p,
+		Candidates:          cands,
+		Whiteouts:           whiteouts,
+		ExitCode:            last.ExitCode,
+		Writes:              writes,
+		HomeReads:           len(trace.reads),
+		HomeReadsNoise:      trace.homeReadsNoise(),
+		Started:             last.Started,
+		ExecSeen:            trace.execSeen,
+		Activity:            activity,
+		ReadsDropped:        trace.stats.ReadsDropped,
+		ParseErrors:         trace.stats.ParseErrors,
+		SizeExceeded:        trace.stats.SizeExceeded,
+		ReadsHidden:         readsHidden,
+		ReadsWarns:          trace.warnsList(),
+		ReadTrace:           trace.readTrace(),
+		KeyringEvidence:     evidence,
+		KeyringTraceDropped: trace.keyringDropped,
 	}, nil
 }
 
@@ -512,17 +545,7 @@ func (e *Env) probeSession(ctx context.Context, app string, opt ProbeOptions, mo
 		}
 	}()
 
-	busDir := filepath.Join(work, "dbus")
-	bus := ""
-	sess2, berr2 := e.startSessionBus(busDir)
-	var stopBus func()
-	if berr2 == nil && sess2 != nil {
-		bus = sess2.Addr()
-		stopBus = sess2.Stop
-	} else {
-		warnProbeBus(opt)
-		bus = unavailableBusAddress(busDir)
-	}
+	bus, stopBus := e.startProbeBus(work, opt)
 	if stopBus != nil {
 		// 用闭包而不是 defer stopBus()：重跑会换 work 并重启总线，
 		// defer 必须在返回时停**当前**那一个。
@@ -579,7 +602,8 @@ func (e *Env) probeSession(ctx context.Context, app string, opt ProbeOptions, mo
 
 	spec := ProbeSpec{
 		Home:         e.Resolver.Home,
-		Base:         e.Base,
+		Base:         Real(e.Base), // 软链 Base 不能作为 bwrap 挂载目标
+		AuditRoot:    e.auditRoot(),
 		Merged:       merged,
 		RuntimeDir:   filepath.Join(work, "runtime"),
 		RuntimeSock:  probeRuntimeSocks(e.Resolver.XDG["RUNTIME_DIR"], filepath.Join(work, "runtime")),
@@ -704,15 +728,7 @@ func (e *Env) probeSession(ctx context.Context, app string, opt ProbeOptions, mo
 			return ProbeResult{}, err
 		}
 		removed = false
-		busDir = filepath.Join(work, "dbus")
-		bus, stopBus = "", nil
-		if s3, err3 := e.startSessionBus(busDir); err3 == nil && s3 != nil {
-			bus = s3.Addr()
-			stopBus = s3.Stop
-		} else {
-			warnProbeBus(opt)
-			bus = unavailableBusAddress(busDir)
-		}
+		bus, stopBus = e.startProbeBus(work, opt)
 		locks, lockCleanup, err = e.probeLockBinds(work, opt.LockFile)
 		if err != nil {
 			if _, terr := teardown(false); terr != nil {
@@ -734,7 +750,8 @@ func (e *Env) probeSession(ctx context.Context, app string, opt ProbeOptions, mo
 		isMounted = true
 		argv2, aerr := ProbeBwrapArgs(ProbeSpec{
 			Home:         e.Resolver.Home,
-			Base:         e.Base,
+			Base:         Real(e.Base), // 软链 Base 不能作为 bwrap 挂载目标
+			AuditRoot:    e.auditRoot(),
 			Merged:       merged,
 			RuntimeDir:   filepath.Join(work, "runtime"),
 			RuntimeSock:  probeRuntimeSocks(e.Resolver.XDG["RUNTIME_DIR"], filepath.Join(work, "runtime")),
@@ -865,6 +882,7 @@ func (e *Env) probeSession(ctx context.Context, app string, opt ProbeOptions, mo
 
 	// 非路径字段先装进 probe，再经 DeriveProfile 落成档案：Probe 不再直接
 	// 调 ProfileFromCandidates（§8.1 要求凭据派生与告警走同一条路径）。
+	evidence := e.keyringEvidence(opt.Command[0], cands, trace.reads, trace.keyringHits)
 	probe := Profile{
 		App:       app,
 		Exec:      opt.Command[0],
@@ -872,29 +890,39 @@ func (e *Env) probeSession(ctx context.Context, app string, opt ProbeOptions, mo
 		Ignored:   DefaultIgnored(),
 		LockFiles: e.lockHostPaths(locks),
 	}
+	// 默认策略（方案 §6）：observed 且能力可用才默认开启；KeyringSet=false
+	// 表示这是探测默认，合并时既有档案的显式选择优先。
+	if on, _ := e.keyringDefault(evidence); on {
+		probe.IsolateKeyring = true
+	}
 	probe.Unsupported = append(probe.Unsupported, probeUnsupported(e)...)
 	sort.Slice(probe.Unsupported, func(i, j int) bool { return probe.Unsupported[i].Path < probe.Unsupported[j].Path })
 	p := e.Resolver.DeriveProfile(probe, nil, "overlay", trace.readTrace(), cands)
 	p.Warnings = append(p.Warnings, credWarns...)
+	if _, warn := e.keyringDefault(evidence); warn != "" {
+		p.Warnings = append(p.Warnings, warn)
+	}
 
 	discard()
 	return ProbeResult{
-		Profile:        p,
-		Candidates:     cands,
-		Whiteouts:      whiteouts,
-		ExitCode:       res.ExitCode,
-		Writes:         writes,
-		HomeReads:      len(trace.reads),
-		HomeReadsNoise: trace.homeReadsNoise(),
-		Started:        res.Started,
-		ExecSeen:       trace.execSeen,
-		Activity:       activity,
-		ReadsDropped:   trace.stats.ReadsDropped,
-		ParseErrors:    trace.stats.ParseErrors,
-		SizeExceeded:   trace.stats.SizeExceeded,
-		ReadsHidden:    readsHidden,
-		ReadsWarns:     trace.warnsList(),
-		ReadTrace:      trace.readTrace(),
+		Profile:             p,
+		Candidates:          cands,
+		Whiteouts:           whiteouts,
+		ExitCode:            res.ExitCode,
+		Writes:              writes,
+		HomeReads:           len(trace.reads),
+		HomeReadsNoise:      trace.homeReadsNoise(),
+		Started:             res.Started,
+		ExecSeen:            trace.execSeen,
+		Activity:            activity,
+		ReadsDropped:        trace.stats.ReadsDropped,
+		ParseErrors:         trace.stats.ParseErrors,
+		SizeExceeded:        trace.stats.SizeExceeded,
+		ReadsHidden:         readsHidden,
+		ReadsWarns:          trace.warnsList(),
+		ReadTrace:           trace.readTrace(),
+		KeyringEvidence:     evidence,
+		KeyringTraceDropped: trace.keyringDropped,
 	}, nil
 }
 

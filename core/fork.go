@@ -99,6 +99,12 @@ func (e *Env) forkMounts(p Profile, in Instance, stop func() bool, warn func(str
 		if stop != nil && stop() {
 			break
 		}
+		// keyring 不参与克隆（ADR-035）：分身的密钥由自己的 keyring daemon
+		// 管理，把主实例的 keyring 文件复制/克隆进来等于让两个分身共用密钥。
+		// ValidateProfile 已经禁止 keyring 进 paths，这里是第二道防线。
+		if e.Resolver != nil && e.Resolver.isKeyring(abs) {
+			continue
+		}
 		if blocked, msg := credentialBlocksFork(abs, creds); blocked {
 			say(msg)
 			continue

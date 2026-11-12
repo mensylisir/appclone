@@ -30,6 +30,8 @@ type ProbeSpec struct {
 	// 防止沙箱内看到宿主 strace 的 FIFO/日志（ADR-034）。
 	TraceDir string
 	Command  []string // 应用命令（argv[0] 之后全部原样）
+	// AuditRoot 非空时在 Base 之后 tmpfs 遮蔽审计写层根（存在才由调用方填）。
+	AuditRoot string
 }
 
 // ProbeBwrapArgs 产出探测会话的完整 argv（纯函数，golden 断言）。
@@ -71,6 +73,12 @@ func ProbeBwrapArgs(s ProbeSpec) ([]string, error) {
 		"--dev-bind", "/dev", "/dev",
 		"--proc", "/proc",
 	)
+	if !s.NoOverlay {
+		argv = append(argv, "--bind", s.Merged, s.Home)
+		for _, pb := range s.PublicBinds {
+			argv = append(argv, "--bind", pb.Src, pb.Dst)
+		}
+	}
 	// 宿主会话总线遮蔽：探测期必须让应用只看到私有总线（起不来时看到的是
 	// 不存在的私有地址），否则 dbus-launch 放在 /tmp 的总线经 `--bind / /`
 	// 仍然可连，读证据/keyring 证据会被宿主会话污染。位置必须在
@@ -82,17 +90,15 @@ func ProbeBwrapArgs(s ProbeSpec) ([]string, error) {
 			argv = append(argv, "--bind", "/dev/null", pth)
 		}
 	}
-	if !s.NoOverlay {
-		argv = append(argv, "--bind", s.Merged, s.Home)
-		for _, pb := range s.PublicBinds {
-			argv = append(argv, "--bind", pb.Src, pb.Dst)
-		}
-	}
 	if s.Base != "" {
 		argv = append(argv, "--bind", s.Base, s.Base)
 		// 探测期不需要、也不该看见已有分身：把 instances/ 换成空 tmpfs，
 		// 否则"探测会写进主实例目录"这件事没法从参数层面排除。
 		argv = append(argv, "--tmpfs", filepath.Join(s.Base, "instances"))
+	}
+	// 审计写层根对探测会话同样不可见：里面是其他分身尚未 verify 的证据副本。
+	if s.AuditRoot != "" {
+		argv = append(argv, "--tmpfs", s.AuditRoot)
 	}
 	for _, sw := range s.SharedWrite {
 		argv = append(argv, "--bind-try", sw, sw)
@@ -305,8 +311,10 @@ func (e *Env) probeSharedWrites() []string {
 // 写出的都是这种形态，混用绝对路径会让同一目录在合并时变成两条。
 func probeUnsupported(e *Env) []Unsupported {
 	return []Unsupported{{
-		Kind:   "keyring",
-		Path:   e.Resolver.ToStoreForm(filepath.Join(e.Resolver.RealHome, ".local", "share", "keyrings")),
+		Kind: "keyring",
+		// 与 normalizeKeyring 共用同一个取数点：用户设置了 XDG_DATA_HOME 时，
+		// 写死 ~/.local/share/keyrings 会让同一份档案出现两条 keyring 条目。
+		Path:   e.keyringUnsupportedPath(),
 		Reason: "probe.why.keyring",
 	}}
 }

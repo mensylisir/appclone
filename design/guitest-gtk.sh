@@ -102,7 +102,7 @@ set +e
 # 180 秒的闸门静默跑成 30 分钟长稳。
 CGO_ENABLED=0 PATH="$WORK:$PATH" APPCLONE_GTK_TEST=1 \
   go test -tags gtk_e2e -count=1 -timeout 180s -v \
-  -run 'TestGtk|TestDetachedRunnerSpawn|TestDetachLogHelpers|TestDetachedTargetEnv|TestBuildProfileKeepsNonPathFieldsAndCredentials|TestReadsBannerPartsStates|TestMergeWarnKeys|TestRetryActionReaderStuck' \
+  -run 'TestGtk|TestDetachedRunnerSpawn|TestDetachLogHelpers|TestDetachedTargetEnv|TestBuildProfileKeepsNonPathFieldsAndCredentials|TestBuildProfileKeyringExplicitAndRowSync|TestSaveProfileLeavesNoKeyringState|TestReadsBannerPartsStates|TestMergeWarnKeys|TestRetryActionReaderStuck' \
   -skip '^TestGtkSoakRenderList$' ./cmd/appclone-gui \
   2>&1 | tee "$LOG"
 rc=${PIPESTATUS[0]}
@@ -122,6 +122,7 @@ for name in TestGtkScreensLifecycle TestGtkLandsOnClonesView TestGtkEmptyStateMa
             TestDetachedRunnerSpawn \
             TestDetachLogHelpers TestDetachedTargetEnv \
             TestBuildProfileKeepsNonPathFieldsAndCredentials \
+            TestBuildProfileKeyringExplicitAndRowSync TestSaveProfileLeavesNoKeyringState \
             TestReadsBannerPartsStates TestMergeWarnKeys \
             TestRetryActionReaderStuck \
             TestGtkRealInputUinput \

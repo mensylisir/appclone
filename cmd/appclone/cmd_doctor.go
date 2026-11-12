@@ -48,6 +48,8 @@ fuse 检查会在写层根建一个临时目录真挂一次 overlay，结束即�
 			var forkInstance bool
 			var readTrace string
 			var credPaths []string
+			var keyringRequired bool
+			var keyringHint bool
 			if len(args) >= 1 {
 				appKey := args[0]
 				id := "main"
@@ -64,7 +66,7 @@ fuse 检查会在写层根建一个临时目录真挂一次 overlay，结束即�
 				}
 				o := a.env.BuildOptions()
 				o.RuntimeSocks = core.FilterExisting(core.RuntimeSocketCandidates(a.env.Resolver.XDG["RUNTIME_DIR"]))
-				if p.IsolateDBus {
+				if p.IsolateDBus || p.IsolateKeyring {
 					// 宿主原文只用来触发 bus bind；真正写进沙箱的是应用侧
 					// 命名空间地址（AC_BASE 被 tmpfs 遮蔽后宿主路径不存在）。
 					o.DBusAddress = "unix:path=" + filepath.Join(in.Dir(), "dbus", "bus")
@@ -80,12 +82,28 @@ fuse 检查会在写层根建一个临时目录真挂一次 overlay，结束即�
 				data["credential_paths"] = p.CredentialPaths
 				readTrace, credPaths = p.ReadTrace, p.CredentialPaths
 				forkInstance = in.Fork
+				keyringRequired = p.IsolateKeyring
+				// 迁移提示（GUI 主入口也有同一句）：升级后私有总线不再激活
+				// 宿主 keyring，用到系统密钥环的应用需要显式开启独立密钥环。
+				keyringHint = p.IsolateDBus && !p.IsolateKeyring
+				// 目标校验与 add/run 同口径（只读）：doctor 打印的是"将要执行的
+				// 命令"，目标已存在却不是目录/软链指向别处时，那条命令注定失败。
+				if p.IsolateKeyring {
+					if kerr := a.env.CheckKeyringTargets(); kerr != nil {
+						checks = append(checks, check{
+							ID: "keyring-target", Status: "fail",
+							Detail: "独立密钥环目标不可用：" + kerr.Error() +
+								"（两个 keyring 目录必须不存在、是目录，或软链到同一目录；否则 add/run 会拒绝启动）",
+						})
+					}
+				}
 				if forkInstance {
 					// 脚本/JSON 消费者也要知道 command 是基线 argv。
 					data["fork"] = true
 				}
 			}
 
+			applyKeyringRequired(checks, keyringRequired)
 			a.ok(data, func() {
 				w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
 				for _, c := range checks {
@@ -106,6 +124,9 @@ fuse 检查会在写层根建一个临时目录真挂一次 overlay，结束即�
 						// 真正 run 时 paths 的 bind 源会换成 .fork/<hash>/merged
 						// （挂载点要到运行时才存在），这里只能给基线 argv。
 						fmt.Println("注：这是克隆起步分身的基线命令；真正运行前 paths 的源会被替换为 .fork/<hash>/merged 的 overlay 挂载点。")
+					}
+					if keyringHint {
+						fmt.Println("提示：该分身使用私有会话总线但未开启独立密钥环；升级后它不再使用宿主密钥环。用到系统密钥环的应用请开启独立密钥环（首次需重新登录）。")
 					}
 				}
 			})
@@ -278,9 +299,24 @@ func unverifiedWhy(reason string) string {
 // 该检查是 fail——那意味着**无法探测新应用**，--strict 应当红。只缺 fuse
 // 且 strace 在时是 warn，不触发退出码 3；"装了但挂载被拒"同样是 fail
 // （ADR-032：此时不会降级，用户必须修环境）。
+// applyKeyringRequired：档案要求独立密钥环时，能力不足必须判 fail。运行时
+// 对 keyring-only 是硬失败（err.env.keyring_requires_bus / no_keyring_daemon），
+// doctor 若只给 warn，--strict 会放过一个必定起不来的分身。
+func applyKeyringRequired(checks []check, keyringRequired bool) {
+	if !keyringRequired {
+		return
+	}
+	for i := range checks {
+		if checks[i].ID == "keyring" && checks[i].Status != "ok" {
+			checks[i].Status = "fail"
+			checks[i].Detail += "（当前档案 isolate_keyring=true，--strict 将失败）"
+		}
+	}
+}
+
 func required(id string) bool {
 	switch id {
-	case "bwrap", "userns", "apparmor", "state-dir", "fuse":
+	case "bwrap", "userns", "apparmor", "state-dir", "fuse", "keyring":
 		return true
 	}
 	return false
@@ -317,6 +353,16 @@ func runChecks(a *app) []check {
 		add("bwrap", "ok", v+"（"+p+"）")
 	} else {
 		add("bwrap", "fail", "未安装 bubblewrap，分身功能不可用")
+	}
+
+	caps := a.env.KeyringCapability()
+	switch {
+	case caps.Available:
+		add("keyring", "ok", "独立密钥环可用（"+caps.Daemon+"）")
+	case caps.Daemon == "":
+		add("keyring", "warn", "未安装 gnome-keyring-daemon：无法为分身提供独立密钥环（用到系统密钥环的应用需改用其它登录方式）")
+	default:
+		add("keyring", "warn", "缺少 dbus-send：无法确认独立密钥环是否就绪")
 	}
 
 	maxNS := strings.TrimSpace(readFile("/proc/sys/user/max_user_namespaces"))

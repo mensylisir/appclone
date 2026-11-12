@@ -54,6 +54,7 @@ func newTraceReader(dir, home string, onStuck func()) (*traceReader, error) {
 		readSeen: map[string]bool{}, writeSeen: map[string]bool{},
 		stop: make(chan struct{}), done: make(chan struct{}),
 	}
+	r.res.keyringSeen = map[string]bool{}
 	go r.loop()
 	return r, nil
 }
@@ -117,12 +118,23 @@ func (r *traceReader) consume(line string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.entries >= traceReadLimit {
-		// 已到上限：继续解析但丢弃结果，保证 FIFO 被排空、strace 不阻塞。
-		var sink StraceResult
+		// 已到上限：继续解析但丢弃路径结果，保证 FIFO 被排空、strace 不阻塞。
+		// sendmsg 证据与计数是**采集级**状态，必须带回 r.res：它们是上限之外
+		// 的独立口径，不能每行重置（方案 §6 D3）。
+		sink := StraceResult{
+			keyringSeen:         r.res.keyringSeen,
+			keyringScanned:      r.res.keyringScanned,
+			KeyringHits:         r.res.KeyringHits,
+			KeyringTraceDropped: r.res.KeyringTraceDropped,
+		}
 		parseStraceLineInto(line, r.home, &sink, map[string]bool{}, map[string]bool{})
 		if len(sink.Reads)+len(sink.Writes) > 0 {
 			r.sizeHit = true
 		}
+		r.res.keyringSeen = sink.keyringSeen
+		r.res.keyringScanned = sink.keyringScanned
+		r.res.KeyringHits = sink.KeyringHits
+		r.res.KeyringTraceDropped = sink.KeyringTraceDropped
 		return
 	}
 	before := len(r.res.Reads) + len(r.res.Writes)
@@ -164,6 +176,8 @@ func (r *traceReader) snapshot() StraceResult {
 		Stats:       r.res.Stats,
 	}
 	out.ExecSeen = r.res.ExecSeen
+	out.KeyringHits = append([]string{}, r.res.KeyringHits...)
+	out.KeyringTraceDropped = r.res.KeyringTraceDropped
 	sort.Strings(out.Reads)
 	out.Stats.SizeExceeded = r.sizeHit
 	return out

@@ -29,17 +29,23 @@ type Profile struct {
 	// App 不落盘：档案文件名就是应用 key 的权威来源。它只用来让
 	// LoadProfile/SaveProfile 的方法签名保持一元（否则每个调用点都要
 	// 自己把 app 传两遍，传错一次就写错文件）。
-	App             string `toml:"-"`
-	Version         int
-	Exec            string
-	ExecArgs        []string
-	Paths           []string
-	SharedWrites    []string
-	LockFiles       []string
-	Sockets         []string
-	ExtraBinds      []BindPair
-	IsolateDBus     bool
-	IsolateRuntime  bool
+	App            string `toml:"-"`
+	Version        int
+	Exec           string
+	ExecArgs       []string
+	Paths          []string
+	SharedWrites   []string
+	LockFiles      []string
+	Sockets        []string
+	ExtraBinds     []BindPair
+	IsolateDBus    bool
+	IsolateRuntime bool
+	// IsolateKeyring 开启后该分身使用自己的 keyring daemon（ADR-035）。
+	// 与 IsolateDBus 是两个开关：keyring 依赖私有总线，但反过来不成立。
+	IsolateKeyring bool
+	// KeyringSet 记录档案里**是否显式写过** isolate_keyring（不落盘）。
+	// 没写过时探测/模板的默认值生效；写过时以显式值为准（§5.5 优先级）。
+	KeyringSet      bool `toml:"-"`
 	Env             map[string]string
 	Cwd             string
 	ProbeMethod     string // overlay | strace | manual
@@ -92,16 +98,19 @@ func (in Instance) Dir() string { return filepath.Dir(in.Root) }
 // profileWire 是落盘形状。它与 Profile 分开的理由：ExtraBinds 在 TOML 里是
 // "源|目标" 字符串，而内存里是结构体；混用会让 Load/Save 各自做一次转换。
 type profileWire struct {
-	Version         int               `toml:"version"`
-	Exec            string            `toml:"exec"`
-	ExecArgs        []string          `toml:"exec_args,omitempty"`
-	Paths           []string          `toml:"paths"`
-	SharedWrites    []string          `toml:"shared_writes,omitempty"`
-	LockFiles       []string          `toml:"lock_files,omitempty"`
-	Sockets         []string          `toml:"sockets,omitempty"`
-	ExtraBinds      []string          `toml:"extra_binds,omitempty"`
-	IsolateDBus     bool              `toml:"isolate_dbus,omitempty"`
-	IsolateRuntime  bool              `toml:"isolate_runtime,omitempty"`
+	Version        int      `toml:"version"`
+	Exec           string   `toml:"exec"`
+	ExecArgs       []string `toml:"exec_args,omitempty"`
+	Paths          []string `toml:"paths"`
+	SharedWrites   []string `toml:"shared_writes,omitempty"`
+	LockFiles      []string `toml:"lock_files,omitempty"`
+	Sockets        []string `toml:"sockets,omitempty"`
+	ExtraBinds     []string `toml:"extra_binds,omitempty"`
+	IsolateDBus    bool     `toml:"isolate_dbus,omitempty"`
+	IsolateRuntime bool     `toml:"isolate_runtime,omitempty"`
+	// IsolateKeyring 用指针区分"没写"与"写了 false"：前者走探测默认，
+	// 后者是用户显式关闭（§5.5）。用 bool + omitempty 会把显式 false 丢掉。
+	IsolateKeyring  *bool             `toml:"isolate_keyring,omitempty"`
 	Env             map[string]string `toml:"env,omitempty"`
 	Cwd             string            `toml:"cwd,omitempty"`
 	ProbeMethod     string            `toml:"probe_method,omitempty"`
@@ -139,7 +148,8 @@ type instanceWire struct {
 var knownProfileKeys = map[string]bool{
 	"version": true, "exec": true, "exec_args": true, "paths": true,
 	"shared_writes": true, "lock_files": true, "sockets": true, "extra_binds": true,
-	"isolate_dbus": true, "isolate_runtime": true, "env": true, "cwd": true,
+	"isolate_dbus": true, "isolate_runtime": true, "isolate_keyring": true,
+	"env": true, "cwd": true,
 	"probe_method": true, "read_trace": true, "credential_paths": true,
 	"audit": true, "unsupported": true, "ignored": true,
 }
@@ -158,7 +168,8 @@ func decodeKnown(md toml.MetaData, prims map[string]toml.Primitive, w *profileWi
 		"paths": &w.Paths, "shared_writes": &w.SharedWrites, "lock_files": &w.LockFiles,
 		"sockets": &w.Sockets, "extra_binds": &w.ExtraBinds,
 		"isolate_dbus": &w.IsolateDBus, "isolate_runtime": &w.IsolateRuntime,
-		"env": &w.Env, "cwd": &w.Cwd, "probe_method": &w.ProbeMethod,
+		"isolate_keyring": &w.IsolateKeyring,
+		"env":             &w.Env, "cwd": &w.Cwd, "probe_method": &w.ProbeMethod,
 		"read_trace": &w.ReadTrace, "credential_paths": &w.CredentialPaths,
 		"audit": &w.Audit, "unsupported": &w.Unsupported, "ignored": &w.Ignored,
 	} {
@@ -207,6 +218,9 @@ func (e *Env) LoadProfile(app string) (Profile, error) {
 	if err != nil {
 		return p, err
 	}
+	// unsupported 的 keyring 条目必须与 isolate_keyring 一致，否则 GUI/doctor
+	// 会一边说"已隔离"、一边说"隔离不了"。
+	e.normalizeKeyring(&p)
 	// 轻量校验：手改档案把 credential_paths 写到 paths 之外时，加载即拒绝，
 	// 不让 fork 拿着一条"看起来像凭据、实际不在隔离范围"的路径去跳过克隆。
 	if err := ValidateCredentialPaths(p, e.BuildOptions()); err != nil {
@@ -251,6 +265,7 @@ func parseProfile(app, path string, data []byte) (Profile, error) {
 		Sockets:         w.Sockets,
 		IsolateDBus:     w.IsolateDBus,
 		IsolateRuntime:  w.IsolateRuntime,
+		KeyringSet:      w.IsolateKeyring != nil,
 		Env:             w.Env,
 		Cwd:             w.Cwd,
 		ProbeMethod:     w.ProbeMethod,
@@ -263,6 +278,10 @@ func parseProfile(app, path string, data []byte) (Profile, error) {
 	// 后者才走默认忽略表。指针保留这个区别，不能折叠成同一个 nil。
 	if w.Ignored != nil {
 		p.Ignored = *w.Ignored
+	}
+	// isolate_keyring 同理：没写 ≠ 写 false。
+	if w.IsolateKeyring != nil {
+		p.IsolateKeyring = *w.IsolateKeyring
 	}
 	for _, u := range w.Unsupported {
 		p.Unsupported = append(p.Unsupported, Unsupported(u))
@@ -288,6 +307,7 @@ func (e *Env) SaveProfile(p Profile) error {
 	if p.Version == 0 {
 		p.Version = ProfileVersion
 	}
+	e.normalizeKeyring(&p)
 	w := profileWire{
 		Version:         p.Version,
 		Exec:            p.Exec,
@@ -298,6 +318,7 @@ func (e *Env) SaveProfile(p Profile) error {
 		Sockets:         p.Sockets,
 		IsolateDBus:     p.IsolateDBus,
 		IsolateRuntime:  p.IsolateRuntime,
+		IsolateKeyring:  keyringWire(p),
 		Env:             p.Env,
 		Cwd:             p.Cwd,
 		ProbeMethod:     p.ProbeMethod,
@@ -333,9 +354,61 @@ func ignoredWire(v []string) *[]string {
 	return &v
 }
 
+// keyringWire 把内存值带进落盘形状。只有显式设置过（KeyringSet）或值为真时
+// 才写键：否则旧档案经一次改名保存就被重写成显式 `isolate_keyring = false`，
+// 把"没声明、跟默认走"静默变成"用户关掉了"。
+func keyringWire(p Profile) *bool {
+	if !p.KeyringSet && !p.IsolateKeyring {
+		return nil
+	}
+	v := p.IsolateKeyring
+	return &v
+}
+
+// keyringUnsupportedPath 是 unsupported 里 keyring 条目的规范路径（store 形态）。
+// probeUnsupported 直接调用本函数，保证探测产物与加载归一化用同一条路径；
+// 两处各写一份（`~/.local/share` vs `XDG_DATA_HOME`）会让同一份档案出现两个
+// keyring 条目。
+func (e *Env) keyringUnsupportedPath() string {
+	return e.Resolver.ToStoreForm(filepath.Join(e.Resolver.XDG["DATA_HOME"], "keyrings"))
+}
+
+// normalizeKeyring 让 unsupported 里的 keyring 条目与 IsolateKeyring 保持一致：
+// 开启时移除（keyring 已被独立 daemon 隔离，不再是"隔离不了"的项）；关闭时
+// 确保存在且只有一条规范条目。加载与落盘都走这里，否则手改档案或旧版本写出的
+// 条目会在两个视图里给出相反结论。
+func (e *Env) normalizeKeyring(p *Profile) {
+	if e.Resolver == nil {
+		return
+	}
+	canon := e.keyringUnsupportedPath()
+	seen := false
+	out := make([]Unsupported, 0, len(p.Unsupported)+1)
+	for _, u := range p.Unsupported {
+		if u.Kind != "keyring" {
+			out = append(out, u)
+			continue
+		}
+		if p.IsolateKeyring || seen {
+			continue
+		}
+		seen = true
+		u.Path = canon
+		if u.Reason == "" {
+			u.Reason = "probe.why.keyring"
+		}
+		out = append(out, u)
+	}
+	if !p.IsolateKeyring && !seen {
+		out = append(out, Unsupported{Kind: "keyring", Path: canon, Reason: "probe.why.keyring"})
+	}
+	p.Unsupported = out
+}
+
 // encodeProfile 是 CreateInstance 事务的前半段：它要拿到字节写进临时文件，
 // 由提交点的 rename 决定是否真的落盘，所以不能直接调 SaveProfile。
-func encodeProfile(p Profile) ([]byte, error) {
+func (e *Env) encodeProfile(p Profile) ([]byte, error) {
+	e.normalizeKeyring(&p)
 	w := profileWire{
 		Version:         p.Version,
 		Exec:            p.Exec,
@@ -346,6 +419,7 @@ func encodeProfile(p Profile) ([]byte, error) {
 		Sockets:         p.Sockets,
 		IsolateDBus:     p.IsolateDBus,
 		IsolateRuntime:  p.IsolateRuntime,
+		IsolateKeyring:  keyringWire(p),
 		Env:             p.Env,
 		Cwd:             p.Cwd,
 		ProbeMethod:     p.ProbeMethod,

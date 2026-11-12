@@ -218,7 +218,7 @@ func (d detailData) sig() string {
 	for _, a := range d.audits {
 		fmt.Fprintf(&b, "%s|%s|%s;", a.conclusion, a.reason, a.at)
 	}
-	fmt.Fprintf(&b, "|p:%d|r:%t|d:%t", len(d.profile.Paths), d.profile.IsolateRuntime, d.profile.IsolateDBus)
+	fmt.Fprintf(&b, "|p:%d|r:%t|d:%t|k:%t", len(d.profile.Paths), d.profile.IsolateRuntime, d.profile.IsolateDBus, d.profile.IsolateKeyring)
 	// 读证据/凭据/告警可能在详情页打开期间被 CLI 重新探测改掉，路径条数
 	// 不变时也必须触发重建，否则页面会一直显示旧结论。
 	fmt.Fprintf(&b, "|rt:%s|cp:%s|w:%s", d.profile.ReadTrace,
@@ -264,6 +264,20 @@ func (v *detailView) buildBroken(msg string) {
 }
 
 // prefix 给只读行加一个 16px 符号图标，让密集的档案信息有视觉锚点。
+// keyringRowState 是详情页"独立密钥环"行的 i18n 键。关闭态要分两种：
+// 私有总线没有 servicedir，宿主 Secret Service 不会被激活（ADR-035 ②），
+// 此时说"与主实例共用宿主密钥环"与升级迁移提示自相矛盾。
+func keyringRowState(p core.Profile) string {
+	switch {
+	case p.IsolateKeyring:
+		return "ui.detail.keyring.on"
+	case p.IsolateDBus:
+		return "ui.detail.keyring.off_bus"
+	default:
+		return "ui.detail.keyring.off"
+	}
+}
+
 func (v *detailView) prefix(row *adw.ActionRow, icon string) {
 	ic := v.u.symbolicIcon(icon)
 	v.scope.own(&ic.Widget)
@@ -479,6 +493,14 @@ func (v *detailView) build() {
 		pg.Add(&cr.Widget)
 	}
 
+	kr := adw.NewActionRow()
+	v.scope.own(&kr.Widget)
+	kr.SetTitle(v.u.tr("ui.detail.keyring", nil))
+	kr.SetSubtitle(v.u.tr(keyringRowState(p), nil))
+	v.prefix(kr, "dialog-password-symbolic")
+	kr.SetSensitive(false)
+	pg.Add(&kr.Widget)
+
 	if len(p.Warnings) > 0 {
 		wr := adw.NewActionRow()
 		v.scope.own(&wr.Widget)
@@ -518,12 +540,15 @@ func (v *detailView) build() {
 	if len(p.LockFiles) > 0 {
 		parts = append(parts, v.u.tr("ui.detail.single.lock", nil))
 	}
-	if p.IsolateRuntime {
+	// isolate_keyring 隐含私有总线与私有 runtime（ADR-035）：摘要必须用与
+	// run 相同的派生判据，否则探测默认只写 IsolateKeyring 时，界面会显示
+	// "runtime 共享 · DBus 共享"，与 setup 页点亮的行和实际行为相反。
+	if p.IsolateRuntime || p.IsolateKeyring {
 		parts = append(parts, v.u.tr("ui.detail.single.runtime_private", nil))
 	} else {
 		parts = append(parts, v.u.tr("ui.detail.single.runtime_shared", nil))
 	}
-	if p.IsolateDBus {
+	if p.IsolateDBus || p.IsolateKeyring {
 		parts = append(parts, v.u.tr("ui.detail.single.dbus_private", nil))
 	} else {
 		parts = append(parts, v.u.tr("ui.detail.single.dbus_shared", nil))

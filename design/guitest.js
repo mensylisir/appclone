@@ -1,6 +1,7 @@
-// 交互回归（68 项）：三屏 + 探测四态（probing/confirm/creating/error）+ 五入口 + 三处破坏性确认
+// 交互回归（74 项）：三屏 + 探测四态（probing/confirm/creating/error）+ 五入口 + 三处破坏性确认
 //                    + 门禁 + 搜索 + 横幅语义 + 空态可达性 + 运行/停止状态
 //                    + 读证据四态/锁定缓存行/credential 徽标/confirm-empty
+//                    + 登录状态（独立密钥环）：默认策略/隐含锁定/能力缺失/迁移提示
 // 运行：node design/guitest.js        （退出码 0 = EXPECTED 全过，非 0 = 设计基线被破坏）
 // 依赖：任一本机 Chromium + puppeteer-core；路径可用环境变量覆盖：
 //   CHROMIUM=/path/to/chromium  PUPPETEER_CORE=/path/to/puppeteer-core
@@ -8,7 +9,7 @@ const path = require('path');
 const fs = require('fs');
 const { pathToFileURL } = require('url');
 
-const EXPECTED = 68;   // 断言总数；改动断言必须同步改这里（否则退出码永远是 1）
+const EXPECTED = 74;   // 断言总数；改动断言必须同步改这里（否则退出码永远是 1）
 
 function loadPuppeteer() {
   const cands = [
@@ -173,10 +174,11 @@ const pp = loadPuppeteer();
      但也不能写"命中 N 次"——overlay 拿不到次数 */
   await t('确认页每个候选显示「N 个写入条目」', async () => {
     return ev(() => {
-      /* 「单例处理」那行也是 .chkrow，但它不是观测出来的路径，不该有写入条目数 */
+      /* 「单例处理」「登录状态」两行也是 .chkrow，但它们不是观测出来的路径，
+         不该有写入条目数 */
       const rows = [...document.querySelectorAll('.chkrow')].filter(r => {
         const inp = r.querySelector('[data-chk]');
-        return inp && inp.dataset.kind !== 'singleton';
+        return inp && inp.dataset.kind !== 'singleton' && inp.dataset.kind !== 'keyring';
       });
       return rows.length > 0 && rows.every(r => /(\d+ 个写入条目|\d+ 条读取路径|\d+ 个写入条目 · \d+ 条读取路径)/.test(r.textContent))
         && !document.querySelector('#dlgBody').textContent.includes('命中');
@@ -211,6 +213,36 @@ const pp = loadPuppeteer();
         && txt.includes('输入法')
         && !chkPaths.includes('recently-used.xbel');   // 只读：不在可勾列表里
     }); });
+  /* 登录状态（ADR-035）：观测到使用系统密钥环 → 默认开。开启即隐含私有总线与
+     runtime，单例行同步点亮并锁住，界面状态与 bwrap 实际行为一致 */
+  await t('登录状态组始终出现：观测到使用 → 默认开启并锁住单例行', async () => {
+    return ev(() => {
+      const g = document.querySelector('[data-group="keyring"]');
+      const kr = document.querySelector('[data-chk][data-kind="keyring"]');
+      const sg = [...document.querySelectorAll('[data-chk][data-kind="singleton"]')];
+      return !!g && !!kr && kr.checked
+        && sg.length > 0 && sg.every(c => c.checked && c.disabled)
+        && g.textContent.includes('已检测到该应用使用系统密钥环')
+        && !document.querySelector('#dlgConfirm').disabled;
+    }) || '登录状态组缺失、默认没开、或单例行没被锁住';
+  });
+  await t('关闭独立密钥环 → 单例行恢复可操作，门禁不受影响', async () => {
+    return ev(() => {
+      const kr = document.querySelector('[data-chk][data-kind="keyring"]');
+      kr.click();
+      const sg = [...document.querySelectorAll('[data-chk][data-kind="singleton"]')];
+      return !kr.checked && sg.every(c => !c.disabled)
+        && !document.querySelector('#dlgConfirm').disabled;
+    }) || '关闭后单例行仍被锁，或确认按钮被误禁用';
+  });
+  await t('重新开启独立密钥环 → 恢复锁定', async () => {
+    return ev(() => {
+      const kr = document.querySelector('[data-chk][data-kind="keyring"]');
+      kr.click();
+      const sg = [...document.querySelectorAll('[data-chk][data-kind="singleton"]')];
+      return kr.checked && sg.every(c => c.checked && c.disabled);
+    }) || '重新开启后没有恢复锁定';
+  });
   await t('全部取消勾选 → 确认禁用', async () => {
     return ev(() => {
       document.querySelectorAll('[data-chk]').forEach(c => { if (c.checked) c.click(); });
@@ -371,6 +403,22 @@ const pp = loadPuppeteer();
     const rebound = await ev(() => { const s = document.querySelector('[data-sw="firefox"]');
       return !s.checked && s.closest('.row').querySelector('[data-sub]').textContent.includes('未开启 · 已有隔离档案'); });
     return cleared && live && rebound; });
+  /* 只有 ELF 链接线索（没观测到实际调用）不足以替用户做决定：默认关，但组必须
+     出现——没有单例组的应用也要能手动开启（这是用户唯一的入口） */
+  await t('仅链接线索 → 默认关、无单例应用也有登录状态组', async () => {
+    await click('[data-sw="firefox"]');
+    const live = await ev(() => document.querySelector('#overlay').classList.contains('open'));
+    if (!live) return 'firefox 没有进入确认态';
+    const ok = await ev(() => {
+      const kr = document.querySelector('[data-chk][data-kind="keyring"]');
+      const g = document.querySelector('[data-group="keyring"]');
+      return !!kr && !kr.checked && !kr.disabled
+        && g.textContent.includes('可能使用系统密钥环')
+        && !document.querySelector('[data-chk][data-kind="singleton"]');
+    });
+    await click('#dlgCancel');
+    return ok || '链接线索被当成证据默认开启，或没有单例组时该组消失了';
+  });
   await t('降级横幅 → 可"了解"关闭，且不影响开关', async () => { await click('#btnSoftBanner');
     const shown = await ev(() => document.querySelector('#bannerSoft').classList.contains('show')
       && !document.body.classList.contains('blocked'));
@@ -648,6 +696,21 @@ const pp = loadPuppeteer();
     return (banner && disabled && publicStillDisabled && enabled) || 'banner/门禁状态不对';
   });
 
+  /* 没有 gnome-keyring-daemon / dbus-send 时不能给一个"拨了也不生效"的开关：
+     禁用并写清原因；已经开着时仍允许关闭（由 GTK 侧断言） */
+  await t('能力缺失 → 登录状态行禁用并说明原因', async () => {
+    await showView('all');
+    await click('[data-sw="zcode"]');
+    const arrived = await waitFor(() => !!document.querySelector('[data-chk][data-kind="keyring"]'), 5000);
+    if (!arrived) return '没进入确认态';
+    const ok = await ev(() => {
+      const kr = document.querySelector('[data-chk][data-kind="keyring"]');
+      return kr.disabled && !kr.checked
+        && document.querySelector('[data-group="keyring"]').textContent.includes('未找到 gnome-keyring-daemon');
+    });
+    await click('#dlgCancel');
+    return ok || '能力缺失时开关仍可拨，或没有说明原因';
+  });
   await t('旧档案（read_trace=""）→ 提示重新探测可获取读证据', async () => {
     await click('[data-sw="notion"]');
     const arrived = await waitFor(() => !!document.querySelector('[data-banner="reads-legacy"]'));
@@ -657,6 +720,19 @@ const pp = loadPuppeteer();
     });
     await click('#dlgCancel');
     return ok || '旧档案没有独立文案';
+  });
+
+  /* 升级后私有总线不再激活宿主 keyring：只有"已开私有总线、未开独立密钥环"的
+     旧档案会看到这句；没有它就等于让用户自己去发现登录态没跟上 */
+  await t('旧档案（私有总线 + 未开密钥环）→ 迁移提示可见', async () => {
+    await showView('all');
+    await click('[data-sw="notion"]');
+    const arrived = await waitFor(() => !!document.querySelector('[data-group="keyring"]'), 4000);
+    if (!arrived) return '没进入确认态';
+    const ok = await ev(() => document.querySelector('[data-group="keyring"]')
+      .textContent.includes('升级后该分身不再使用宿主密钥环'));
+    await click('#dlgCancel');
+    return ok || '旧档案没有迁移提示';
   });
 
   console.log(`\n结果: ${pass} 通过 / ${fail} 失败`);

@@ -41,6 +41,13 @@ func (e *Env) CreateInstanceWith(ctx context.Context, app string, p Profile, id 
 	if err := ValidateProfile(p, e.BuildOptions()); err != nil {
 		return Instance{}, err
 	}
+	// 独立密钥环是创建时就要兑现的承诺：能力缺失时直接失败，而不是建出
+	// 一个每次 run 都报错的实例（方案 §6 的默认策略与 §5.1 一致）。
+	if p.IsolateKeyring {
+		if err := e.checkKeyringCapability(); err != nil {
+			return Instance{}, err
+		}
+	}
 	if err := ValidateCreatable(p); err != nil {
 		return Instance{}, err
 	}
@@ -80,7 +87,7 @@ func (e *Env) CreateInstanceWith(ctx context.Context, app string, p Profile, id 
 	}
 
 	// 2. 档案写到临时文件，先不 rename（提交点是两个 rename，各原子）。
-	profBytes, err := encodeProfile(p)
+	profBytes, err := e.encodeProfile(p)
 	if err != nil {
 		return Instance{}, err
 	}
@@ -297,7 +304,204 @@ func (e *Env) prepareBindTargets(p Profile, in Instance) (created []string, err 
 			created = append(created, abs)
 		}
 	}
+	if p.IsolateKeyring {
+		made, kerr := e.prepareKeyringTargets(in)
+		created = append(created, made...)
+		if kerr != nil {
+			return fail(kerr)
+		}
+	}
 	return created, nil
+}
+
+// prepareKeyringTargets 准备沙箱内两个 keyring bind 目标（方案 §4.3）。
+//   - 目标不存在 → 建 0700 空目录（源由 EnsureKeyring 建）；
+//   - 目标是普通文件 → 报错；
+//   - 目标是软链：解析后等于另一个 keyring 目标就跳过（`~/.config/keyrings`
+//     -> `~/.local/share/keyrings` 是常见布局，另一个 bind 已覆盖同一目录）；
+//     解析到别处 → 报可操作错误，不静默跟随；
+//   - 源是软链 → 报错（应由我们创建为实目录）。
+func (e *Env) prepareKeyringTargets(in Instance) ([]string, error) {
+	src := keyringDataDir(in)
+	var created []string
+	// 源目录属于实例数据（keyring.pw 与 keyring 文件在 run 时由 EnsureKeyring
+	// 写入）；建实例时只把它建出来，不预造密码——保存/创建阶段替用户造状态，
+	// 取消后会留下半截实例数据。
+	if fi, err := os.Lstat(src); err != nil {
+		if !os.IsNotExist(err) {
+			return created, errEnv("err.env.mkdir", map[string]any{"path": src}, err)
+		}
+		made, merr := mkdirAllTracked(src, 0o700)
+		created = append(created, made...)
+		if merr != nil {
+			return created, errEnv("err.env.mkdir", map[string]any{"path": src}, merr)
+		}
+	} else if fi.Mode()&os.ModeSymlink != 0 || !fi.IsDir() {
+		return created, errInput("err.profile.keyring_target", map[string]any{"path": src})
+	}
+	targets := e.BuildOptions().keyringTargets()
+	for _, tgt := range targets {
+		fi, err := os.Lstat(tgt)
+		if err == nil {
+			if fi.Mode()&os.ModeSymlink != 0 {
+				// 用 keyringTargetReal：双侧软链可能指向**尚未创建**的 vault
+				// 目录（两个 keyring 目标都 -> ~/vault/keyrings），
+				// EvalSymlinks/Real 会因末级不存在而解析不出目标。
+				real := keyringTargetReal(tgt)
+				// 解析后的真实目录同样不能落在 Base 下：悬空软链的词法目标
+				// 可能绕过 ValidateProfile 对原始目标的检查，add 会在 Base 里
+				// 建目录、run 才报错。这里按解析结果再查一次。
+				if berr := checkBaseExposure(real, e.BuildOptions(), "isolate_keyring"); berr != nil {
+					return created, berr
+				}
+				// 去重后只剩一个目标时没有"兄弟"可比：软链是该 keyring 目录的
+				// 唯一入口，bind 解析后的真实目录即可（与双侧软链的兜底一致）。
+				if keyringTargetCoveredBySibling(targets, tgt, real) ||
+					siblingKeyringTarget(targets, tgt) == "" {
+					// 被覆盖的真实目录也可能还不存在：由我们建出来（与建普通
+					// 目标同一语义），回滚清单同样记录。
+					if rfi, rerr := os.Lstat(real); os.IsNotExist(rerr) {
+						made, merr := mkdirAllTracked(real, 0o700)
+						created = append(created, made...)
+						if merr != nil {
+							return created, errEnv("err.env.mkdir", map[string]any{"path": real}, merr)
+						}
+					} else if rerr != nil || !rfi.IsDir() {
+						return created, errInput("err.profile.keyring_target", map[string]any{"path": tgt})
+					}
+					continue // 另一个目标已经覆盖同一目录
+				}
+				return created, errInput("err.profile.keyring_target", map[string]any{"path": tgt})
+			}
+			if !fi.IsDir() {
+				return created, errInput("err.profile.keyring_target", map[string]any{"path": tgt})
+			}
+			continue
+		}
+		if !os.IsNotExist(err) {
+			return created, errInput("err.profile.keyring_target", map[string]any{"path": tgt})
+		}
+		made, merr := mkdirAllTracked(tgt, 0o700)
+		created = append(created, made...)
+		if merr != nil {
+			return created, errEnv("err.env.mkdir", map[string]any{"path": tgt}, merr)
+		}
+	}
+	return created, nil
+}
+
+// CheckKeyringTargets 只读校验两个 keyring bind 目标，给 doctor 这类排障
+// 视图用：不建目录、不改状态，结论与 prepareKeyringTargets 一致。目标不存在
+// 是正常情况（首次 run 才创建），存在但不是目录、软链解析后落在 Base 下、
+// 或解析到没有兄弟目标覆盖的位置都报输入错误。
+func (e *Env) CheckKeyringTargets() error {
+	o := e.BuildOptions()
+	targets := o.keyringTargets()
+	for _, tgt := range targets {
+		fi, err := os.Lstat(tgt)
+		if err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			return errInput("err.profile.keyring_target", map[string]any{"path": tgt})
+		}
+		if fi.Mode()&os.ModeSymlink != 0 {
+			real := keyringTargetReal(tgt)
+			if berr := checkBaseExposure(real, o, "isolate_keyring"); berr != nil {
+				return berr
+			}
+			if keyringTargetCoveredBySibling(targets, tgt, real) || siblingKeyringTarget(targets, tgt) == "" {
+				continue
+			}
+			return errInput("err.profile.keyring_target", map[string]any{"path": tgt})
+		}
+		if !fi.IsDir() {
+			return errInput("err.profile.keyring_target", map[string]any{"path": tgt})
+		}
+	}
+	return nil
+}
+
+// keyringTargetReal 解析 keyring 目标的真实路径，**允许末级不存在**：
+// `~/.config/keyrings -> ~/vault/keyrings` 在首次运行前指向一个还不存在的
+// 目录，EvalSymlinks（以及 Real 的祖先回退）会停在软链本身，导致两个目标
+// 被当成不同目录、bwrap 又拒绝在软链上挂载。逐级 Readlink 最多 8 层，
+// 非软链/读不出时退回 Real（与项目其他路径解析同一口径）。
+func keyringTargetReal(p string) string {
+	for i := 0; i < 8; i++ {
+		fi, err := os.Lstat(p)
+		if err != nil || fi.Mode()&os.ModeSymlink == 0 {
+			return Real(p)
+		}
+		dst, rerr := os.Readlink(p)
+		if rerr != nil {
+			return Real(p)
+		}
+		if !filepath.IsAbs(dst) {
+			dst = filepath.Join(filepath.Dir(p), dst)
+		}
+		p = filepath.Clean(dst)
+	}
+	return Real(p)
+}
+
+// siblingKeyringTarget 返回 targets 里除 tgt 之外的另一个目标。
+func siblingKeyringTarget(targets []string, tgt string) string {
+	for _, t := range targets {
+		if t != tgt {
+			return t
+		}
+	}
+	return ""
+}
+
+// keyringTargetCoveredBySibling 报告软链目标 tgt（已解析为 real）是否被同组
+// 另一个目标覆盖：两者解析到同一目录时，另一个 bind 已经把数据挂在那里，
+// 再对软链目标 bind 只会让 bwrap 拒绝启动。
+func keyringTargetCoveredBySibling(targets []string, tgt, real string) bool {
+	other := siblingKeyringTarget(targets, tgt)
+	if other == "" {
+		return false
+	}
+	return keyringTargetReal(other) == real
+}
+
+// resolveKeyringTargets 返回实际可以 bind 的 keyring 目标：跳过被同组另一个
+// 目标覆盖的软链（bwrap 不能在软链目标上挂载）。解析失败或指向别处的软链
+// 原样保留——那两种情况由 prepareKeyringTargets 在 add 时给出可操作错误，
+// 不在构造参数时静默吞掉。
+func resolveKeyringTargets(targets []string) []string {
+	out := make([]string, 0, len(targets))
+	for _, tgt := range targets {
+		fi, err := os.Lstat(tgt)
+		if err != nil || fi.Mode()&os.ModeSymlink == 0 {
+			out = append(out, tgt)
+			continue
+		}
+		real := keyringTargetReal(tgt)
+		if !keyringTargetCoveredBySibling(targets, tgt, real) {
+			out = append(out, tgt)
+		}
+	}
+	if len(out) > 0 {
+		return out
+	}
+	// 两个目标都软链到**同一个**目录（如 data/conf 都指向 ~/vault/keyrings）：
+	// 彼此都"被对方覆盖"，逐目标剔除会得到空列表，退回原始软链又会让 bwrap
+	// 拒绝挂载。此时 bind 解析后的真实目录——应用侧软链仍能解析到它。
+	seen := map[string]bool{}
+	for _, tgt := range targets {
+		real := keyringTargetReal(tgt)
+		if real == tgt || seen[real] {
+			continue // 解析不出软链目标：交给 prepare 报错
+		}
+		seen[real] = true
+		out = append(out, real)
+	}
+	if len(out) == 0 {
+		return targets // 解析失败：交给 prepareKeyringTargets 报可操作错误
+	}
+	return out
 }
 
 // srcWithinRoot 检查 src 的**最近存在祖先**解析软链后是否仍落在 root 内。
@@ -345,6 +549,14 @@ func mkdirAllTracked(path string, perm os.FileMode) ([]string, error) {
 	var created []string
 	for i := len(missing) - 1; i >= 0; i-- {
 		if err := os.Mkdir(missing[i], perm); err != nil {
+			// 并发创建（两个 run 同时起同一实例）会让某一级得到 EEXIST：
+			// 对方已经建好的目录就是目标状态，不算失败，也不计入回滚清单
+			// （回滚只删"本次真的建出来的"）。
+			if os.IsExist(err) {
+				if fi, serr := os.Lstat(missing[i]); serr == nil && fi.IsDir() {
+					continue
+				}
+			}
 			return created, err
 		}
 		created = append(created, missing[i])

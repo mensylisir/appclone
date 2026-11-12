@@ -54,6 +54,10 @@ type probeReadState struct {
 	execs       []string
 	traceErr    error
 	unclean     bool // 任一轮 ExitCode!=0（会话不干净，读证据不可信）
+
+	// keyring 证据来自 sendmsg 扫描：与读路径是两套口径（方案 §6）。
+	keyringHits    []string
+	keyringDropped int
 }
 
 // newProbeReadState 做能力预检并启动 FIFO reader。needWriteTrace 为 true 时
@@ -154,6 +158,13 @@ func (st *probeReadState) readSyscalls() []string {
 	return append(out, "execve", "execveat")
 }
 
+// keyringSyscalls 是 keyring 证据专用的额外系统调用。单独成函数、在
+// command() 里统一拼接一次：它是**证据**采集，不是读路径采集，绝不能混进
+// readSyscalls()（probeCapsReadList 的 golden 与读能力预检都依赖那份列表）。
+func keyringSyscalls() []string {
+	return []string{"sendmsg"}
+}
+
 // writeSyscalls 是写列表（§4.1）。open/openat 也在此列：兜底路径靠它们
 // 捕获带写入意图的打开。
 func (st *probeReadState) writeSyscalls() []string {
@@ -200,6 +211,10 @@ func (st *probeReadState) command(inner []string, fallback bool) []string {
 	if fallback {
 		list = st.fallbackSyscalls()
 	}
+	// sendmsg 只用于 keyring 字面量扫描（方案 §6），两个分支都要有：
+	// 兜底会话里 libsecret 照样经 D-Bus 找密钥环。**唯一拼接点**，不改
+	// readSyscalls()——probeCapsReadList 的 golden 依赖它保持原样。
+	list = append(list, keyringSyscalls()...)
 	return StraceCommandWith(StraceSpec{
 		Binary:   st.e.stracePath(),
 		LogPath:  st.reader.path(),
@@ -257,6 +272,8 @@ func (st *probeReadState) stop() {
 	st.stats = res.Stats
 	st.execSeen = res.ExecSeen
 	st.execs = res.Execs
+	st.keyringHits = res.KeyringHits
+	st.keyringDropped = res.KeyringTraceDropped
 	if err != nil {
 		st.traceErr = err
 		st.addWarn("reader_stuck")

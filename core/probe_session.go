@@ -32,8 +32,12 @@ type SessionResult struct {
 func probeRuntimeSocks(hostRuntime, probeRuntime string) []BindPair {
 	socks := FilterExisting(RuntimeSocketCandidates(hostRuntime))
 	out := socks[:0]
+	// 只排除**会话总线本身**（<runtime>/bus）。按 basename 过滤会把
+	// at-spi/bus 一起丢掉：探测期应用的无障碍总线缺失，应用可能因此走不同
+	// 代码路径，读证据的保真度下降。
+	busSock := filepath.Join(hostRuntime, "bus")
 	for _, s := range socks {
-		if filepath.Base(s.Src) == "bus" {
+		if s.Src == busSock {
 			continue
 		}
 		rel, ok := relUnder(hostRuntime, s.Src)

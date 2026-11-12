@@ -98,6 +98,8 @@ func TestBuildBwrapArgsGoldenOrder(t *testing.T) {
 		"--bind", "/dev/null", "/tmp/dbus-hostbus",
 		// ④.6 AC_BASE 遮蔽：必须在 paths 之前，否则实例 bind 会被它盖住
 		"--tmpfs", o.BaseReal,
+		// ④.7 审计写层根：普通 run 也必须遮蔽（其他分身的 upper 证据）
+		"--tmpfs", o.AuditRoot,
 		// ⑤ paths：父先子后，源在实例 root 下
 		"--bind", instSrc(in.Root, o.Home+"/.config/WeChat"), o.Home + "/.config/WeChat",
 		"--bind", instSrc(in.Root, o.Home+"/.local/share/WeChat"), o.Home + "/.local/share/WeChat",

@@ -2119,14 +2119,19 @@ func TestGtkConfirmReuseEvidence(t *testing.T) {
 				v2 := &setupView{u: u, appKey: "cred", mode: "setup",
 					onClose: func(bool) {}, rows: map[int]*adw.SwitchRow{}}
 				v2.build()
+				// 能力检测走真实 PATH 会让断言随机器漂移：钉死一份"可用"。
+				env.KeyringCapsOverride = &core.KeyringCaps{
+					Available: true, Daemon: "/usr/bin/gnome-keyring-daemon", DbusSend: "/usr/bin/dbus-send",
+				}
 				v2.applyProbeResult(core.ProbeResult{
 					Candidates: []core.Candidate{
 						{Path: pub, Class: core.ClassPublic, DisplayClass: core.ClassPublic, Why: "probe.why.public"},
 						{Path: cfg, Class: core.ClassConfig, Checked: true,
 							Credential: core.CredentialStrong, CredentialPath: cred},
 					},
-					ReadTrace: core.ReadTraceUnavailable,
-					Profile:   core.Profile{App: "cred", ProbeMethod: "overlay"},
+					ReadTrace:       core.ReadTraceUnavailable,
+					KeyringEvidence: core.KeyringEvidenceObserved,
+					Profile:         core.Profile{App: "cred", ProbeMethod: "overlay", IsolateKeyring: true},
 				})
 				if v2.state != "confirm" {
 					fail("候选确认页没有进入 confirm：%s", v2.state)
@@ -2142,6 +2147,21 @@ func TestGtkConfirmReuseEvidence(t *testing.T) {
 				}
 				if findListRowByTitle(v2.confirmPage, u.tr("ui.setup.confirm.empty", nil)) == nil {
 					fail("读证据不可用时必须显示 confirm-empty 提示行")
+					return false
+				}
+				// 登录状态组始终出现：探测到使用证据时默认开启，副标题点名证据。
+				// 没有它，用户就只剩下手写档案这一条路（违反零门槛红线）。
+				krRow := findListRowByTitle(v2.confirmPage, u.tr("ui.setup.row.keyring.title", nil))
+				if krRow == nil {
+					fail("确认页缺少「独立密钥环」行（现有行：%v）", listRowTitles(v2.confirmPage))
+					return false
+				}
+				if v2.keyringRow == nil || !v2.keyringRow.GetActive() {
+					fail("观测到使用证据时应默认开启独立密钥环")
+					return false
+				}
+				if sub := stringProp(krRow, "subtitle"); !strings.Contains(sub, u.tr("ui.setup.row.keyring.observed", nil)) {
+					fail("独立密钥环行必须说明证据来源：%q", sub)
 					return false
 				}
 				v2.scope.close()
@@ -2189,4 +2209,24 @@ func findListRowByTitle(page *adw.PreferencesPage, title string) *gtk.Widget {
 		}
 	}
 	return nil
+}
+
+// 详情页"独立密钥环"行：关闭态必须区分"私有总线在跑"与"真的共用宿主总线"。
+// 私有总线没有 servicedir，宿主 Secret Service 不会被激活（ADR-035 ②），
+// 说"与主实例共用宿主密钥环"会与升级迁移提示自相矛盾。
+func TestKeyringRowState(t *testing.T) {
+	cases := []struct {
+		name string
+		p    core.Profile
+		want string
+	}{
+		{"on", core.Profile{IsolateKeyring: true}, "ui.detail.keyring.on"},
+		{"off-bus", core.Profile{IsolateDBus: true}, "ui.detail.keyring.off_bus"},
+		{"off", core.Profile{}, "ui.detail.keyring.off"},
+	}
+	for _, c := range cases {
+		if got := keyringRowState(c.p); got != c.want {
+			t.Fatalf("%s: 期望 %s，得到 %s", c.name, c.want, got)
+		}
+	}
 }

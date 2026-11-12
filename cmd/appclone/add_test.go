@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -101,5 +102,75 @@ func TestAddRefusesVersionAheadProfile(t *testing.T) {
 	}
 	if !strings.Contains(string(after), "future_only") {
 		t.Fatalf("未来字段必须原样保留：\n%s", after)
+	}
+}
+
+// add --json 的 keyring 契约：isolate_keyring 是档案字段（持久、脚本要读），
+// keyring_evidence 是本次探测的 run-scoped 证据——复用档案时是空串，
+// 表示"没有证据"，不是"没有 keyring"。GUI 确认页读的是同一对字段。
+func TestAddJSONKeyringContract(t *testing.T) {
+	a, root := cliEnv(t)
+	a.env.CliPath = "/usr/bin/appclone"
+	home := filepath.Join(root, "home")
+	dataDir := filepath.Join(home, ".config", "Demo")
+	if err := os.MkdirAll(dataDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	execPath := filepath.Join(home, "demo-bin")
+	if err := os.WriteFile(execPath, []byte("#!/bin/sh\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	desktop := filepath.Join(root, "xdg", "data", "applications", "demo.desktop")
+	if err := os.WriteFile(desktop,
+		[]byte("[Desktop Entry]\nType=Application\nName=Demo\nExec="+execPath+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	run := func(t *testing.T, isolate bool) map[string]any {
+		t.Helper()
+		p := core.Profile{
+			App: "demo", Version: core.ProfileVersion, Exec: execPath,
+			Paths: []string{"~/.config/Demo"}, ProbeMethod: "manual",
+			Env: map[string]string{}, IsolateKeyring: isolate, KeyringSet: true,
+		}
+		if err := a.env.SaveProfile(p); err != nil {
+			t.Fatal(err)
+		}
+		cmd := newAddCmd(a)
+		cmd.SilenceUsage, cmd.SilenceErrors = true, true
+		cmd.SetArgs([]string{"demo", "--profile-only"})
+		out, err := captureStdout(t, func() error { return cmd.Execute() })
+		if err != nil {
+			t.Fatalf("add --profile-only 失败：%v", err)
+		}
+		// 外形是 {ok, data}（与 list/doctor 同一约定），字段在 data 里。
+		var resp struct {
+			OK   bool           `json:"ok"`
+			Data map[string]any `json:"data"`
+		}
+		if err := json.Unmarshal([]byte(out), &resp); err != nil {
+			t.Fatalf("输出不是 JSON：%v\n%s", err, out)
+		}
+		if !resp.OK {
+			t.Fatalf("命令失败：%s", out)
+		}
+		return resp.Data
+	}
+
+	on := run(t, true)
+	if on["isolate_keyring"] != true {
+		t.Fatalf("isolate_keyring 应为 true：%v", on)
+	}
+	if v, ok := on["keyring_evidence"]; !ok || v != "" {
+		t.Fatalf("复用档案时 keyring_evidence 必须是空串（无证据）：%v", on)
+	}
+	// 证据扫描被上限截断时非零；复用档案没有探测，必须是 0 而不是缺字段
+	// （脚本用 0 区分"证据完整但没有"与"证据被截断"）。
+	if v, ok := on["keyring_trace_dropped"]; !ok || v != float64(0) {
+		t.Fatalf("keyring_trace_dropped 应为 0：%v", on)
+	}
+	off := run(t, false)
+	if off["isolate_keyring"] != false {
+		t.Fatalf("显式关闭必须原样输出 false（不能缺键）：%v", off)
 	}
 }

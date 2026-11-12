@@ -31,8 +31,32 @@ type AuditSession struct {
 	pubs   []BindPair
 	shared []string
 	base   string
+	// keyringBinds 是本次 run 实际 bind 的 keyring 目标（beginAudit 时解析）。
+	// finish 不能重新解析：运行中软链布局变化会让 run.toml 与真实 argv 不一致。
+	keyringBinds []string
 	// stop 是卸载 overlay 的闭包；finish/abort 之后置 nil，避免二次卸载。
 	stop func() error
+}
+
+// auditRoot 是所有审计写层的根：<tmpRoot>/appclone/audit.<uid>。每个实例的
+// upper 在其下的 <app>.<id>/，所以**任何**分身都必须把它整个遮住——只在审计
+// 会话里遮蔽 per-instance 目录，普通 run 的 `--bind / /` 仍能读到其他分身尚未
+// verify 的证据副本（§6.5）。
+func (e *Env) auditRoot() string {
+	return filepath.Join(e.tmpRoot(), "appclone", fmt.Sprintf("audit.%d", e.UID))
+}
+
+// ensureAuditRoot 以 0700 建出审计写层根。所有 run 与探测都必须先调用它，
+// 再在 argv 里 `--tmpfs` 遮蔽这个根：
+//   - 根不存在时 bwrap 会在宿主父目录里自建挂载点（默认权限，不是 0700）；
+//   - 遮蔽不能按"根当前是否存在"取快照：普通 run 构造参数到 bwrap 启动之间
+//     可能有一次并发审计刚建出根，漏遮等于把别的分身未 verify 的 upper 副本
+//     暴露给应用（§6.5）。
+func (e *Env) ensureAuditRoot() error {
+	if err := os.MkdirAll(e.auditRoot(), 0o700); err != nil {
+		return errEnv("err.env.mkdir", map[string]any{"path": e.auditRoot()}, err)
+	}
+	return nil
 }
 
 // beginAudit 准备审计会话并返回要插进 bwrap 参数的那一层。
@@ -42,13 +66,13 @@ type AuditSession struct {
 // ② 扫掉残留（含仍挂载的）；③ 写层必须在 $HOME 之外（overlay 的 upper 嵌在
 // lower 里会 ELOOP）；④ 删掉上一轮的 run.toml——否则新审计中途崩掉时，
 // verify 会把旧凭证当成本次"正常跑完"。
-func (e *Env) beginAudit(in Instance, p Profile) (*AuditSession, *AuditLayers, error) {
+func (e *Env) beginAudit(in Instance, p Profile, keyringBinds []string) (*AuditSession, *AuditLayers, error) {
 	if err := e.quarantinePendingAudit(in); err != nil {
 		return nil, nil, err
 	}
 	// 写层根在 AC_BASE 里时，`--tmpfs Base` 会把它一起盖住（应用看不到，
 	// 工具自己也挂不上）；而且写层嵌在实例目录里等于把证据暴露给应用。
-	writeRoot := filepath.Join(e.tmpRoot(), "appclone", fmt.Sprintf("audit.%d", e.UID))
+	writeRoot := e.auditRoot()
 	// 双向都拒：writeRoot 在 Base 下会被 `--tmpfs Base` 盖住；Base 在
 	// writeRoot 下会被 `--tmpfs WriteRoot` 连带遮掉（实例 bind 目标在
 	// 被遮的祖先下，审计会话起不来）。两边都取真实路径再比：tmpRoot
@@ -118,12 +142,13 @@ func (e *Env) beginAudit(in Instance, p Profile) (*AuditSession, *AuditLayers, e
 	// 互相判为未格式化。赋值语句的格式在两个版本一致。
 	sess := &AuditSession{
 		e: e, in: in, p: p, work: work,
-		upper:  filepath.Join(work, "upper"),
-		start:  start,
-		stop:   unmount,
-		pubs:   pubs,
-		shared: e.existingSharedWrites(p),
-		base:   e.Base,
+		upper:        filepath.Join(work, "upper"),
+		start:        start,
+		stop:         unmount,
+		pubs:         pubs,
+		shared:       e.existingSharedWrites(p),
+		base:         e.Base,
+		keyringBinds: keyringBinds,
 	}
 	layers := &AuditLayers{
 		Merged:      filepath.Join(work, "merged"),
@@ -175,6 +200,10 @@ func (s *AuditSession) finish(exitCode int) error {
 		}
 	}
 	sort.Strings(paths)
+	var keyringBinds []string
+	if s.p.IsolateKeyring {
+		keyringBinds = s.keyringBinds
+	}
 	rec := runRecord{
 		Version:       ProfileVersion,
 		App:           s.in.App,
@@ -188,6 +217,7 @@ func (s *AuditSession) finish(exitCode int) error {
 		Base:          s.base,
 		MaskedBase:    Real(s.base),
 		BindsRecorded: true,
+		KeyringBinds:  keyringBinds,
 	}
 	return writeRunRecord(filepath.Join(audit, "run.toml"), rec)
 }
@@ -253,6 +283,9 @@ type runRecord struct {
 	// Base 下出现写入说明遮蔽没生效，verify 判 extract_failed 而不是普通 leak。
 	MaskedBase    string `toml:"masked_base,omitempty"`
 	BindsRecorded bool   `toml:"binds_recorded,omitempty"`
+	// KeyringBinds 是本次实际 bind 的 keyring 目标（v1.0.3 起）。verify 把它们
+	// 并入 mustBind：keyring 目录下出现"未 bind"的写入就是隔离没生效。
+	KeyringBinds []string `toml:"keyring_binds,omitempty"`
 }
 
 // complete 判定"这次审计正常跑完"。finished_at 是 finish 在应用退出之后才

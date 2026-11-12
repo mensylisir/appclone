@@ -47,6 +47,15 @@ type BuildOptions struct {
 	// 没有条目的路径仍绑定实例目录。BuildBwrapArgs 仍是纯函数：挂载由
 	// core.Run 在调用前完成，这里只消费结果。
 	ForkSources map[string]string
+	// KeyringTargets 是本次实际要 bind 的 keyring 目标（由 BuildOptions 用
+	// 文件系统现状解析：软链目标解析后与同组另一个目标指向同一目录时跳过，
+	// 因为 bwrap 拒绝在软链目标上挂载）。空时退回 keyringTargets() 的两个
+	// 原始目标，保持 BuildBwrapArgs 对纯函数测试的可用性。
+	KeyringTargets []string
+	// AuditRoot 是所有审计写层的根（<tmpRoot>/appclone/audit.<uid>）。run 与
+	// 探测都无条件 tmpfs 遮蔽它：普通 run 的 `--bind / /` 同样能按真实路径
+	// 读到/改掉其他分身尚未 verify 的 upper 副本。
+	AuditRoot string
 }
 
 // BindPair 表示一次 bind 的源与目标。
@@ -96,6 +105,16 @@ func ValidateProfile(p Profile, o BuildOptions) error {
 		return err
 	}
 	p.Paths = paths
+	// keyring 目录不能进 paths：keyring 的隔离由独立 daemon 负责（ADR-035）。
+	// 把宿主 keyring 文件当普通路径 bind 进分身，等于让两个实例共享同一份密钥，
+	// 与 isolate_keyring 的语义直接冲突。
+	for _, pp := range p.Paths {
+		// 只拒两个 keyring 目录：paths 支持精确文件，`.keyring` 后缀不能单独
+		// 判定（应用自己的 `~/.config/app/foo.keyring` 是合法文件）。
+		if o.Resolver != nil && o.Resolver.isKeyringDir(pp) {
+			return errInput("err.profile.keyring_in_paths", map[string]any{"path": pp})
+		}
+	}
 	if err := ValidateReadTrace(p.ReadTrace); err != nil {
 		return err
 	}
@@ -153,6 +172,28 @@ func ValidateProfile(p Profile, o BuildOptions) error {
 				// 同一目标被两条规则 bind：档案自相矛盾，谁在后谁生效，
 				// 用户看到的隔离结果取决于实现顺序（§3.1 ⑦）。
 				return errInput("err.profile.extra_bind_overlap", map[string]any{"path": dst})
+			}
+		}
+	}
+
+	// 独立 keyring 的两个 bind 目标不得与 AC_BASE 重叠：目标落在被 tmpfs
+	// 遮蔽的范围内时，bind 会把实例数据重新暴露成"宿主 keyring 目录"。
+	// 源在 Base 下是正常布局（<inst>/keyring/data/keyrings）。
+	if p.IsolateKeyring {
+		// 原始目标与解析后的目标都要查：双侧软链可以指向 Base 下一个**尚不存在**
+		// 的目录，词法检查只看软链位置会放行，而 keyringBinds 最终 bind 的是
+		// 解析后的真实路径（Real 解析不到末级时逐级回退，仍可能落在 Base 下）。
+		checked := map[string]bool{}
+		for _, tgt := range append(o.keyringTargets(), o.keyringBinds()...) {
+			if checked[tgt] {
+				continue
+			}
+			checked[tgt] = true
+			if !filepath.IsAbs(tgt) {
+				return errInternal("err.internal.probe_spec", map[string]any{"field": "xdg"}, nil)
+			}
+			if err := checkBaseExposure(tgt, o, "isolate_keyring"); err != nil {
+				return err
 			}
 		}
 	}
@@ -539,6 +580,30 @@ func (o BuildOptions) expand(s string) (string, error) {
 		return "", errInternal("err.internal.no_resolver", nil, nil)
 	}
 	return r.Expand(s)
+}
+
+// keyringTargets 是沙箱内两个 keyring 目录（XDG_DATA_HOME/keyrings 与
+// XDG_CONFIG_HOME/keyrings），两个目标 bind 到同一来源。XDG 相同时去重，
+// 避免同目标两次 bind（后一次覆盖前一次，语义不变但 argv 冗余）。
+func (o BuildOptions) keyringTargets() []string {
+	data := filepath.Join(o.XDG["XDG_DATA_HOME"], "keyrings")
+	conf := filepath.Join(o.XDG["XDG_CONFIG_HOME"], "keyrings")
+	if data == conf {
+		return []string{data}
+	}
+	return []string{data, conf}
+}
+
+// keyringBinds 是本次实际要 bind 的 keyring 目标。调用方（BuildOptions）已
+// 用文件系统现状剔除"软链到同组另一个目标"的路径——bwrap 不能在软链目标上
+// 挂载（Can't mount on symlink destination），常见布局
+// `~/.config/keyrings -> ~/.local/share/keyrings` 会让整次启动失败。
+// 没有提供解析结果时退回原始目标：纯函数测试与离线命令构造仍可工作。
+func (o BuildOptions) keyringBinds() []string {
+	if len(o.KeyringTargets) > 0 {
+		return o.KeyringTargets
+	}
+	return o.keyringTargets()
 }
 
 func (o BuildOptions) publicDirs() []string {

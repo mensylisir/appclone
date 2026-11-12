@@ -621,12 +621,12 @@
     <b>Esc 三级语义</b>：确认框开着 → 只关确认框；探测页开着 → 关探测页（等同取消）；都没有 → <b>不做导航</b>（Esc 不是"返回"，返回走头栏「←」）。
   </div>
   <div class="annot" id="annot3">
-    <h4>屏3 · 探测页 — 四态与五组</h4>
+    <h4>屏3 · 探测页 — 四态与六组</h4>
     <table>
       <tr><td>承载</td><td>原生为 <span class="w">AdwNavigationView</span> 的 push 页（不是对话框）；本稿用遮罩对话框表达同一状态机</td></tr>
       <tr><td>闸门（探测前）</td><td>四道闸门跑在探测会话启动<b>之前</b>：bwrap 不可用 / 缺 fuse（降级不阻断）/ <b>目标应用还在运行</b> / 拿不到全局写锁。硬闸门失败<b>直接进 error 并带原因</b>，不启动会话</td></tr>
       <tr><td>探测中</td><td><span class="w">GtkSpinner</span> + 「正在跟踪写入…」+ <b>已发现 N 个写入条目</b>（流式递增）+ HeaderBar「取消探测」——<b>取消必给</b>，探测十秒到一分钟。措辞是"条目"不是"命中次数"：overlay 只知道"写过/删过"，拿不到次数</td></tr>
-      <tr><td>确认</td><td>五组：① 应用自身数据（可勾 <span class="w">AdwSwitchRow</span>，<b>缓存项也在这组</b>、默认不勾并标「缓存」）② <b>数据来源</b>（可勾 <span class="w">AdwSwitchRow</span>「从现有应用数据克隆起步」，<b>默认关</b>；只更新档案的 rediscover 入口必须隐藏；缺 fuse-overlayfs 时禁用——拨了也不会生效）③ 单例处理（可勾 <span class="w">AdwSwitchRow</span>：私有 runtime / 私有 DBus，<b>由检出的单例项驱动、没检出就不出现</b>；本稿用 <span class="w">app.singleton</span> 演示——firefox/chrome/notion 就没有这一组）<b>注意</b>：本稿把 <span class="w">~/.dingtalk</span>、<span class="w">~/.mozilla</span> 这类顶层点目录标成「配置」且默认勾选，<b>只是演示</b>；真实 L2 规则里它们是灰区、默认不勾（discover.md §5 第 5 条）。照抄会把用户自己放在点目录里的文件误判成应用数据。<br>④ <b>公共目录（强制共享）</b>：只读 <span class="w">AdwActionRow</span> + <span class="w">.dim-label</span>，<b>一律显示、不可勾</b> ⑤ <b>共享但可写（不隔离）</b>：只读，<b>并写清代价</b>（"两个分身的最近文件会混在一起"）——不说，用户遇到就判定产品坏了</td></tr>
+      <tr><td>确认</td><td>六组：① 应用自身数据（可勾 <span class="w">AdwSwitchRow</span>，<b>缓存项也在这组</b>、默认不勾并标「缓存」）② <b>数据来源</b>（可勾 <span class="w">AdwSwitchRow</span>「从现有应用数据克隆起步」，<b>默认关</b>；只更新档案的 rediscover 入口必须隐藏；缺 fuse-overlayfs 时禁用——拨了也不会生效）③ 单例处理（可勾 <span class="w">AdwSwitchRow</span>：私有 runtime / 私有 DBus，<b>由检出的单例项驱动、没检出就不出现</b>；本稿用 <span class="w">app.singleton</span> 演示——firefox/chrome/notion 就没有这一组）<b>注意</b>：本稿把 <span class="w">~/.dingtalk</span>、<span class="w">~/.mozilla</span> 这类顶层点目录标成「配置」且默认勾选，<b>只是演示</b>；真实 L2 规则里它们是灰区、默认不勾（discover.md §5 第 5 条）。照抄会把用户自己放在点目录里的文件误判成应用数据。<br>④ <b>公共目录（强制共享）</b>：只读 <span class="w">AdwActionRow</span> + <span class="w">.dim-label</span>，<b>一律显示、不可勾</b> ⑤ <b>共享但可写（不隔离）</b>：只读，<b>并写清代价</b>（"两个分身的最近文件会混在一起"）——不说，用户遇到就判定产品坏了 ⑥ <b>登录状态</b>（<span class="w">AdwSwitchRow</span>「独立密钥环」，<b>始终出现</b>，证据只定默认值与副标题；开启即隐含私有总线与 runtime，行同步点亮并锁定；能力缺失时禁用并说明原因，已开时可关）</td></tr>
       <tr><td>创建中</td><td><b>独立第四态</b>，不是"confirm 里加个 flag"：写档案 + 建实例目录 + 生成 .desktop 是几百毫秒的事务，期间再点一次确认会<b>建出两个实例</b>；中途取消会留下"档案写了、实例没建成"的半成品。故：确认按钮变「正在创建…」并禁用，<b>取消也禁用</b>，Esc 同样不生效</td></tr>
       <tr><td>失败</td><td><span class="w">AdwStatusPage</span>：<b>按 Reason 分文案</b>——<code>app_running</code> / <code>env_unavailable</code> / <code>no_writes</code> / <code>public_dir_leak</code>，每类一条独立键与"下一步做什么"；<b>禁止所有失败共用一句"探测失败"</b>。「这次没有跟踪到任何写入」也走这一态，<b>不生成空档案</b></td></tr>
       <tr><td>确认按钮</td><td><span class="w">suggested-action</span>：创建分身（setup/reconfig/clone）/ 开启分身（open）/ 保存档案（rediscover）；<b>门禁只数「应用自身数据」</b>——只勾缓存或单例时仍禁用，否则会生成一个什么都不隔离的空档案；探测中与创建中该按钮不存在/不可用</td></tr>
@@ -658,11 +658,12 @@ const apps = [
   { id:'qq',       name:'QQ',          letter:'Q', color:'#12b7f5',
     hasProfile:true,  creatable:true,  probeMethod:'overlay', readTrace:'ok', noHomeReads:true, instances:[] },
   { id:'firefox',  name:'火狐浏览器', letter:'F', color:'#ff7139',
-    hasProfile:true,  creatable:true,  probeMethod:'overlay', singleton:false, instances:[] },
+    /* keyring:'linked' = 只有 ELF 链接线索、没观测到实际调用：默认关，提示可手动开启 */
+    hasProfile:true,  creatable:true,  probeMethod:'overlay', singleton:false, keyring:'linked', instances:[] },
   { id:'dingtalk', name:'钉钉',        letter:'钉', color:'#0089ff',
-    hasProfile:false, creatable:false, readTrace:'partial', readsHidden:4, instances:[] },
+    hasProfile:false, creatable:false, readTrace:'partial', readsHidden:4, keyring:'observed', instances:[] },
   { id:'zcode',    name:'ZCode',       letter:'Z', color:'#5b21b6',
-    hasProfile:false, creatable:false, readTrace:'unavailable', instances:[] },
+    hasProfile:false, creatable:false, readTrace:'unavailable', keyringCaps:false, instances:[] },
   { id:'chrome',   name:'Chrome',      letter:'C', color:'#e2432e',
     hasProfile:false, creatable:false, singleton:false, instances:[] },
   { id:'slack',    name:'Slack',       letter:'S', color:'#611f69',
@@ -670,7 +671,10 @@ const apps = [
   /* 档案在、但里面记的路径已不存在（应用升级换了数据目录）：
      这是"档案失效"，不是"从没配过"——复用它等于造一个空隔离分身，必须重探 */
   { id:'notion',   name:'Notion',      letter:'N', color:'#1f1f1f',
-    hasProfile:true,  creatable:false, probeMethod:'overlay', readTrace:'', singleton:false, instances:[] },
+    hasProfile:true,  creatable:false, probeMethod:'overlay', readTrace:'', singleton:false,
+    /* 旧档案已经开了私有 DBus、还没开独立密钥环：升级后私有总线不再激活宿主 keyring，
+       这是唯一需要提示迁移的组合 */
+    isolateDBus:true, instances:[] },
   /* 主实例正在运行：探测的第一道闸门就会挡住（最高频的首启失败） */
   { id:'obsidian', name:'Obsidian',    letter:'O', color:'#7c3aed',
     hasProfile:false, creatable:false, hostRunning:true, instances:[] },
@@ -1064,6 +1068,17 @@ function renderDialog() {
   const confirmEmpty = dlgMode === 'setup' && rt === 'unavailable'
     && gateCands.length > 0 && selectedGate === 0;
   const hidden = a.readsHidden || 0;
+  /* 独立密钥环（ADR-035）：探测到使用证据 → 默认开；只有链接线索 → 提示可手动开；
+     能力缺失时禁用（已经开着则仍可关）。 */
+  const keyringOn = a.keyring === 'observed';
+  const keyringLocked = a.keyringCaps === false && !keyringOn;
+  const keyringEvidenceText = a.keyring === 'observed'
+    ? ' · 已检测到该应用使用系统密钥环'
+    : a.keyring === 'linked' ? ' · 检测到该应用可能使用系统密钥环，可手动开启' : '';
+  const keyringMigrateText = (a.isolateDBus && !keyringOn)
+    ? ' · 升级后该分身不再使用宿主密钥环；用到系统密钥环的应用请开启独立密钥环（首次需重新登录）' : '';
+  const keyringWhyText = a.keyringCaps === false
+    ? ' · 无法开启：未找到 gnome-keyring-daemon' : '';
   const chk = (p, kind) => {
     const locked = !!p.locked;
     const obs = [];
@@ -1123,6 +1138,21 @@ function renderDialog() {
       <div class="locknote">这个应用靠<b>运行目录里的 socket</b> 判断"自己已经开着"。这里换成<b>私有的运行目录</b>，
       两个分身就能各自启动；换成空文件是不行的——那样应用连不上自己的服务，会直接起不来。</div>
     </div>`}
+    <!-- 登录状态（ADR-035）：独立密钥环开关。组**始终出现**——这是用户手动开启它的
+         唯一入口；证据只决定默认值与副标题。observed → 默认开；linked/无 → 默认关。
+         能力缺失（没有 gnome-keyring-daemon / dbus-send）时禁用并说明原因，
+         但已经开着时始终允许关闭 -->
+    <div class="dlg-group" data-group="keyring">
+      <div class="group-label">登录状态</div>
+      <label class="chkrow" ${keyringLocked ? 'data-disabled="1"' : ''}>
+        <input type="checkbox" data-chk data-kind="keyring" ${keyringOn ? 'checked' : ''} ${keyringLocked ? 'disabled' : ''}>
+        <span class="cb"></span>
+        <div class="tt">
+          <div class="path">独立密钥环</div>
+          <div class="why">分身使用自己的系统密钥环；开启后分身内的通知、托盘和输入法可能不可用${keyringEvidenceText}${keyringMigrateText}${keyringWhyText}</div>
+        </div>
+      </label>
+    </div>
     <div class="dlg-group">
       <div class="group-label">公共目录（强制共享）</div>
       ${publicDirs.map(d => `<div class="readonly-row"><span class="path">${d}</span><span class="shared-tag">始终共享</span></div>`).join('')}
@@ -1136,11 +1166,21 @@ function renderDialog() {
         <span class="path">${s.path}</span><span class="shared-tag">共享</span></div>
         <div class="readonly-row" style="border-top:none;padding-top:0;font-size:11.5px">${s.why}</div>`).join('')}
     </div>`;
+  syncKeyringRows();
   body.dataset.state = confirmEmpty ? 'confirm-empty' : 'confirm';
   foot.textContent = dlgMode === 'rediscover' ? '保存档案'
     : dlgMode === 'open' ? '开启分身' : '创建分身';
   refreshConfirm();
 }
+/* 独立密钥环隐含私有总线与私有 runtime：开启时把单例行点亮并锁住，避免界面
+   显示的开关状态与 bwrap 实际行为不一致。关闭时恢复可操作，但不回退用户
+   已经开着的单例行（那是用户的显式选择）。 */
+function syncKeyringRows() {
+  const kr = $('[data-chk][data-kind="keyring"]');
+  const on = !!kr && kr.checked;
+  $$('[data-chk][data-kind="singleton"]').forEach(c => { if (on) c.checked = true; c.disabled = on; });
+}
+
 /* 门禁只数"应用自身数据"：全取消、只勾缓存/单例时不能建——那会生成一个什么都不隔离的空档案
    （分身与主实例完全共享数据，用户却以为隔了。见 discover.md §6） */
 function refreshConfirm() {
@@ -1497,7 +1537,10 @@ document.addEventListener('change', e => {
     return;
   }
   if (e.target.closest('[data-fork]')) { forkOn = e.target.checked; return; }
-  if (e.target.closest('[data-chk]')) refreshConfirm();
+  if (e.target.closest('[data-chk]')) {
+    if (e.target.dataset.kind === 'keyring') syncKeyringRows();
+    refreshConfirm();
+  }
 });
 /* GtkSearchEntry：按显示名与 desktop id 双字段过滤（方案设计 §6.1.1）。
    必须防抖：397 个应用逐键重建 DOM，输入框会一顿一顿；GtkSearchEntry 的 search-changed 也是防抖语义 */

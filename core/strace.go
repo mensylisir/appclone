@@ -54,13 +54,24 @@ type StraceResult struct {
 	// FlagsHidden 是 openat2 flags 不可见、按读计入但**不参与凭据升级**的路径。
 	FlagsHidden []string
 	Stats       StraceStats
+	// KeyringHits 是 sendmsg 行里命中的 D-Bus 服务字面量（去重、按首次出现
+	// 顺序）。它只是**证据**，绝不进入 Reads/Writes，也不参与路径解析。
+	KeyringHits []string
+	// KeyringTraceDropped 是超过扫描上限后被丢弃的 sendmsg 行数（计数，
+	// 不是布尔标记）。它不触发 size_exceeded：sendmsg 不产生路径条目。
+	KeyringTraceDropped int
+
+	// keyringSeen/keyringScanned 是扫描器的内部状态：去重键与已扫描行数。
+	// 不导出，避免调用方把它们当成结果的一部分。
+	keyringSeen    map[string]bool
+	keyringScanned int
 }
 
 // ParseStraceAll 同时解析读与写证据。读/写两条路径共用同一份行语法，
 // 避免"读解析支持 -y、写解析不支持"这种半修状态。
 func ParseStraceAll(r io.Reader, home string) StraceResult {
 	home = filepath.Clean(home)
-	var res StraceResult
+	res := StraceResult{keyringSeen: map[string]bool{}}
 	readSeen := map[string]bool{}
 	writeSeen := map[string]bool{}
 	sc := bufio.NewScanner(r)
@@ -103,6 +114,81 @@ func parseStraceLineInto(line, home string, res *StraceResult, readSeen, writeSe
 	if straceWriteSyscalls[c.call] {
 		parseWriteCall(c, home, res, writeSeen)
 	}
+	if c.call == "sendmsg" {
+		parseKeyringCall(c, res)
+	}
+}
+
+// keyringServiceLiteral 是 keyring 强证据扫描的目标字面量。libsecret/GDBus
+// 请求 org.freedesktop.secrets 时，服务名以明文出现在 sendmsg 的 iov 里
+// （strace -s 4096 可见）。
+const keyringServiceLiteral = "org.freedesktop.secrets"
+
+// keyringTraceLimit 是 sendmsg 行的扫描上限。超过后停止扫描并累加
+// KeyringTraceDropped——它**不**触发 size_exceeded：路径条目上限与证据
+// 扫描上限是两套口径（方案 §6）。
+const keyringTraceLimit = 20000
+
+// parseKeyringCall 只做 sendmsg 字面量扫描，**硬约束**：绝不追加 Reads/
+// Writes、绝不进入路径解析。未知系统调用本来就被忽略，所以兜底会话里多出
+// 的 sendmsg 行不会污染写入证据。
+//
+// 过滤条件（方案 §6 / D4）：
+//   - 必须有 -y 注解且是 unix socket 路径：注解缺失时无法确认 fd 是 socket，
+//     跳过该行（caps.Y=false 时整轮都没有注解，自然零命中、零丢弃）；
+//   - 载荷必须以 D-Bus 消息头开头：普通文本里恰好出现同名字面量不算证据；
+//   - 非 unix socket（TCP/匿名 socket，注解形如 socket:[123]）不扫描。
+func parseKeyringCall(c straceCall, res *StraceResult) {
+	// 只认**成功**的 sendmsg：普通文件 fd 上的 sendmsg 必然失败
+	// （ENOTSOCK），返回值 <=0 的行不是总线流量，不能升级为证据。
+	if c.ret <= 0 {
+		return
+	}
+	ann := sendmsgFDAnnotation(c.args)
+	if ann == "" || !strings.HasPrefix(ann, "/") {
+		return
+	}
+	if res.keyringScanned >= keyringTraceLimit {
+		res.KeyringTraceDropped++
+		return
+	}
+	res.keyringScanned++
+	if !strings.Contains(c.args, keyringServiceLiteral) || !dbusMessagePayload(c.args) {
+		return
+	}
+	if res.keyringSeen == nil {
+		res.keyringSeen = map[string]bool{}
+	}
+	if res.keyringSeen[keyringServiceLiteral] {
+		return
+	}
+	res.keyringSeen[keyringServiceLiteral] = true
+	res.KeyringHits = append(res.KeyringHits, keyringServiceLiteral)
+}
+
+// dbusMessagePayload 判断 iov 载荷是否以 D-Bus 消息头开头。头四个字节是
+// 字节序（'l'/'B'）、消息类型（1=method call）、flags、协议版本 1。
+// strace 把不可打印字节写成短八进制转义（`\1`），所以按字面量比对；
+// 大端同样是 method call 类型 1（`B\1`），不是 `B\0`。
+func dbusMessagePayload(args string) bool {
+	return strings.Contains(args, `iov_base="l\1`) ||
+		strings.Contains(args, `iov_base="B\1`)
+}
+
+// sendmsgFDAnnotation 取第一个参数上的 -y 注解（`3</run/user/1000/bus>` →
+// `/run/user/1000/bus`）。注解在**参数**里，不在返回值尾部：parseStraceLine
+// 的 ann 只解析 `= ret<...>` 那一段，sendmsg 的 fd 注解必须单独取。
+func sendmsgFDAnnotation(args string) string {
+	first := args
+	if i := strings.IndexByte(args, ','); i >= 0 {
+		first = args[:i]
+	}
+	open := strings.IndexByte(first, '<')
+	closeIdx := strings.LastIndexByte(first, '>')
+	if open < 0 || closeIdx <= open {
+		return ""
+	}
+	return first[open+1 : closeIdx]
 }
 
 // ParseStrace 保留原有只取写入的签名（降级路径与旧测试仍可用）。

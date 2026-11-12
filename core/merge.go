@@ -35,6 +35,18 @@ func MergeNonPathFieldsWith(r *PathResolver, p, base Profile) Profile {
 	}
 	p.IsolateDBus = base.IsolateDBus
 	p.IsolateRuntime = base.IsolateRuntime
+	// isolate_keyring 的优先级不同：旧档案里根本没有这个键（KeyringSet=false），
+	// 此时探测/模板的默认值才生效；一旦档案显式写过，显式值胜出——否则用户
+	// 关掉的开关会在下次重探时被默认值悄悄打开（§5.5）。
+	if base.KeyringSet {
+		p.IsolateKeyring = base.IsolateKeyring
+		p.KeyringSet = true
+	} else if base.IsolateKeyring {
+		// base 没写过这个键 = 没有意见：探测/模板的默认值必须能穿过
+		// ProfileFromCandidates 的零值落到最终档案（否则 observed 默认开等于没实现）。
+		// 不标 KeyringSet：默认值不是用户的显式选择，下次探测仍可重新决定。
+		p.IsolateKeyring = true
+	}
 	p.Sockets = slices.Clone(base.Sockets)
 	p.ExtraBinds = slices.Clone(base.ExtraBinds)
 	p.Cwd = base.Cwd

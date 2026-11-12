@@ -121,7 +121,7 @@ func TestProfileReadTraceCredentialRoundTrip(t *testing.T) {
 		t.Fatalf("往返丢字段：read_trace=%q credential_paths=%v", got.ReadTrace, got.CredentialPaths)
 	}
 
-	b, err := encodeProfile(p)
+	b, err := testEnv(t).encodeProfile(p)
 	if err != nil {
 		t.Fatalf("encode: %v", err)
 	}

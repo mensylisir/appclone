@@ -171,7 +171,7 @@ func (e *Env) Run(ctx context.Context, app, id string, opt RunOptions) (RunResul
 	var audit *AuditSession
 	started := false
 	if opt.Audit {
-		sess, layers, aerr := e.beginAudit(in, p)
+		sess, layers, aerr := e.beginAudit(in, p, o.KeyringTargets)
 		if aerr != nil {
 			return RunResult{}, aerr
 		}
@@ -186,30 +186,47 @@ func (e *Env) Run(ctx context.Context, app, id string, opt RunOptions) (RunResul
 			}
 		}()
 	}
+	// 审计写层根以 0700 建好（bwrap 对不存在的 --tmpfs 目标会自建默认权限
+	// 的挂载点）。根永远遮蔽：不能按"当前是否存在"取快照——构造参数到 bwrap
+	// 启动之间可能有并发审计刚建出根。
+	if err := e.ensureAuditRoot(); err != nil {
+		return RunResult{}, err
+	}
+	o.AuditRoot = e.auditRoot()
 
 	// 私有 DBus 总线：必须先起 daemon（要 socket 存在才能 bind），
 	// 且 --nofork 不能少——fork 模式下 --print-address 的父进程会先退出（§6.6）。
-	var dbusSess *dbusSession
-	if p.IsolateDBus {
-		sess, derr := e.startSessionBus(filepath.Join(in.Dir(), "dbus"))
-		if derr != nil {
-			// 降级为共享总线，但必须明确告知：静默共享会让用户以为"应用不支持分身"。
-			// （keyring 开启时不允许降级——那等于把宿主总线连同宿主 keyring 交给应用。）
-			if opt.Stderr != nil {
-				_, _ = io.WriteString(opt.Stderr, "appclone: 未启动私有 DBus 总线，将与主实例共用会话总线（可能无法双开）\n")
-			}
-		} else {
-			dbusSess = sess
-			o.DBusAddress = sess.Addr()
-			// bind 源用会话给出的真实 socket：路径过长时它不在 <inst>/dbus 下。
-			o.BusSock = sess.Sock()
-			// 应用侧地址是命名空间里的路径：AC_BASE 被 tmpfs 遮蔽后，宿主
-			// socket 路径在沙箱里不存在。
-			o.DBusAppAddress = AppDBusAddress(o.RuntimeDir)
-		}
+	// isolate_keyring 隐含 isolate_dbus（ADR-035）：keyring daemon 与 libsecret
+	// 都走私有总线。
+	dbusSess, berr := e.startRunBus(p, in, &o, opt.Stderr)
+	if berr != nil {
+		return RunResult{}, berr
 	}
 	if dbusSess != nil {
 		defer dbusSess.Stop()
+	}
+
+	// 独立 keyring daemon（ADR-035）：必须在私有总线就绪之后、应用启动之前。
+	// 退出顺序由 defer LIFO 写死：keyring 先停、dbus 后停、socket 最后删。
+	var keyringSess *keyringSession
+	if p.IsolateKeyring {
+		if err := e.checkKeyringCapability(); err != nil {
+			return RunResult{}, err
+		}
+		if err := e.EnsureKeyring(in); err != nil {
+			return RunResult{}, err
+		}
+		pw, err := readKeyringPassword(in)
+		if err != nil {
+			return RunResult{}, err
+		}
+		cap := e.keyringCaps()
+		sess, kerr := startKeyringDaemon(cap.Daemon, cap.DbusSend, o.DBusAddress, keyringDir(in), pw)
+		if kerr != nil {
+			return RunResult{}, kerr
+		}
+		keyringSess = sess
+		defer keyringSess.Stop()
 	}
 
 	// cwd 落在 AC_BASE 里（含软链解析）时回退 HOME：沙箱里 Base 已被 tmpfs
@@ -250,7 +267,50 @@ func (e *Env) Run(ctx context.Context, app, id string, opt RunOptions) (RunResul
 	pgid := cmd.Process.Pid
 	pgidCh <- pgid // 早到的 SIGTERM 在这里拿到目标，整组终止
 
+	// E6：daemon 意外退出时终止应用。应用先退出或用户 stop 时不判 3——
+	// watcher 先看 appDone/stopping，再看 Done，避免把正常停止误判成故障。
+	appDone := make(chan struct{})
+	// appExited 在 Wait 返回后、close(appDone) 前同步置位：watcher 用它区分
+	// "应用先退出"与"daemon 先死、应用随后也退出"——后者仍是故障（退出 3），
+	// 不能因为应用在 100ms 确认窗口内退出就放过。
+	var appExited atomic.Bool
+	var daemonErr atomic.Value
+	watchDaemon := func(name string, done <-chan struct{}) {
+		select {
+		case <-done:
+		case <-appDone:
+			return
+		}
+		if appExited.Load() {
+			return // 应用先退出：契约规定不算失败
+		}
+		if stopping.Load() {
+			return
+		}
+		// 用户按 Ctrl-C 时 SIGINT 同时送达 daemon 与本进程，信号 goroutine
+		// 可能还没被调度。给一个很短的确认窗口再判定，避免把用户主动停止
+		// 记成"daemon 意外死亡"（退出 3）。应用在窗口内退出**不**改变结论：
+		// daemon 先死就是故障。
+		select {
+		case <-appDone:
+		case <-time.After(100 * time.Millisecond):
+		}
+		if stopping.Load() {
+			return
+		}
+		daemonErr.Store(daemonDiedKeys[name])
+		terminateGroup(pgid)
+	}
+	if keyringSess != nil {
+		go watchDaemon("keyring_daemon", keyringSess.Done())
+	}
+	if dbusSess != nil {
+		go watchDaemon("dbus_daemon", dbusSess.Done())
+	}
+
 	waitErr := cmd.Wait()
+	appExited.Store(true)
+	close(appDone)
 
 	// 应用退出后，它 fork 出去的子进程仍可能活着：补一次组终止。
 	terminateGroup(pgid)
@@ -271,6 +331,14 @@ func (e *Env) Run(ctx context.Context, app, id string, opt RunOptions) (RunResul
 		ferr := audit.finish(code)
 		audit = nil // 置空让 defer 的 abort 不再执行
 		return ferr
+	}
+	// daemon 死亡优先于应用退出码：应用是被我们 terminateGroup 掉的，
+	// 它的 SIGTERM(143) 没有解释力，必须返回环境错误（退出码 3）。
+	if key, _ := daemonErr.Load().(string); key != "" {
+		if ferr := finishAudit(3); ferr != nil {
+			return res, ferr
+		}
+		return res, errEnv(key, nil, nil)
 	}
 	if waitErr != nil {
 		if ee, ok := waitErr.(*exec.ExitError); ok {
@@ -295,6 +363,41 @@ func (e *Env) Run(ctx context.Context, app, id string, opt RunOptions) (RunResul
 	}
 	_ = e.TouchLastUsed(app, id)
 	return res, nil
+}
+
+// startRunBus 按档案决定是否起私有总线，并处理两条不同的失败方向：
+//   - keyring 开启时**禁止降级**（P1）：回落到宿主总线等于把宿主 keyring
+//     交给应用，独立密钥环从根上失效；
+//   - 仅 dbus 时降级为共享宿主总线，但必须明确告知（静默共享会让用户以为
+//     "应用不支持分身"）。
+func (e *Env) startRunBus(p Profile, in Instance, o *BuildOptions, warn io.Writer) (*dbusSession, error) {
+	if !p.IsolateDBus && !p.IsolateKeyring {
+		return nil, nil
+	}
+	sess, derr := e.startSessionBus(filepath.Join(in.Dir(), "dbus"))
+	if derr != nil {
+		if p.IsolateKeyring {
+			return nil, newErr(CodeEnv, "err.env.keyring_requires_bus", nil, derr)
+		}
+		if warn != nil {
+			_, _ = io.WriteString(warn, "appclone: 未启动私有 DBus 总线，将与主实例共用会话总线（可能无法双开）\n")
+		}
+		return nil, nil
+	}
+	o.DBusAddress = sess.Addr()
+	// bind 源用会话给出的真实 socket：路径过长时它不在 <inst>/dbus 下。
+	o.BusSock = sess.Sock()
+	// 应用侧地址是命名空间里的路径：AC_BASE 被 tmpfs 遮蔽后，宿主
+	// socket 路径在沙箱里不存在。
+	o.DBusAppAddress = AppDBusAddress(o.RuntimeDir)
+	return sess, nil
+}
+
+// daemonDiedKeys 把 watcher 的名字映射到错误键。用映射而不是拼字符串：
+// i18n 门禁按字面量扫描错误键，动态拼接会漏检（也漏掉真正的缺文案）。
+var daemonDiedKeys = map[string]string{
+	"keyring_daemon": "err.env.keyring_daemon_died",
+	"dbus_daemon":    "err.env.dbus_daemon_died",
 }
 
 // 私有总线生命周期见 core/dbus_session.go（startSessionBus / dbusSession）：
