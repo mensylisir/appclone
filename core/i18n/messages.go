@@ -400,6 +400,7 @@ var messages = map[string]map[string]string{
 		"probe.profile.cache_path_dropped":           "缓存路径不隔离，已从档案中剔除",
 		"probe.profile.profile_conflict":             "同一路径出现在多个字段，已按规则合并",
 		"probe.profile.credential_rows_truncated":    "登录态读路径超过上限，只保留了前 100 条；可能还有未覆盖的凭据",
+		"probe.profile.exec_args_preserved":          "本次探测没有识别到新的启动参数，沿用档案里已有的启动参数",
 
 		// 桌面入口
 		"desktop.clone_name_suffix": "（分身 {name}）",
@@ -794,6 +795,7 @@ var messages = map[string]map[string]string{
 		"probe.profile.cache_path_dropped":           "Cache paths are not isolated and were removed from the profile",
 		"probe.profile.profile_conflict":             "The same path appeared in multiple fields; it was merged by rule",
 		"probe.profile.credential_rows_truncated":    "More than 100 login-state read paths were observed; only the first 100 were kept, so some credentials may be uncovered",
+		"probe.profile.exec_args_preserved":          "No new launch arguments were identified; the arguments already in the profile were kept",
 
 		"desktop.clone_name_suffix": " (Clone · {name})",
 

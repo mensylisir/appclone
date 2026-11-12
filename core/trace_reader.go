@@ -2,8 +2,11 @@ package core
 
 import (
 	"bytes"
+	"fmt"
 	"path/filepath"
 	"sort"
+	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -41,6 +44,12 @@ const traceReadLimit = 100000
 var traceReaderJoinTimeout = 2 * time.Second
 
 func newTraceReader(dir, home string, onStuck func()) (*traceReader, error) {
+	return newTraceReaderOpts(dir, home, onStuck, false)
+}
+
+// newTraceReaderOpts 允许兜底路径把 reader 设成“exec 只作证据”：记录
+// ExecCalls/ExecSeen/Execs，但不把 exec 目标追加到 Reads。
+func newTraceReaderOpts(dir, home string, onStuck func(), execEvidenceOnly bool) (*traceReader, error) {
 	fifo := filepath.Join(dir, "reads.fifo")
 	if err := syscall.Mkfifo(fifo, 0o600); err != nil {
 		return nil, errEnv("err.probe.trace_fifo", map[string]any{"path": fifo}, err)
@@ -55,11 +64,51 @@ func newTraceReader(dir, home string, onStuck func()) (*traceReader, error) {
 		stop: make(chan struct{}), done: make(chan struct{}),
 	}
 	r.res.keyringSeen = map[string]bool{}
+	r.res.execEvidenceOnly = execEvidenceOnly
 	go r.loop()
 	return r, nil
 }
 
 func (r *traceReader) path() string { return r.fifo }
+
+// markRound 在每轮 runner.Run 之前写入轮次标记行。reader 以 O_RDWR 持有
+// FIFO，这里另开 O_WRONLY|O_NONBLOCK 一次 write；前导换行切断上一轮可能
+// 留下的半行。写入失败是 best-effort：只计数并保持旧轮次，绝不阻塞 probe。
+func (r *traceReader) markRound(n int) {
+	if r == nil {
+		return
+	}
+	fd, err := syscall.Open(r.fifo, syscall.O_WRONLY|syscall.O_NONBLOCK|syscall.O_CLOEXEC, 0)
+	if err != nil {
+		r.dropRoundMarker()
+		return
+	}
+	defer syscall.Close(fd)
+	line := []byte(fmt.Sprintf("\n#appclone-round %d\n", n))
+	if nw, werr := syscall.Write(fd, line); werr != nil || nw != len(line) {
+		r.dropRoundMarker()
+	}
+}
+
+func (r *traceReader) dropRoundMarker() {
+	r.mu.Lock()
+	r.res.Stats.RoundMarkerDropped++
+	r.mu.Unlock()
+}
+
+// parseRoundMarker 识别 `#appclone-round n`（允许前后空白）。
+func parseRoundMarker(line string) (int, bool) {
+	line = strings.TrimSpace(line)
+	const prefix = "#appclone-round "
+	if !strings.HasPrefix(line, prefix) {
+		return 0, false
+	}
+	n, err := strconv.Atoi(strings.TrimSpace(line[len(prefix):]))
+	if err != nil || n < 0 {
+		return 0, false
+	}
+	return n, true
+}
 
 func (r *traceReader) loop() {
 	defer close(r.done)
@@ -117,11 +166,22 @@ func (r *traceReader) stopped() bool {
 func (r *traceReader) consume(line string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	// 标记行必须在 100k 上限判断之前识别：超过上限后仍要能切换轮次。
+	if n, ok := parseRoundMarker(line); ok {
+		r.res.round = n
+		return
+	}
 	if r.entries >= traceReadLimit {
 		// 已到上限：继续解析但丢弃路径结果，保证 FIFO 被排空、strace 不阻塞。
-		// sendmsg 证据与计数是**采集级**状态，必须带回 r.res：它们是上限之外
-		// 的独立口径，不能每行重置（方案 §6 D3）。
+		// exec/keyring 证据是**采集级**状态，必须带回 r.res：它们是上限之外
+		// 的独立口径，不能每行重置（方案 §6 D3 / ADR-036）。
 		sink := StraceResult{
+			Stats:               r.res.Stats,
+			ExecCalls:           deepCopyExecCalls(r.res.ExecCalls),
+			ExecSeen:            r.res.ExecSeen,
+			Execs:               append([]string(nil), r.res.Execs...),
+			execEvidenceOnly:    r.res.execEvidenceOnly,
+			round:               r.res.round,
 			keyringSeen:         r.res.keyringSeen,
 			keyringScanned:      r.res.keyringScanned,
 			KeyringHits:         r.res.KeyringHits,
@@ -131,6 +191,12 @@ func (r *traceReader) consume(line string) {
 		if len(sink.Reads)+len(sink.Writes) > 0 {
 			r.sizeHit = true
 		}
+		r.res.Stats = sink.Stats
+		r.res.ExecCalls = sink.ExecCalls
+		r.res.ExecSeen = sink.ExecSeen
+		r.res.Execs = sink.Execs
+		r.res.execEvidenceOnly = sink.execEvidenceOnly
+		r.res.round = sink.round
 		r.res.keyringSeen = sink.keyringSeen
 		r.res.keyringScanned = sink.keyringScanned
 		r.res.KeyringHits = sink.KeyringHits
@@ -172,10 +238,13 @@ func (r *traceReader) snapshot() StraceResult {
 		Reads:       append([]string{}, r.res.Reads...),
 		Writes:      append([]UpperEntry{}, r.res.Writes...),
 		Execs:       append([]string{}, r.res.Execs...),
+		ExecCalls:   deepCopyExecCalls(r.res.ExecCalls),
 		FlagsHidden: append([]string{}, r.res.FlagsHidden...),
 		Stats:       r.res.Stats,
+		round:       r.res.round,
 	}
 	out.ExecSeen = r.res.ExecSeen
+	out.execEvidenceOnly = r.res.execEvidenceOnly
 	out.KeyringHits = append([]string{}, r.res.KeyringHits...)
 	out.KeyringTraceDropped = r.res.KeyringTraceDropped
 	sort.Strings(out.Reads)

@@ -484,7 +484,7 @@ func (v *setupView) probe() {
 		// 闸门 2/3（fuse 降级、应用在跑）由 core.Probe 判定：降级不阻断，
 		// app_running 直接失败。自检与探测各写一套判据迟早会说不到一处去。
 		hints := v.u.env.StaticHints(ctx, d)
-		cmdline := append([]string{d.Exec}, d.ExecArgs...)
+		cmdline := core.ProbeCommand(d.Exec, d.ExecArgs, v.existing, v.hasExisting)
 		res, perr := v.u.env.Probe(ctx, v.appKey, core.ProbeOptions{
 			Command:     cmdline,
 			LockFile:    hints.LockFiles,
@@ -667,7 +667,7 @@ func (v *setupView) readsBannerParts() []string {
 		switch w {
 		case "credential_scope_narrowed", "credential_scope_unsupported",
 			"cache_credential", "cache_path_dropped", "profile_conflict",
-			"credential_rows_truncated":
+			"credential_rows_truncated", "exec_args_preserved":
 			parts = append(parts, v.u.tr("probe.profile."+w, nil))
 		}
 	}

@@ -64,6 +64,10 @@ type Profile struct {
 	// CredentialDropped 是本次派生中被收缩/丢弃的旧凭据路径（run-scoped，
 	// 不落盘）。`add --json` / GUI 详情用它说明"为什么某个登录态不再隔离"。
 	CredentialDropped []string `toml:"-"`
+	// execArgsFromEvidence 表示 ExecArgs 来自本次探测的 execve 证据（不落盘）。
+	// 重探时它决定“保留旧参数”还是“证据优先”，也用于判断是否要告警
+	// exec_args_preserved（ADR-036）。
+	execArgsFromEvidence bool `toml:"-"`
 }
 
 // Unsupported 是"根本不在文件路径上、这个方案隔离不了"的项（keyring 等）。

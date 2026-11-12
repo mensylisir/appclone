@@ -52,6 +52,7 @@ type probeReadState struct {
 	stats       StraceStats
 	execSeen    bool
 	execs       []string
+	execCalls   []ExecCall
 	traceErr    error
 	unclean     bool // 任一轮 ExitCode!=0（会话不干净，读证据不可信）
 
@@ -112,7 +113,7 @@ func (e *Env) newProbeReadState(ctx context.Context, traceDir string, opt ProbeO
 	if st.stderr == nil {
 		st.stderr = newProbeStderr(opt.Stderr)
 	}
-	r, rerr := newTraceReader(traceDir, e.Resolver.Home, e.markProbeReaderLeaked)
+	r, rerr := newTraceReaderOpts(traceDir, e.Resolver.Home, e.markProbeReaderLeaked, !st.readOK)
 	if rerr != nil {
 		if needWriteTrace {
 			// 兜底路径的写证据完全依赖这条 FIFO；没有它只能报环境错误，
@@ -180,9 +181,11 @@ func (st *probeReadState) writeSyscalls() []string {
 }
 
 // fallbackSyscalls 是读 ∪ 写（读不可用时只剩写列表）。顺序固定，golden 可断言。
+// execve/execveat 在兜底路径里仍要显式加入：自动预填依赖 exec 证据，而
+// writeSyscalls 不含它们。
 func (st *probeReadState) fallbackSyscalls() []string {
 	if !st.readOK {
-		return st.writeSyscalls()
+		return append(st.writeSyscalls(), "execve", "execveat")
 	}
 	out := st.readSyscalls()
 	seen := map[string]bool{}
@@ -241,6 +244,14 @@ func (st *probeReadState) writesSoFar() []UpperEntry {
 	return st.reader.snapshot().Writes
 }
 
+// markRound 在每轮 runner.Run 之前写轮次标记行；没有 reader 时 no-op。
+func (st *probeReadState) markRound(n int) {
+	if st == nil || st.reader == nil {
+		return
+	}
+	st.reader.markRound(n)
+}
+
 // checkRound 在每轮结束后检查会话期 stderr 与退出码。strace 的 stderr 可能
 // 在会话结束才被读完，所以 stop 之后还会再查一次。
 func (st *probeReadState) checkRound(res SessionResult) {
@@ -272,6 +283,7 @@ func (st *probeReadState) stop() {
 	st.stats = res.Stats
 	st.execSeen = res.ExecSeen
 	st.execs = res.Execs
+	st.execCalls = deepCopyExecCalls(res.ExecCalls)
 	st.keyringHits = res.KeyringHits
 	st.keyringDropped = res.KeyringTraceDropped
 	if err != nil {

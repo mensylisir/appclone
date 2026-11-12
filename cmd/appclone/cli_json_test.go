@@ -206,12 +206,13 @@ func TestDoctorJSONShape(t *testing.T) {
 func TestAddProbeEvidenceShape(t *testing.T) {
 	p := core.Profile{
 		ReadTrace:         core.ReadTracePartial,
+		ExecArgs:          []string{"--ozone-platform=x11"},
 		CredentialPaths:   []string{"~/.config/App/credentials.json"},
 		CredentialDropped: []string{"~/Downloads/token"},
 		Warnings:          []string{"credential_scope_unsupported"},
 	}
 	payload := map[string]any{}
-	addProbeEvidence(payload, []string{"parse_error", "no_fd_annotation"}, p)
+	addProbeEvidence(payload, []string{"parse_error", "no_fd_annotation"}, p, true)
 	warns, ok := payload["reads_warns"].([]string)
 	if !ok || len(warns) != 2 || warns[0] != "parse_error" || warns[1] != "no_fd_annotation" {
 		t.Fatalf("reads_warns 形状/顺序错：%#v", payload["reads_warns"])
@@ -220,8 +221,16 @@ func TestAddProbeEvidenceShape(t *testing.T) {
 	if !ok || len(dropped) != 1 || dropped[0] != "~/Downloads/token" {
 		t.Fatalf("credential_scope_narrowed 应携带丢弃路径：%#v", payload["credential_scope_narrowed"])
 	}
+	execArgs, ok := payload["exec_args"].([]string)
+	if !ok || len(execArgs) != 1 || execArgs[0] != "--ozone-platform=x11" {
+		t.Fatalf("exec_args 应携带自动预填参数：%#v", payload["exec_args"])
+	}
+	if unknown, ok := payload["self_relaunch_unknown"].(bool); !ok || !unknown {
+		t.Fatalf("self_relaunch_unknown 应为 true：%#v", payload["self_relaunch_unknown"])
+	}
+	// 空值不写键：保持 --json 的 omit-empty 约定（ADR-036）。
 	empty := map[string]any{}
-	addProbeEvidence(empty, nil, core.Profile{})
+	addProbeEvidence(empty, nil, core.Profile{}, false)
 	if len(empty) != 0 {
 		t.Fatalf("空值不应写键：%#v", empty)
 	}

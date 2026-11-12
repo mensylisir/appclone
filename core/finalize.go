@@ -66,6 +66,12 @@ func (e *Env) FinalizeProbe(app string, res ProbeResult, opt ProbeFinalize) (Pro
 		base = &opt.Bundled
 	}
 	p := e.Resolver.DeriveProfile(probe, base, method, res.ReadTrace, cands)
+	// 重探没有拿到新的 exec 证据时，exec_args 只能沿用旧档案；来源不可区分，
+	// 必须告警让用户知道“这次没有重新识别启动参数”（ADR-036）。
+	if opt.HasExisting && sameExecPath(opt.Existing.Exec, p.Exec) &&
+		len(opt.Existing.ExecArgs) > 0 && !res.Profile.execArgsFromEvidence {
+		p.Warnings = append(p.Warnings, "exec_args_preserved")
+	}
 	if len(p.Paths) == 0 {
 		// AllowEmpty 是 GUI 首次配置在读证据不可用时的降级确认页：只有确实
 		// 有"能进 paths"的行可勾选时才允许进入，否则页面是空的，用户会被
@@ -132,6 +138,8 @@ func (r *PathResolver) DeriveProfile(probe Profile, base *Profile, method, readT
 	p = MergeNonPathFieldsWith(r, p, effective)
 	p.Ignored = slices.Clone(effective.Ignored)
 	p.ReadTrace = readTrace
+	// 证据标志必须跟最终返回值一致：FinalizeProbe 用它判断是否告警。
+	p.execArgsFromEvidence = effective.execArgsFromEvidence
 
 	// 凭据继承与派生（§8.1 第 6 步，重探/取消勾选都走这一份并集）：
 	// 旧凭据适配到新 paths，再并入本次 checked 且有强证据的候选。

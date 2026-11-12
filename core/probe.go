@@ -75,6 +75,9 @@ type ProbeResult struct {
 	// 非零表示"未观测到 keyring"可能是证据不全，而不是应用真的不用——
 	// 必须可诊断，否则探测结论会静默降级。
 	KeyringTraceDropped int `json:"keyring_trace_dropped,omitempty"`
+	// SelfRelaunchUnknown 表示自动预填的 exec_args 只来自 RetKnown=false
+	// 的证据（`= ?` / `<unfinished>`）。run-scoped 诊断，只进 `add --json`。
+	SelfRelaunchUnknown bool `json:"self_relaunch_unknown,omitempty"`
 }
 
 const probeTimeoutDefault = 30 * time.Minute
@@ -308,6 +311,7 @@ func (e *Env) probeStrace(ctx context.Context, app string, opt ProbeOptions, run
 			fmt.Fprintf(opt.Stderr, "appclone: 第 %d/%d 轮 —— 请打开应用用一下，然后把它关掉\n", round+1, rounds)
 		}
 		sctx, cancel := context.WithTimeout(ctx, timeout)
+		trace.markRound(round)
 		res, runErr := runner.Run(sctx, trace.command(inner, true), trace.stderrWriter())
 		cancel()
 		if runErr != nil {
@@ -361,6 +365,17 @@ func (e *Env) probeStrace(ctx context.Context, app string, opt ProbeOptions, run
 		Ignored:   DefaultIgnored(),
 		LockFiles: e.lockHostPaths(locks),
 	}
+	// 自重启识别（ADR-036）：必须在 probe 构造之后、DeriveProfile 之前。
+	minRounds := 1
+	if rounds >= 2 {
+		minRounds = 2
+	}
+	sr := DetectSelfRelaunchArgs(opt.Command[0], opt.Command[1:], trace.execCalls, minRounds)
+	if sr.OK {
+		probe.ExecArgs = sr.Args
+		probe.execArgsFromEvidence = true
+	}
+	selfRelaunchUnknown := sr.OK && !sr.Known
 	// 默认策略（方案 §6）：只有 observed 且能力可用才默认开启。KeyringSet
 	// 保持 false——这是"探测默认"，不是用户显式选择，合并时既有档案优先。
 	if on, _ := e.keyringDefault(evidence); on {
@@ -392,6 +407,7 @@ func (e *Env) probeStrace(ctx context.Context, app string, opt ProbeOptions, run
 		ReadTrace:           trace.readTrace(),
 		KeyringEvidence:     evidence,
 		KeyringTraceDropped: trace.keyringDropped,
+		SelfRelaunchUnknown: selfRelaunchUnknown,
 	}, nil
 }
 
@@ -638,6 +654,7 @@ func (e *Env) probeSession(ctx context.Context, app string, opt ProbeOptions, mo
 		if opt.Stderr != nil && rounds > 1 {
 			fmt.Fprintf(opt.Stderr, "appclone: 第 %d/%d 轮 —— 请打开应用用一下，然后把它关掉\n", round+1, rounds)
 		}
+		trace.markRound(round)
 		r, runErr := runner.Run(sctx, trace.command(argv, false), trace.stderrWriter())
 		cancel()
 		if runErr != nil {
@@ -890,6 +907,17 @@ func (e *Env) probeSession(ctx context.Context, app string, opt ProbeOptions, mo
 		Ignored:   DefaultIgnored(),
 		LockFiles: e.lockHostPaths(locks),
 	}
+	// 自重启识别（ADR-036）：必须在 probe 构造之后、DeriveProfile 之前。
+	minRounds := 1
+	if rounds >= 2 {
+		minRounds = 2
+	}
+	sr := DetectSelfRelaunchArgs(opt.Command[0], opt.Command[1:], trace.execCalls, minRounds)
+	if sr.OK {
+		probe.ExecArgs = sr.Args
+		probe.execArgsFromEvidence = true
+	}
+	selfRelaunchUnknown := sr.OK && !sr.Known
 	// 默认策略（方案 §6）：observed 且能力可用才默认开启；KeyringSet=false
 	// 表示这是探测默认，合并时既有档案的显式选择优先。
 	if on, _ := e.keyringDefault(evidence); on {
@@ -923,6 +951,7 @@ func (e *Env) probeSession(ctx context.Context, app string, opt ProbeOptions, mo
 		ReadTrace:           trace.readTrace(),
 		KeyringEvidence:     evidence,
 		KeyringTraceDropped: trace.keyringDropped,
+		SelfRelaunchUnknown: selfRelaunchUnknown,
 	}, nil
 }
 

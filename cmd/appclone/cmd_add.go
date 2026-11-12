@@ -117,6 +117,10 @@ func newAddCmd(a *app) *cobra.Command {
 			// 证据扫描被上限截断时非零：没有观测到 keyring 不等于应用不用，
 			// 必须让脚本能区分"证据完整但没有"与"证据被截断"。
 			var keyringDropped int
+			// 自动预填的 exec_args 只来自 RetKnown=false 证据时置位（run-scoped
+			// 诊断，只进 --json）。必须声明在 needProfile 之外：两处 payload
+			// 都要用。
+			var selfRelaunchUnknown bool
 			needProfile := !hasProfile || !creatable || rediscover
 			if needProfile {
 				if !rediscover && hasProfile && !creatable {
@@ -135,7 +139,7 @@ func newAddCmd(a *app) *cobra.Command {
 				if lerr != nil {
 					return lerr
 				}
-				cmdline := append([]string{d.Exec}, d.ExecArgs...)
+				cmdline := core.ProbeCommand(d.Exec, d.ExecArgs, old, hasOld)
 				fmt.Fprintf(cmd.ErrOrStderr(),
 					"正在跟踪「%s」的写入：应用会被启动两次，每次用一下再关掉。\n", appKey)
 				// L0 先扫一遍：它的锁文件线索能让探测不再"零写入"——主实例
@@ -181,6 +185,7 @@ func newAddCmd(a *app) *cobra.Command {
 				readsWarns = res.ReadsWarns
 				keyringEvidence = res.KeyringEvidence
 				keyringDropped = res.KeyringTraceDropped
+				selfRelaunchUnknown = res.SelfRelaunchUnknown
 			} else if hasOld {
 				p = old
 			} else if p, err = a.env.LoadProfile(appKey); err != nil {
@@ -210,7 +215,7 @@ func newAddCmd(a *app) *cobra.Command {
 					"isolate_keyring": p.IsolateKeyring, "keyring_evidence": keyringEvidence,
 					"keyring_trace_dropped": keyringDropped,
 				}
-				addProbeEvidence(payload, readsWarns, p)
+				addProbeEvidence(payload, readsWarns, p, selfRelaunchUnknown)
 				a.ok(payload, func() {
 					fmt.Printf("已保存「%s」的隔离档案（%d 条路径，来源 %s），未创建分身。\n",
 						appKey, len(p.Paths), p.ProbeMethod)
@@ -230,7 +235,7 @@ func newAddCmd(a *app) *cobra.Command {
 				"isolate_keyring": p.IsolateKeyring, "keyring_evidence": keyringEvidence,
 				"keyring_trace_dropped": keyringDropped,
 			}
-			addProbeEvidence(payload, readsWarns, p)
+			addProbeEvidence(payload, readsWarns, p, selfRelaunchUnknown)
 			a.ok(payload, func() {
 				fmt.Printf("已创建「%s（分身 %s）」\n", appKey, in.DisplayName)
 				fmt.Printf("  桌面入口：%s\n", a.env.LauncherPath(in.App, in.ID))
@@ -255,13 +260,20 @@ func newAddCmd(a *app) *cobra.Command {
 
 // addProbeEvidence 把 run-scoped 的读证据字段加进 `--json` 输出。空值不写，
 // 避免脚本把"没有告警"误读成"告警字段为空数组"。
-func addProbeEvidence(payload map[string]any, readsWarns []string, p core.Profile) {
+func addProbeEvidence(payload map[string]any, readsWarns []string, p core.Profile, selfRelaunchUnknown bool) {
 	if len(readsWarns) > 0 {
 		payload["reads_warns"] = readsWarns
 	}
 	if len(p.CredentialDropped) > 0 {
 		// 字段名沿用契约：这里携带的是被收缩/丢弃的**旧凭据路径**，不是告警键。
 		payload["credential_scope_narrowed"] = p.CredentialDropped
+	}
+	if len(p.ExecArgs) > 0 {
+		// 空值不写键，保持 --json 的 omit-empty 约定；ADR-036 已注明。
+		payload["exec_args"] = append([]string{}, p.ExecArgs...)
+	}
+	if selfRelaunchUnknown {
+		payload["self_relaunch_unknown"] = true
 	}
 }
 

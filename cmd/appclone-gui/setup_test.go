@@ -98,13 +98,16 @@ func TestReadsBannerPartsStates(t *testing.T) {
 	v = &setupView{
 		u: u, state: "confirm", readTrace: core.ReadTracePartial,
 		profile: core.Profile{
-			Warnings:          []string{"credential_rows_truncated"},
+			Warnings:          []string{"credential_rows_truncated", "exec_args_preserved"},
 			CredentialDropped: []string{"~/Downloads/token"},
 		},
 	}
 	joined := strings.Join(v.readsBannerParts(), " · ")
 	if !strings.Contains(joined, u.tr("probe.profile.credential_rows_truncated", nil)) {
 		t.Fatalf("凭据行超限告警必须可见：%s", joined)
+	}
+	if !strings.Contains(joined, u.tr("probe.profile.exec_args_preserved", nil)) {
+		t.Fatalf("启动参数沿用告警必须可见：%s", joined)
 	}
 	if !strings.Contains(joined, "~/Downloads/token") {
 		t.Fatalf("被丢弃的旧凭据路径必须可见：%s", joined)

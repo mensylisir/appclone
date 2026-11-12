@@ -26,9 +26,23 @@ func MergeNonPathFields(p, base Profile) Profile {
 // lock_files 也以 base 为准（非空时）：维护者校对过的单例线索比本次 L0 静态
 // 线索完整，用探测结果整体替换会丢掉一条锁文件，单例检测随之退化。
 func MergeNonPathFieldsWith(r *PathResolver, p, base Profile) Profile {
-	if len(p.Exec) == 0 && base.Exec != "" {
+	// exec 的三态（ADR-036）：
+	//   1. 探测没给出 exec → 旧档案是唯一来源；
+	//   2. 本次探测有 execve 证据 → 证据参数优先，不能被旧档案盖回去；
+	//   3. 无证据但同 exec → 沿用旧档案参数（重探不能丢掉手工/上次预填的
+	//      --ozone-platform=x11 之类参数），并带上来源标志。
+	switch {
+	case len(p.Exec) == 0 && base.Exec != "":
 		p.Exec = base.Exec
 		p.ExecArgs = slices.Clone(base.ExecArgs)
+		p.execArgsFromEvidence = base.execArgsFromEvidence
+	case p.execArgsFromEvidence:
+		// 本次探测的证据参数保留。
+	case sameExecPath(p.Exec, base.Exec) && len(base.ExecArgs) > 0:
+		p.ExecArgs = slices.Clone(base.ExecArgs)
+		if base.execArgsFromEvidence {
+			p.execArgsFromEvidence = true
+		}
 	}
 	if len(base.LockFiles) > 0 {
 		p.LockFiles = slices.Clone(base.LockFiles)

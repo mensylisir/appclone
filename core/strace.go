@@ -7,6 +7,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 )
 
 // strace 解析（docs/discover.md §3.4、docs/tech-stack.md ADR-034）。
@@ -41,6 +42,21 @@ type StraceStats struct {
 	NoFDAnnotation     bool
 	Openat2FlagsHidden bool
 	SizeExceeded       bool
+	// ExecArgsSkipped 是 exec 目标可见但 argv 缺失/不可信而无法成为自重启
+	// 证据的条数。它不影响 read_trace：argv 只服务自动预填，不是读路径。
+	ExecArgsSkipped int
+	// RoundMarkerDropped 是轮次标记行写入失败的次数（best-effort，不影响
+	// read_trace；非零说明跨轮证据可能退化）。
+	RoundMarkerDropped int
+}
+
+// ExecCall 是一次成功（或返回值未知）的 execve/execveat 证据。
+// Args 含 argv[0]，与 Profile.ExecArgs（不含 argv[0]）不同；检测器负责剥离。
+type ExecCall struct {
+	Path     string
+	Args     []string
+	RetKnown bool
+	Round    int
 }
 
 // StraceResult 是一次解析的全部证据。
@@ -51,6 +67,8 @@ type StraceResult struct {
 	// T5 用它区分"应用根本没 exec"与"exec 了但零读写"（tracee_unverified）。
 	ExecSeen bool
 	Execs    []string
+	// ExecCalls 是自重启识别的原始证据（环形上限见 execCallLimit）。
+	ExecCalls []ExecCall
 	// FlagsHidden 是 openat2 flags 不可见、按读计入但**不参与凭据升级**的路径。
 	FlagsHidden []string
 	Stats       StraceStats
@@ -60,6 +78,13 @@ type StraceResult struct {
 	// KeyringTraceDropped 是超过扫描上限后被丢弃的 sendmsg 行数（计数，
 	// 不是布尔标记）。它不触发 size_exceeded：sendmsg 不产生路径条目。
 	KeyringTraceDropped int
+
+	// execEvidenceOnly 表示本轮只把 exec 当证据：记录 ExecCalls/ExecSeen/
+	// Execs，但不把 exec 目标追加到 Reads（兜底路径 readOK=false 时使用）。
+	execEvidenceOnly bool
+	// round 是当前轮次，唯一归属这里；traceReader.markRound 在锁内写，
+	// recordExecCall 读。ParseStraceAll 不写（保持 0）。
+	round int
 
 	// keyringSeen/keyringScanned 是扫描器的内部状态：去重键与已扫描行数。
 	// 不导出，避免调用方把它们当成结果的一部分。
@@ -81,9 +106,17 @@ func ParseStraceAll(r io.Reader, home string) StraceResult {
 		if line == "" {
 			continue
 		}
-		if strings.Contains(line, "<unfinished") || strings.Contains(line, " resumed>") {
-			// 多线程下 strace 会把一次调用拆成两行，拼起来太脆；计数并跳过，
-			// 最终由 parse_error 告警把"证据不完整"暴露给用户。
+		if strings.Contains(line, " resumed>") {
+			// 拆成两行的调用，前半行（<unfinished）若承载 exec 证据已由宽松
+			// 解析记录；resumed 行本身不重复计数。
+			continue
+		}
+		if strings.Contains(line, "<unfinished") {
+			// exec 的 argv 在 <unfinished 之前已经打印完，不能整行丢掉；
+			// 其他调用保持原有 ParseErrors 语义。
+			if parseLooseExecLine(line, &res) {
+				continue
+			}
 			res.Stats.ParseErrors++
 			continue
 		}
@@ -105,6 +138,12 @@ func parseStraceLineInto(line, home string, res *StraceResult, readSeen, writeSe
 		return
 	}
 	if c.parseErr {
+		if c.call == "execve" || c.call == "execveat" {
+			// `= ?` 或截断的 exec 行：argv 可能完整，交给宽松解析。
+			if parseLooseExecLine(line, res) {
+				return
+			}
+		}
 		res.Stats.ParseErrors++
 		return
 	}
@@ -202,15 +241,15 @@ type straceCall struct {
 	ret      int64
 	ann      string
 	parseErr bool
+	// retKnown 在宽松解析（`= ?` / `<unfinished>`）时为 false：调用发生过，
+	// 但返回值不可见，不能据此排除失败。
+	retKnown bool
 }
 
-// parseStraceLine 解析 `[pid ]call(args) = ret[<ann>][ errno]`。
-//
-// 行首可能是 `1234 `（-f）、`[pid 1234] `（-f 另一种形态）或时间戳；
-// 返回值后的 `<...>` 是 -y 的 fd 注解，路径本身可能含 `<`/`>`/`) = 3`，
-// 所以必须从 `call(` 起做引号感知的括号配对，不能从行尾反推。
-func parseStraceLine(line string) (straceCall, bool) {
-	s := line
+// callPrefix 剥离行首 pid/时间戳前缀，返回调用名、剩余整行（含参数）与
+// `(` 的下标。严格解析与宽松 exec 解析共用这一份前缀逻辑。
+func callPrefix(line string) (call, s string, open int, ok bool) {
+	s = line
 	// 行首 pid 前缀（纯数字 + 空格）或 [pid N]。
 	if strings.HasPrefix(s, "[pid ") {
 		if i := strings.Index(s, "] "); i > 0 {
@@ -226,12 +265,25 @@ func parseStraceLine(line string) (straceCall, bool) {
 		s = s[i+1:]
 	}
 	s = strings.TrimLeft(s, " ")
-	open := strings.IndexByte(s, '(')
+	open = strings.IndexByte(s, '(')
 	if open <= 0 {
-		return straceCall{}, false
+		return "", "", 0, false
 	}
-	call := s[:open]
+	call = s[:open]
 	if !validCallName(call) {
+		return "", "", 0, false
+	}
+	return call, s, open, true
+}
+
+// parseStraceLine 解析 `[pid ]call(args) = ret[<ann>][ errno]`。
+//
+// 行首可能是 `1234 `（-f）、`[pid 1234] `（-f 另一种形态）或时间戳；
+// 返回值后的 `<...>` 是 -y 的 fd 注解，路径本身可能含 `<`/`>`/`) = 3`，
+// 所以必须从 `call(` 起做引号感知的括号配对，不能从行尾反推。
+func parseStraceLine(line string) (straceCall, bool) {
+	call, s, open, ok := callPrefix(line)
+	if !ok {
 		return straceCall{}, false
 	}
 	closeIdx := matchParen(s, open)
@@ -265,7 +317,7 @@ func parseStraceLine(line string) (straceCall, bool) {
 			ann = tail[1:i]
 		}
 	}
-	return straceCall{call: call, args: args, ret: ret, ann: ann}, true
+	return straceCall{call: call, args: args, ret: ret, ann: ann, retKnown: true}, true
 }
 
 func allDigits(s string) bool {
@@ -520,12 +572,238 @@ func isWriteOpen(call, flags string) bool {
 	return false
 }
 
+// execCallLimit 是 ExecCall 环形上限：首条基线 + 最近 255 条。子进程会刷
+// 大量 execve，目标应用的自重启证据必须留在窗口里。
+const execCallLimit = 256
+
+// deepCopyExecCalls 复制证据并逐条 clone Args，供 snapshot 与 100k sink 共用。
+func deepCopyExecCalls(in []ExecCall) []ExecCall {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]ExecCall, len(in))
+	for i, c := range in {
+		out[i] = c
+		out[i].Args = append([]string(nil), c.Args...)
+	}
+	return out
+}
+
+// recordExecCall 记录一条 exec 证据。Path 必须是绝对路径（调用方已解析
+// dirfd/AT_EMPTY_PATH）；argv 解析失败时由调用方只计 ExecArgsSkipped。
+func recordExecCall(res *StraceResult, path string, argv []string, retKnown bool) {
+	if path == "" || !filepath.IsAbs(path) {
+		return
+	}
+	call := ExecCall{
+		Path:     stripDeleted(path),
+		Args:     append([]string(nil), argv...),
+		RetKnown: retKnown,
+		Round:    res.round,
+	}
+	if len(res.ExecCalls) < execCallLimit {
+		res.ExecCalls = append(res.ExecCalls, call)
+		return
+	}
+	// 保留首条基线，丢弃索引 1（最旧的“最近”条目），再追加新证据。
+	copy(res.ExecCalls[1:], res.ExecCalls[2:])
+	res.ExecCalls = res.ExecCalls[:len(res.ExecCalls)-1]
+	res.ExecCalls = append(res.ExecCalls, call)
+}
+
+// quotedArray 严格解析 strace 的 argv 数组 `["a", "b"]`。任何不确定都失败：
+// 自动预填会把结果写进档案，不能拿截断/非字符串内容当启动参数。
+func quotedArray(arg string) ([]string, bool) {
+	arg = strings.TrimSpace(arg)
+	if len(arg) < 2 || arg[0] != '[' || arg[len(arg)-1] != ']' {
+		return nil, false
+	}
+	body := strings.TrimSpace(arg[1 : len(arg)-1])
+	if body == "" {
+		return []string{}, true
+	}
+	var out []string
+	for {
+		body = strings.TrimLeft(body, " \t")
+		if body == "" || body[0] != '"' {
+			return nil, false
+		}
+		end := -1
+		for i := 1; i < len(body); i++ {
+			if body[i] == '\\' {
+				i++
+				continue
+			}
+			if body[i] == '"' {
+				end = i
+				break
+			}
+		}
+		if end < 0 {
+			return nil, false
+		}
+		v := unescapeStrace(body[1:end])
+		if !validExecArg(v) {
+			return nil, false
+		}
+		out = append(out, v)
+		body = strings.TrimLeft(body[end+1:], " \t")
+		if body == "" {
+			return out, true
+		}
+		if body[0] != ',' {
+			return nil, false
+		}
+		body = body[1:]
+	}
+}
+
+// validExecArg 拒绝会破坏 argv/档案的字符串：非法 UTF-8、NUL、控制字符、
+// 超过 512 字节的单参数。空字符串是合法 argv 元素。
+func validExecArg(s string) bool {
+	if len(s) > 512 || !utf8.ValidString(s) {
+		return false
+	}
+	for _, r := range s {
+		if r == 0 || (r < 0x20 && r != '\t') || r == 0x7f {
+			return false
+		}
+	}
+	return true
+}
+
+// execArgvFromParts 从已切分的参数里取 argv 数组：execve 是 parts[1]；
+// execveat 是 parts[1] 之后第一个以 `[` 开头的参数（通常是 parts[2]）。
+func execArgvFromParts(call string, parts []string) ([]string, bool) {
+	switch call {
+	case "execve":
+		if len(parts) >= 2 {
+			return quotedArray(parts[1])
+		}
+	case "execveat":
+		for _, p := range parts[2:] {
+			if strings.HasPrefix(strings.TrimSpace(p), "[") {
+				return quotedArray(p)
+			}
+		}
+	}
+	return nil, false
+}
+
+// looseExecArgs 从 `call(` 之后的文本里截出参数列表。宽松解析只用于
+// `= ?` 与 `<unfinished>`：它们可能没有 `) = ret`，但 argv 已经打印完。
+func looseExecArgs(rest string) string {
+	inQuote := false
+	depth := 0
+	for i := 0; i < len(rest); i++ {
+		c := rest[i]
+		if inQuote {
+			if c == '\\' {
+				i++
+				continue
+			}
+			if c == '"' {
+				inQuote = false
+			}
+			continue
+		}
+		if strings.HasPrefix(rest[i:], " <unfinished") {
+			return strings.TrimSpace(rest[:i])
+		}
+		switch c {
+		case '"':
+			inQuote = true
+		case '(', '[', '{':
+			depth++
+		case ')', ']', '}':
+			if c == ')' && depth == 0 {
+				return strings.TrimSpace(rest[:i])
+			}
+			if depth > 0 {
+				depth--
+			}
+		}
+	}
+	return ""
+}
+
+// parseLooseExecLine 解析 `= ?` / `<unfinished>` 的 exec 行。只记录
+// ExecCall（RetKnown=false）、ExecSeen/Execs，不追加 Reads、不计 ParseErrors。
+func parseLooseExecLine(line string, res *StraceResult) bool {
+	call, s, open, ok := callPrefix(line)
+	if !ok || (call != "execve" && call != "execveat") {
+		return false
+	}
+	args := looseExecArgs(s[open+1:])
+	if args == "" {
+		return false
+	}
+	parts := splitArgs(args)
+	var raw string
+	switch call {
+	case "execve":
+		if len(parts) == 0 {
+			return false
+		}
+		raw, _ = quoted(parts[0])
+	case "execveat":
+		if len(parts) < 2 {
+			return false
+		}
+		flags := ""
+		if len(parts) >= 4 {
+			flags = parts[len(parts)-1]
+		}
+		raw, _ = quoted(parts[1])
+		if raw == "" && execveatEmptyPath(flags) {
+			raw = argAnnotation(parts[0])
+		}
+	}
+	if raw == "" {
+		return false
+	}
+	raw = stripDeleted(raw)
+	if !filepath.IsAbs(raw) {
+		if call != "execveat" {
+			// execve 的相对路径依赖 cwd，无法可靠归属。
+			return false
+		}
+		base := argAnnotation(parts[0])
+		if !filepath.IsAbs(base) {
+			return false
+		}
+		raw = filepath.Join(base, raw)
+	}
+	res.ExecSeen = true
+	dup := false
+	for _, x := range res.Execs {
+		if x == raw {
+			dup = true
+			break
+		}
+	}
+	if !dup {
+		res.Execs = append(res.Execs, raw)
+	}
+	if argv, ok := execArgvFromParts(call, parts); ok {
+		recordExecCall(res, raw, argv, false)
+	} else {
+		res.Stats.ExecArgsSkipped++
+	}
+	return true
+}
+
 func parseReadCall(c straceCall, home string, res *StraceResult, seen map[string]bool) {
 	if c.ret < 0 {
 		return
 	}
 	var raw string
 	isExec := c.call == "execve" || c.call == "execveat"
+	var execArgv []string
+	execArgvOK := false
+	if isExec {
+		execArgv, execArgvOK = execArgvFromParts(c.call, splitArgs(c.args))
+	}
 	switch c.call {
 	case "open":
 		parts := splitArgs(c.args)
@@ -644,6 +922,17 @@ resolved:
 		}
 		if !dup {
 			res.Execs = append(res.Execs, raw)
+		}
+		if execArgvOK {
+			recordExecCall(res, raw, execArgv, c.retKnown)
+		} else {
+			// 没有可信 argv 的调用不能当基线，否则后续 delta 会把整串参数
+			// 误当成自重启追加项。只计数，不影响 read_trace。
+			res.Stats.ExecArgsSkipped++
+		}
+		if res.execEvidenceOnly {
+			// 兜底路径只把 exec 当证据，不把目标追加到 Reads。
+			return
 		}
 	}
 	rel, ok := homeRel(home, raw)
