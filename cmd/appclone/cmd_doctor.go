@@ -65,7 +65,10 @@ fuse 检查会在写层根建一个临时目录真挂一次 overlay，结束即�
 				o := a.env.BuildOptions()
 				o.RuntimeSocks = core.FilterExisting(core.RuntimeSocketCandidates(a.env.Resolver.XDG["RUNTIME_DIR"]))
 				if p.IsolateDBus {
+					// 宿主原文只用来触发 bus bind；真正写进沙箱的是应用侧
+					// 命名空间地址（AC_BASE 被 tmpfs 遮蔽后宿主路径不存在）。
 					o.DBusAddress = "unix:path=" + filepath.Join(in.Dir(), "dbus", "bus")
+					o.DBusAppAddress = core.AppDBusAddress(o.RuntimeDir)
 				}
 				argv, err := core.BwrapCommand(p, in, o)
 				if err != nil {
@@ -151,6 +154,11 @@ func (a *app) runVerify(cmd *cobra.Command, args []string) error {
 			fmt.Printf("覆盖范围：%s 之内的写入\n", coverage)
 		}
 	}
+	// warnings 必须始终是数组：JSON 消费方按 []string 解析，null 会直接失败。
+	warnings := v.Warnings
+	if warnings == nil {
+		warnings = []string{}
+	}
 	a.ok(map[string]any{
 		"conclusion":     v.Conclusion,
 		"coverage":       coverage,
@@ -159,6 +167,7 @@ func (a *app) runVerify(cmd *cobra.Command, args []string) error {
 		"ignored":        v.Ignored,
 		"retained":       v.Retained,
 		"reason":         v.Reason,
+		"warnings":       warnings,
 		"generated_at":   v.GeneratedAt,
 		"quarantine":     v.Quarantine,
 	}, func() {
@@ -233,6 +242,14 @@ func (a *app) runVerify(cmd *cobra.Command, args []string) error {
 		if len(v.Ignored) > 0 {
 			// §5：审计输出必须列出被忽略的类别，不许悄悄忽略。
 			fmt.Printf("已忽略的类别：%s\n", strings.Join(v.Ignored, "、"))
+		}
+		for _, w := range v.Warnings {
+			switch w {
+			case "masked_base_missing":
+				fmt.Println("警告：这份审计记录缺少 masked_base 字段（写入器异常或记录被手改），按旧语义判了 AC_BASE，结论方向仍然安全，但证据不完整。")
+			default:
+				fmt.Println("警告：" + w)
+			}
 		}
 	})
 	if code := v.ExitCode(); code != core.CodeOK {

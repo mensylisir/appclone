@@ -418,8 +418,9 @@ func TestProbeSessionRerunRebuildsLockAndBus(t *testing.T) {
 				case "--setenv":
 					if r.argv[i+1] == "DBUS_SESSION_BUS_ADDRESS" {
 						if p := strings.TrimPrefix(r.argv[i+2], "unix:path="); p != r.argv[i+2] {
-							busSock = p
-							if _, err := os.Stat(p); err != nil {
+							// --print-address 原文带 ",guid=..."，它不是路径的一部分。
+							busSock = strings.SplitN(p, ",", 2)[0]
+							if _, err := os.Stat(busSock); err != nil {
 								busMissing = true
 							}
 						}

@@ -46,6 +46,21 @@ func (e *Env) beginAudit(in Instance, p Profile) (*AuditSession, *AuditLayers, e
 	if err := e.quarantinePendingAudit(in); err != nil {
 		return nil, nil, err
 	}
+	// 写层根在 AC_BASE 里时，`--tmpfs Base` 会把它一起盖住（应用看不到，
+	// 工具自己也挂不上）；而且写层嵌在实例目录里等于把证据暴露给应用。
+	writeRoot := filepath.Join(e.tmpRoot(), "appclone", fmt.Sprintf("audit.%d", e.UID))
+	// 双向都拒：writeRoot 在 Base 下会被 `--tmpfs Base` 盖住；Base 在
+	// writeRoot 下会被 `--tmpfs WriteRoot` 连带遮掉（实例 bind 目标在
+	// 被遮的祖先下，审计会话起不来）。两边都取真实路径再比：tmpRoot
+	// （/tmp、$XDG_RUNTIME_DIR）或 AC_BASE 可能是软链，词法比较会漏判。
+	if base := Real(e.Base); base != "" {
+		wr := Real(writeRoot)
+		if wr == base || IsUnder(base, wr) || IsUnder(wr, base) {
+			return nil, nil, errInput("err.profile.base_exposure", map[string]any{
+				"path": writeRoot, "base": base, "field": "audit_write_root",
+			})
+		}
+	}
 	// 先用一条 finished_at 为空的"进行中"凭证顶掉上一轮 run.toml。
 	//
 	// 不能简单删除：如果这次审计在写层建起来之前就失败（mount/probePublicBinds/
@@ -113,6 +128,7 @@ func (e *Env) beginAudit(in Instance, p Profile) (*AuditSession, *AuditLayers, e
 	layers := &AuditLayers{
 		Merged:      filepath.Join(work, "merged"),
 		PublicBinds: pubs,
+		WriteRoot:   writeRoot,
 	}
 	return sess, layers, nil
 }
@@ -170,6 +186,7 @@ func (s *AuditSession) finish(exitCode int) error {
 		SharedBinds:   s.shared,
 		Paths:         paths,
 		Base:          s.base,
+		MaskedBase:    Real(s.base),
 		BindsRecorded: true,
 	}
 	return writeRunRecord(filepath.Join(audit, "run.toml"), rec)
@@ -222,17 +239,20 @@ func (s *AuditSession) detach() error {
 // 版本策略：目前只有 v1。读到 version 大于 ProfileVersion 的记录时，不能按
 // v1 的口径解释未知字段——见 Verify 对 rec.Version > ProfileVersion 的处理。
 type runRecord struct {
-	Version       int      `toml:"version"`
-	App           string   `toml:"app"`
-	ID            string   `toml:"id"`
-	StartedAt     string   `toml:"started_at"`
-	FinishedAt    string   `toml:"finished_at,omitempty"`
-	ExitCode      int      `toml:"exit_code"`
-	PublicBinds   []string `toml:"public_binds,omitempty"`
-	SharedBinds   []string `toml:"shared_binds,omitempty"`
-	Paths         []string `toml:"paths,omitempty"`
-	Base          string   `toml:"base,omitempty"`
-	BindsRecorded bool     `toml:"binds_recorded,omitempty"`
+	Version     int      `toml:"version"`
+	App         string   `toml:"app"`
+	ID          string   `toml:"id"`
+	StartedAt   string   `toml:"started_at"`
+	FinishedAt  string   `toml:"finished_at,omitempty"`
+	ExitCode    int      `toml:"exit_code"`
+	PublicBinds []string `toml:"public_binds,omitempty"`
+	SharedBinds []string `toml:"shared_binds,omitempty"`
+	Paths       []string `toml:"paths,omitempty"`
+	Base        string   `toml:"base,omitempty"`
+	// MaskedBase 是本次审计用 `--tmpfs` 遮蔽的 AC_BASE 真实路径（v1.0.3 起）。
+	// Base 下出现写入说明遮蔽没生效，verify 判 extract_failed 而不是普通 leak。
+	MaskedBase    string `toml:"masked_base,omitempty"`
+	BindsRecorded bool   `toml:"binds_recorded,omitempty"`
 }
 
 // complete 判定"这次审计正常跑完"。finished_at 是 finish 在应用退出之后才

@@ -175,6 +175,14 @@ func ProbeBackendKeyMissing(key string) bool {
 	return false
 }
 
+// warnProbeBus 在探测总线起不来时告诉用户：fail-closed 后应用拿不到会话
+// 总线，读证据可能不完整。不能静默——否则用户会以为"应用本来就不读配置"。
+func warnProbeBus(opt ProbeOptions) {
+	if opt.Stderr != nil {
+		fmt.Fprintln(opt.Stderr, "appclone: 未能启动私有 DBus 总线；探测期间应用拿不到会话总线，读证据可能不完整")
+	}
+}
+
 func (e *Env) probeStrace(ctx context.Context, app string, opt ProbeOptions, runner SessionRunner) (ProbeResult, error) {
 	if running, err := e.AppRunning(opt.Command[0]); err != nil {
 		return ProbeResult{}, err
@@ -214,7 +222,18 @@ func (e *Env) probeStrace(ctx context.Context, app string, opt ProbeOptions, run
 	if err := os.MkdirAll(traceDir, 0o700); err != nil {
 		return ProbeResult{}, errEnv("err.env.mkdir", map[string]any{"path": traceDir}, err)
 	}
-	bus, stopBus := e.startProbeBus(filepath.Join(work, "dbus"))
+	busDir := filepath.Join(work, "dbus")
+	bus := ""
+	sess, berr := e.startSessionBus(busDir)
+	var stopBus func()
+	if berr == nil && sess != nil {
+		bus = sess.Addr()
+		stopBus = sess.Stop
+	} else {
+		// fail-closed：总线起不来时注入不存在的私有地址，绝不回落到宿主总线。
+		warnProbeBus(opt)
+		bus = unavailableBusAddress(busDir)
+	}
 	if stopBus != nil {
 		// 用闭包而不是 defer stopBus()：重跑会换 work 并重启总线，
 		// defer 必须在返回时停**当前**那一个。
@@ -248,16 +267,17 @@ func (e *Env) probeStrace(ctx context.Context, app string, opt ProbeOptions, run
 	var last SessionResult
 	for round := 0; round < rounds; round++ {
 		inner, aerr := ProbeBwrapArgs(ProbeSpec{
-			Home:        e.Resolver.Home,
-			Base:        e.Base,
-			RuntimeDir:  runtimeDir,
-			RuntimeSock: probeRuntimeSocks(e.Resolver.XDG["RUNTIME_DIR"], runtimeDir),
-			DBusAddress: bus,
-			SharedWrite: e.probeSharedWrites(),
-			LockBinds:   locks,
-			TraceDir:    traceDir,
-			Command:     opt.Command,
-			NoOverlay:   true,
+			Home:         e.Resolver.Home,
+			Base:         e.Base,
+			RuntimeDir:   runtimeDir,
+			RuntimeSock:  probeRuntimeSocks(e.Resolver.XDG["RUNTIME_DIR"], runtimeDir),
+			DBusAddress:  bus,
+			HostBusPaths: e.hostBusPaths(),
+			SharedWrite:  e.probeSharedWrites(),
+			LockBinds:    locks,
+			TraceDir:     traceDir,
+			Command:      opt.Command,
+			NoOverlay:    true,
 		})
 		if aerr != nil {
 			return ProbeResult{}, aerr
@@ -492,7 +512,17 @@ func (e *Env) probeSession(ctx context.Context, app string, opt ProbeOptions, mo
 		}
 	}()
 
-	bus, stopBus := e.startProbeBus(filepath.Join(work, "dbus"))
+	busDir := filepath.Join(work, "dbus")
+	bus := ""
+	sess2, berr2 := e.startSessionBus(busDir)
+	var stopBus func()
+	if berr2 == nil && sess2 != nil {
+		bus = sess2.Addr()
+		stopBus = sess2.Stop
+	} else {
+		warnProbeBus(opt)
+		bus = unavailableBusAddress(busDir)
+	}
 	if stopBus != nil {
 		// 用闭包而不是 defer stopBus()：重跑会换 work 并重启总线，
 		// defer 必须在返回时停**当前**那一个。
@@ -548,18 +578,19 @@ func (e *Env) probeSession(ctx context.Context, app string, opt ProbeOptions, mo
 	defer func() { lockCleanup() }()
 
 	spec := ProbeSpec{
-		Home:        e.Resolver.Home,
-		Base:        e.Base,
-		Merged:      merged,
-		RuntimeDir:  filepath.Join(work, "runtime"),
-		RuntimeSock: probeRuntimeSocks(e.Resolver.XDG["RUNTIME_DIR"], filepath.Join(work, "runtime")),
-		DBusAddress: bus,
-		PublicBinds: pubBinds,
-		SharedWrite: e.probeSharedWrites(),
-		LockBinds:   locks,
-		Env:         probeGuardEnv(pubBinds),
-		TraceDir:    traceDir,
-		Command:     opt.Command,
+		Home:         e.Resolver.Home,
+		Base:         e.Base,
+		Merged:       merged,
+		RuntimeDir:   filepath.Join(work, "runtime"),
+		RuntimeSock:  probeRuntimeSocks(e.Resolver.XDG["RUNTIME_DIR"], filepath.Join(work, "runtime")),
+		DBusAddress:  bus,
+		HostBusPaths: e.hostBusPaths(),
+		PublicBinds:  pubBinds,
+		SharedWrite:  e.probeSharedWrites(),
+		LockBinds:    locks,
+		Env:          probeGuardEnv(pubBinds),
+		TraceDir:     traceDir,
+		Command:      opt.Command,
 	}
 	argv, err := ProbeBwrapArgs(spec)
 	if err != nil {
@@ -673,7 +704,15 @@ func (e *Env) probeSession(ctx context.Context, app string, opt ProbeOptions, mo
 			return ProbeResult{}, err
 		}
 		removed = false
-		bus, stopBus = e.startProbeBus(filepath.Join(work, "dbus"))
+		busDir = filepath.Join(work, "dbus")
+		bus, stopBus = "", nil
+		if s3, err3 := e.startSessionBus(busDir); err3 == nil && s3 != nil {
+			bus = s3.Addr()
+			stopBus = s3.Stop
+		} else {
+			warnProbeBus(opt)
+			bus = unavailableBusAddress(busDir)
+		}
 		locks, lockCleanup, err = e.probeLockBinds(work, opt.LockFile)
 		if err != nil {
 			if _, terr := teardown(false); terr != nil {
@@ -694,17 +733,18 @@ func (e *Env) probeSession(ctx context.Context, app string, opt ProbeOptions, mo
 		unmount = unmount2
 		isMounted = true
 		argv2, aerr := ProbeBwrapArgs(ProbeSpec{
-			Home:        e.Resolver.Home,
-			Base:        e.Base,
-			Merged:      merged,
-			RuntimeDir:  filepath.Join(work, "runtime"),
-			RuntimeSock: probeRuntimeSocks(e.Resolver.XDG["RUNTIME_DIR"], filepath.Join(work, "runtime")),
-			DBusAddress: bus,
-			PublicBinds: pubBinds,
-			SharedWrite: e.probeSharedWrites(),
-			LockBinds:   locks,
-			Env:         probeGuardEnv(pubBinds),
-			Command:     opt.Command,
+			Home:         e.Resolver.Home,
+			Base:         e.Base,
+			Merged:       merged,
+			RuntimeDir:   filepath.Join(work, "runtime"),
+			RuntimeSock:  probeRuntimeSocks(e.Resolver.XDG["RUNTIME_DIR"], filepath.Join(work, "runtime")),
+			DBusAddress:  bus,
+			HostBusPaths: e.hostBusPaths(),
+			PublicBinds:  pubBinds,
+			SharedWrite:  e.probeSharedWrites(),
+			LockBinds:    locks,
+			Env:          probeGuardEnv(pubBinds),
+			Command:      opt.Command,
 		})
 		if aerr != nil {
 			if _, terr := teardown(false); terr != nil {

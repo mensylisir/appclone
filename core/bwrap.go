@@ -12,11 +12,24 @@ import (
 // BuildBwrapArgs 是项目的事实核心（§3.1）。参数集与顺序都是契约：
 // 缺一项或调错顺序就算实现错误，golden 断言覆盖 argv 全序而不是"包含某参数"。
 //
-// 纯函数：不读环境变量、不探文件系统。存在性与权限由 PrepareBindTargets
-// 前置完成——这里 stat 一次就会让"能不能构造参数"依赖于运行时状态，
-// doctor 也就无法离线展示将要执行的命令。
+// 纯函数：不读环境变量。需要探测的路径（BaseReal、HostBusPaths、RuntimeSocks）
+// 由调用方在 BuildOptions 里给出——这里 stat 一次就会让"能不能构造参数"依赖
+// 于运行时状态，doctor 也就无法离线展示将要执行的命令。
 func BuildBwrapArgs(p Profile, in Instance, o BuildOptions) ([]string, error) {
 	if err := ValidateProfile(p, o); err != nil {
+		return nil, err
+	}
+	// 私有总线只有真的会生成 bind/setenv 时才算数。isolate_dbus 隐含
+	// runtime 隔离；总线启动失败（DBusAddress 为空）时退回共享宿主总线，
+	// 此时 runtime 目录仍然隔离，但宿主 bus 必须经 RuntimeSocks 绑回来。
+	needRuntime := p.IsolateRuntime || (p.IsolateDBus && o.DBusAddress != "")
+	// 校验 2（§3.1）：Base 不得等于或位于**tmpfs 之后**的任一 bind 目标之下，
+	// 也不得包含它们。runtime 目录与每个 socket 都是 tmpfs 之后才绑的：
+	// AC_BASE 若在 $XDG_RUNTIME_DIR/X11-unix 下，`--ro-bind-try` 会把整个
+	// X11-unix 目录绑回来，Base 连同实例数据/keyring 又被应用看见。
+	// 没有 runtime bind 时这些目标不存在，不能误拒（Base 落在 runtime 下是
+	// 合法的临时目录用法）。
+	if err := o.checkBaseVsLateBinds(needRuntime); err != nil {
 		return nil, err
 	}
 	paths, err := normalizePaths(p.Paths, o)
@@ -32,18 +45,47 @@ func BuildBwrapArgs(p Profile, in Instance, o BuildOptions) ([]string, error) {
 		"--proc", "/proc",
 	}
 
+	// ④.1 宿主会话总线遮蔽：`--bind / /` 会让 dbus-launch 之类放在 /tmp 的
+	// 宿主总线在沙箱里仍然可见，应用可以绕过私有总线连回宿主（进而触达宿主
+	// keyring）。只在私有总线**确实在跑**时遮蔽：总线启动失败走的是"降级为
+	// 共享宿主总线"，那时遮蔽等于把应用彻底断网。
+	// 用 `--bind` 而不是 `--bind-try`：清单已按"真实存在的 socket"过滤过
+	// （core/dbus_session.go，含软链解析），-try 的容错没有意义；stat 与 bwrap
+	// 之间 socket 消失的极小窗口可能留下 0444 占位文件，fail-closed 可接受。
+	if p.IsolateDBus && o.DBusAddress != "" {
+		for _, pth := range o.HostBusPaths {
+			args = append(args, "--bind", "/dev/null", pth)
+		}
+	}
+
 	// ④.5 审计层（§6.5）：只在 `run --audit` 时存在。顺序写死——
-	//   overlay 先罩住 HOME，再把**公共目录 / AC_BASE** 绑回真实位置，
+	//   overlay 先罩住 HOME，再把**公共目录**绑回真实位置，
 	//   最后才是 ⑤ 的实例私有目录。反过来（实例 bind 在前）会被公共目录的
 	//   bind 盖掉，应用数据反而落进 upper，verify 会把正常数据当越界。
+	//
+	//   AC_BASE 不再 bind 回真实位置：那样等于把实例目录（含其他分身的
+	//   keyring/密码/私有总线）重新递给应用。审计期应用不需要 AC_BASE，
+	//   run.toml/summary 由工具在沙箱外写。
 	if o.Audit != nil {
 		args = append(args, "--bind", o.Audit.Merged, o.Home)
 		for _, pb := range o.Audit.PublicBinds {
 			args = append(args, "--bind", pb.Src, pb.Dst)
 		}
-		if o.Base != "" {
-			args = append(args, "--bind", o.Base, o.Base)
-		}
+	}
+
+	// ④.6 AC_BASE 遮蔽：--bind / / 会把工具自己的运行时根（其他分身的数据、
+	// keyring、私有总线 socket）暴露给应用。tmpfs 只盖真实路径：bwrap 拒绝
+	// 在软链目标上挂载（Can't mount on symlink destination），解析一次后软链
+	// 自然被盖住。顺序必须在审计层之后、所有以 Base 为源的 bind 之前。
+	if base := o.baseReal(); base != "" {
+		args = append(args, "--tmpfs", base)
+	}
+
+	// ④.7 审计写层对应用不可见：分身 A 不该读到分身 B 的 upper 副本。
+	// 写层根在 XDG_RUNTIME_DIR 内时随后的 runtime bind 会覆盖它，tmpfs 冗余
+	// 但无害；golden 不断言该情形。
+	if o.Audit != nil && o.Audit.WriteRoot != "" {
+		args = append(args, "--tmpfs", o.Audit.WriteRoot)
 	}
 
 	// ⑤ 仅 paths 声明的目录，父先子后（normalizePaths 已给出全序）。
@@ -109,7 +151,6 @@ func BuildBwrapArgs(p Profile, in Instance, o BuildOptions) ([]string, error) {
 	// ⑨⑩ 私有 runtime / 私有 DBus 总线。isolate_dbus 隐含 isolate_runtime：
 	// 不隔离 runtime 时 <runtime> 是宿主 $XDG_RUNTIME_DIR，bwrap 会在宿主建 bus
 	// 占位文件，正好压住真实的 session bus socket（§3.1 ⑩）。
-	needRuntime := p.IsolateRuntime || (p.IsolateDBus && o.DBusAddress != "")
 	if needRuntime {
 		args = append(args,
 			// 源是实例目录（持久层），目标是命名空间里的宿主 runtime 路径。
@@ -119,8 +160,13 @@ func BuildBwrapArgs(p Profile, in Instance, o BuildOptions) ([]string, error) {
 			"--setenv", "XDG_RUNTIME_DIR", o.RuntimeDir, // 漏了这行，应用仍按旧值找 socket
 		)
 		for _, s := range o.RuntimeSocks {
-			// 私有总线时不能把宿主 bus 带进来：那等于把单例检测又接回宿主（§6.2）。
-			if p.IsolateDBus && filepath.Base(s.Src) == "bus" && filepath.Dir(filepath.Dir(s.Src)) == o.RuntimeDir {
+			// 私有总线**确实在跑**时不能把宿主 bus 带进来：那等于把单例检测
+			// 又接回宿主（§6.2）。总线启动失败（DBusAddress 为空）时是明确的
+			// 降级路径：必须把宿主 bus 绑回来，否则 runtime 目录被换成空目录后
+			// 应用继承的宿主地址指向一个不存在的 socket，工具却打印"共用总线"。
+			// 判据是"直接位于宿主 runtime 下的 bus"；旧写法取了两级 Dir，
+			// 对 /run/user/1000/bus 永远不成立（二级 Dir 是 /run/user）。
+			if p.IsolateDBus && o.DBusAddress != "" && filepath.Base(s.Src) == "bus" && filepath.Dir(s.Src) == o.RuntimeDir {
 				continue
 			}
 			// 只读、只 bind socket/目录本身：把整个 $XDG_RUNTIME_DIR 带进来
@@ -129,9 +175,17 @@ func BuildBwrapArgs(p Profile, in Instance, o BuildOptions) ([]string, error) {
 		}
 	}
 	if p.IsolateDBus && o.DBusAddress != "" {
+		appAddr := o.DBusAppAddress
+		if appAddr == "" {
+			appAddr = o.DBusAddress
+		}
+		sock := o.BusSock
+		if sock == "" {
+			sock = filepath.Join(in.Dir(), "dbus", "bus")
+		}
 		args = append(args,
-			"--bind", filepath.Join(in.Dir(), "dbus", "bus"), filepath.Join(o.RuntimeDir, "bus"),
-			"--setenv", "DBUS_SESSION_BUS_ADDRESS", o.DBusAddress,
+			"--bind", sock, filepath.Join(o.RuntimeDir, "bus"),
+			"--setenv", "DBUS_SESSION_BUS_ADDRESS", appAddr,
 		)
 	}
 
@@ -160,6 +214,14 @@ func BuildBwrapArgs(p Profile, in Instance, o BuildOptions) ([]string, error) {
 			return nil, err
 		}
 		cwd = abs
+	}
+	// cwd 落在 AC_BASE 里时，沙箱内的 Base 已被 tmpfs 遮蔽，chdir 必失败。
+	// 这里只做词法比较（本函数不探文件系统）；core.Run 会在调用前用 Real
+	// 再兜一次，doctor 与 run 因此打印/执行同一条命令。
+	if base := o.baseReal(); base != "" {
+		if c := filepath.Clean(cwd); c == base || IsUnder(base, c) {
+			cwd = o.Home
+		}
 	}
 	args = append(args, "--chdir", cwd)
 

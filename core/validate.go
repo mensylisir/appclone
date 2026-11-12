@@ -23,9 +23,22 @@ type BuildOptions struct {
 	Home         string        // 有效 HOME：AC_HOME 或 RealHome
 	UID          int
 	Base         string     // AC_BASE 绝对路径
+	BaseReal     string     // AC_BASE 的真实路径（EvalSymlinks；空时退回 Base）
 	RuntimeDir   string     // 宿主 XDG_RUNTIME_DIR
 	RuntimeSocks []BindPair // 已探测存在的宿主 socket → 私有 runtime 内目标（只读）
 	DBusAddress  string     // dbus-daemon --print-address 原文；空 = 不隔离
+	// DBusAppAddress 是写进沙箱的地址（命名空间内路径，已按 D-Bus 规则转义）。
+	// 空时退回 DBusAddress（探测会话不遮 AC_BASE，仍可用宿主原文）。
+	DBusAppAddress string
+	// BusSock 是 dbus-daemon 实际监听的 socket（宿主路径）。空时按实例目录
+	// 约定拼 <inst>/dbus/bus；socket 路径过长时会退到短目录，必须用会话给出
+	// 的真实路径（core/dbus_session.go 的 busSocketPath）。
+	BusSock string
+	// HostBusPaths 是宿主会话总线的 unix socket 路径（DBUS_SESSION_BUS_ADDRESS
+	// 里所有 unix:path= 条目，已按 D-Bus 规则解码、去重）。私有总线在跑时
+	// 逐个用 /dev/null 遮蔽：`--bind / /` 会让 /tmp/dbus-XXXX 之类的宿主总线
+	// 在沙箱里仍可连，应用能绕过私有总线。
+	HostBusPaths []string
 	XDG          map[string]string
 	// Audit 非空时在 ④ 与 ⑤ 之间插入审计层（只有 `run --audit` 会设置它）。
 	Audit *AuditLayers
@@ -60,6 +73,11 @@ func ValidateProfile(p Profile, o BuildOptions) error {
 	if strings.TrimSpace(p.Exec) == "" {
 		return errInput("err.profile.no_exec", map[string]any{"app": p.App})
 	}
+	// HOME/真实 HOME/runtime/XDG 根落在 AC_BASE 里时，`--tmpfs Base` 会把
+	// 它们自己盖掉（实例目录、keyring、私有总线全在 Base 下），运行必坏。
+	if err := checkBaseContainers(o); err != nil {
+		return err
+	}
 	if !filepath.IsAbs(p.Exec) {
 		return errInput("err.profile.exec_relative", map[string]any{"exec": p.Exec})
 	}
@@ -92,6 +110,9 @@ func ValidateProfile(p Profile, o BuildOptions) error {
 		if err != nil {
 			return err
 		}
+		if err := checkBaseContained(abs, o, "lock_files"); err != nil {
+			return err
+		}
 		for _, sk := range p.Sockets {
 			sabs, err := o.expand(sk)
 			if err != nil {
@@ -114,6 +135,11 @@ func ValidateProfile(p Profile, o BuildOptions) error {
 		}
 		if !filepath.IsAbs(src) {
 			return errInput("err.profile.extra_bind_relative", map[string]any{"src": b.Src})
+		}
+		// 源同样要查：`--bind "$HOME" /mnt/home` 会让应用经 /mnt/home/...
+		// 重新读到 AC_BASE（实例数据、keyring、私有总线 socket）。
+		if err := checkBaseExposure(src, o, "extra_binds"); err != nil {
+			return err
 		}
 		if err := checkDangerous(dst, o, "extra_binds"); err != nil {
 			return err
@@ -196,6 +222,17 @@ func ValidateProfile(p Profile, o BuildOptions) error {
 					"path": pabs, "other": sabs,
 				})
 			}
+		}
+	}
+	// shared_writes 的源会被 --bind-try 原样绑回真实位置：源是 Base 的祖先
+	// （如 `$HOME/.local/share`）时，应用经共享项重新读到实例目录。
+	for _, sw := range p.SharedWrites {
+		sabs, err := o.expand(sw)
+		if err != nil {
+			return err
+		}
+		if err := checkBaseExposure(sabs, o, "shared_writes"); err != nil {
+			return err
 		}
 	}
 	return nil
@@ -347,9 +384,14 @@ func checkDangerous(abs string, o BuildOptions, field string) error {
 	// AC_BASE 及其之下：把分身自己的运行时根写进 paths 会让 bind 自指
 	// （instances/<app>/<id>/root 变成它自己的子目录）。paths 已经过 Expand
 	// （真实形态），自定义 AC_BASE 若是软链，词法比较会漏判。
+	//
+	// 只拒「等于 / 之下」，**不拒祖先**：`--bind <inst>/root/<path> <path>`
+	// 把目标替换成实例数据，Base 在沙箱里仍被 tmpfs 遮住；祖先形态是合法档案
+	// （fork 的 lower/upper 边界用例依赖它）。真正会暴露 Base 的是绑定**源**，
+	// 见 checkBaseExposure。
 	if o.Base != "" {
 		for _, base := range []string{o.Base, Real(o.Base)} {
-			if IsUnder(base, abs) {
+			if abs == base || IsUnder(base, abs) {
 				return errInput("err.profile.base_path", map[string]any{"path": abs, "field": field})
 			}
 		}
@@ -360,6 +402,130 @@ func checkDangerous(abs string, o BuildOptions, field string) error {
 	for _, pd := range o.protectedDirs() {
 		if abs == pd || IsUnder(abs, pd) {
 			return errInput("err.profile.protected_path", map[string]any{"path": abs, "field": field})
+		}
+	}
+	return nil
+}
+
+// baseReal 返回 AC_BASE 的真实路径。BaseReal 未填时（测试或直接构造
+// BuildOptions 的调用方）退回词法 Base；两者都空时返回 ""。
+func (o BuildOptions) baseReal() string {
+	if o.BaseReal != "" {
+		return filepath.Clean(o.BaseReal)
+	}
+	if o.Base == "" {
+		return ""
+	}
+	return filepath.Clean(o.Base)
+}
+
+// checkBaseExposure 拒绝能把 AC_BASE 重新带回命名空间的 bind **源**。
+// 三向都拒：等于、祖先（`--bind "$HOME" /mnt/home` 会经 /mnt/home/...
+// 读到实例目录）、子孙（直接指到 keyring/密码）。
+//
+// 只用于源，不用于 bind 目标：目标被替换成 bind 的内容，Base 仍被 tmpfs
+// 遮住；对目标做祖先拒绝会误杀合法档案。
+func checkBaseExposure(abs string, o BuildOptions, field string) error {
+	base := o.baseReal()
+	if base == "" {
+		return nil
+	}
+	for _, cand := range []string{filepath.Clean(abs), Real(abs)} {
+		if cand == base || IsUnder(cand, base) || IsUnder(base, cand) {
+			return errInput("err.profile.base_exposure", map[string]any{
+				"path": abs, "base": base, "field": field,
+			})
+		}
+	}
+	return nil
+}
+
+// checkBaseContained 只拒「等于 / 位于 Base 之下」：这类目标在沙箱里已被
+// tmpfs 盖住，bind 会失败或写进虚空，必须在档案阶段就拒绝。
+func checkBaseContained(abs string, o BuildOptions, field string) error {
+	base := o.baseReal()
+	if base == "" {
+		return nil
+	}
+	for _, cand := range []string{filepath.Clean(abs), Real(abs)} {
+		if cand == base || IsUnder(base, cand) {
+			return errInput("err.profile.base_exposure", map[string]any{
+				"path": abs, "base": base, "field": field,
+			})
+		}
+	}
+	return nil
+}
+
+// checkBaseContainers 拒绝把 HOME / 真实 HOME / runtime / 任一 XDG 根
+// 放在 AC_BASE 里（等于或子孙）。它们是 Base 的**祖先**时是正常默认布局
+// （AC_BASE=$HOME/.local/share/appclone），不能误拒。
+func checkBaseContainers(o BuildOptions) error {
+	base := o.baseReal()
+	if base == "" {
+		return nil
+	}
+	cands := []struct {
+		field string
+		path  string
+	}{
+		{"home", o.Home},
+		{"real_home", o.RealHome},
+		{"runtime", o.RuntimeDir},
+	}
+	for k, d := range o.XDG {
+		cands = append(cands, struct {
+			field string
+			path  string
+		}{"xdg_" + strings.ToLower(k), d})
+	}
+	for _, c := range cands {
+		if c.path == "" {
+			continue
+		}
+		for _, cand := range []string{filepath.Clean(c.path), Real(c.path)} {
+			if cand == base || IsUnder(base, cand) {
+				return errInput("err.profile.base_exposure", map[string]any{
+					"path": c.path, "base": base, "field": c.field,
+				})
+			}
+		}
+	}
+	return nil
+}
+
+// checkBaseVsLateBinds 实现方案 §3.1 的校验 2：AC_BASE 不得与 tmpfs 之后
+// 才绑定的 runtime 目标/宿主 socket 重叠（任一方向）。
+//
+// 典型事故：AC_BASE=$XDG_RUNTIME_DIR/X11-unix/appclone。`--tmpfs Base` 之后
+// 紧跟着 `--ro-bind-try $XDG_RUNTIME_DIR/X11-unix`（整个目录），Base 连同
+// 实例数据、keyring、私有总线又被应用看见。宁可在档案阶段报 2，也不静默
+// 过滤 socket——过滤会让某个分身的输入法/剪贴板悄悄失效，用户无从得知。
+//
+// needRuntime 为假时 BuildBwrapArgs 根本不生成这些 bind（不隔离 runtime/dbus
+// 的普通档案），此时把 AC_BASE 放进 $XDG_RUNTIME_DIR 是合法的，不能误拒。
+func (o BuildOptions) checkBaseVsLateBinds(needRuntime bool) error {
+	base := o.baseReal()
+	if base == "" || !needRuntime {
+		return nil
+	}
+	var targets []string
+	if o.RuntimeDir != "" {
+		targets = append(targets, o.RuntimeDir, filepath.Join(o.RuntimeDir, "bus"))
+	}
+	for _, s := range o.RuntimeSocks {
+		targets = append(targets, s.Src, s.Dst)
+	}
+	for _, t := range targets {
+		if t == "" {
+			continue
+		}
+		for _, cand := range []string{filepath.Clean(t), Real(t)} {
+			if cand == base || IsUnder(cand, base) || IsUnder(base, cand) {
+				return errInput("err.profile.base_exposure", map[string]any{
+					"path": t, "base": base, "field": "runtime_socks",
+				})
+			}
 		}
 	}
 	return nil

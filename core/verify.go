@@ -31,6 +31,7 @@ type Verdict struct {
 	Ignored     []string `json:"ignored"`
 	Retained    bool     `json:"retained"`               // 越界时证据必须留着，否则等于销毁用户数据
 	Reason      string   `json:"reason,omitempty"`       // unverified 的原因，如 audit_not_enabled
+	Warnings    []string `json:"warnings,omitempty"`     // 结论有效但需要提示的异常（如 masked_base_missing）
 	GeneratedAt string   `json:"generated_at,omitempty"` // 重放已存摘要时带上它，用户才知道结论有多旧
 	Quarantine  string   `json:"quarantine,omitempty"`   // 越界证据被搬到哪里（空 = 没有搬）
 }
@@ -297,6 +298,7 @@ func (e *Env) finalize(app, id string, p Profile, v Verdict) (Verdict, error) {
 		Retained:    v.Retained,
 		GeneratedAt: time.Now().UTC().Format(time.RFC3339),
 		Reason:      v.Reason,
+		Warnings:    v.Warnings,
 		Quarantine:  v.Quarantine,
 	}
 	var buf bytes.Buffer
@@ -329,6 +331,9 @@ type Summary struct {
 	Retained    bool     `toml:"evidence_retained"`
 	GeneratedAt string   `toml:"generated_at,omitempty"`
 	Reason      string   `toml:"reason,omitempty"`
+	// Warnings 与 Verdict.Warnings 同义：重放时不能丢（masked_base_missing
+	// 只在新跑时出现、重放就消失，等于把异常藏起来）。
+	Warnings []string `toml:"warnings,omitempty"`
 	// Quarantine 是证据被搬到的位置（绝对路径）。重放时用户必须能据此找回文件，
 	// 否则摘要只告诉他"泄漏了"，却不说东西在哪。
 	Quarantine string `toml:"quarantine,omitempty"`
@@ -342,6 +347,7 @@ func (s Summary) Verdict() Verdict {
 		Ignored:     s.Ignored,
 		Retained:    s.Retained,
 		Reason:      s.Reason,
+		Warnings:    s.Warnings,
 		GeneratedAt: s.GeneratedAt,
 		Quarantine:  s.Quarantine,
 	}
@@ -414,6 +420,9 @@ func (e *Env) judge(p Profile, entries []UpperEntry, rec *runRecord) Verdict {
 	//    文件路径上，用路径判定没有意义）。
 	//  ③ 其余 → 越界。
 	var mustBind, allowed []string
+	// 新记录缺 masked_base（写入器异常或手改）时仍按 Base 判 extract_failed，
+	// 但要让用户看见"这份证据不完整"。
+	maskedMissing := false
 	expandInto := func(dst *[]string, list []string) {
 		for _, raw := range list {
 			if abs, err := e.Resolver.Expand(raw); err == nil {
@@ -439,8 +448,23 @@ func (e *Env) judge(p Profile, entries []UpperEntry, rec *runRecord) Verdict {
 		// 凭空产生的 extract_failed，会让审计永远作废。
 		mustBind = append(mustBind, rec.PublicBinds...)
 		mustBind = append(mustBind, rec.SharedBinds...)
-		if rec.Base != "" {
-			mustBind = append(mustBind, rec.Base)
+		// AC_BASE 现在是 `--tmpfs` 遮蔽路径，不再是 bind：Base 下出现写入
+		// 说明遮蔽没生效。新记录用 MaskedBase；异常缺字段时退回 Base，
+		// 方向仍是 extract_failed（不能掉成普通 leak），并记一条 warning。
+		if rec.MaskedBase != "" {
+			mustBind = append(mustBind, rec.MaskedBase)
+		} else {
+			// 新格式却没有 masked_base：写入器异常或手改凭证。方向必须是
+			// extract_failed（"作废后重审"），不能掉成 leak-detected（"重新
+			// 探测"）。两者都空时用当前 e.Base 兜底，并始终给出 warning——
+			// 静默会让用户回看摘要时看不到这次异常。
+			maskedMissing = true
+			switch {
+			case rec.Base != "":
+				mustBind = append(mustBind, rec.Base)
+			case e.Base != "":
+				mustBind = append(mustBind, e.Base)
+			}
 		}
 	} else {
 		// 老格式（没有 binds_recorded）或单测：退回按档案推断。这条回退是
@@ -449,7 +473,11 @@ func (e *Env) judge(p Profile, entries []UpperEntry, rec *runRecord) Verdict {
 		expandInto(&mustBind, p.Paths)
 		expandInto(&mustBind, p.SharedWrites)
 		mustBind = append(mustBind, e.Resolver.PublicDirs()...)
-		if e.Base != "" {
+		// 旧记录若写了 base，用它：AC_BASE 改过之后按当前 e.Base 重放会
+		// 漏判旧审计里的 Base 写入。没写才退回当前值。
+		if rec != nil && rec.Base != "" {
+			mustBind = append(mustBind, rec.Base)
+		} else if e.Base != "" {
 			mustBind = append(mustBind, e.Base)
 		}
 	}
@@ -479,6 +507,9 @@ func (e *Env) judge(p Profile, entries []UpperEntry, rec *runRecord) Verdict {
 		Coverage:   []string{e.Resolver.Home},
 		Violations: []string{},
 		Ignored:    p.Ignored,
+	}
+	if maskedMissing {
+		v.Warnings = append(v.Warnings, "masked_base_missing")
 	}
 	seen := map[string]bool{}
 	var extractFailed []string
@@ -516,6 +547,7 @@ func (e *Env) judge(p Profile, entries []UpperEntry, rec *runRecord) Verdict {
 			Ignored:    p.Ignored,
 			Retained:   true,
 			Reason:     "extract_failed",
+			Warnings:   v.Warnings,
 		}
 	}
 	if len(leaked) > 0 {

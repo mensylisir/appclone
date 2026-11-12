@@ -8,10 +8,10 @@ import (
 	"testing"
 )
 
-// 审计层必须落在 ④ 与 ⑤ 之间：overlay 罩住 HOME、公共目录与 AC_BASE 绑回真实，
-// 然后才是实例私有目录。顺序错了会出现两种事故：
+// 审计层必须落在 ④ 与 ⑤ 之间：overlay 罩住 HOME、公共目录绑回真实，
+// 再用 tmpfs 遮蔽 AC_BASE，然后才是实例私有目录。顺序错了会出现两种事故：
 //   - 实例 bind 在前 → 被公共目录 bind 盖掉，应用数据落进 upper，verify 误报越界；
-//   - AC_BASE 不 bind → 工具自己的写入进 upper，最后一并进 quarantine。
+//   - AC_BASE 不遮蔽 → 工具自己的写入进 upper，最后一并进 quarantine。
 func TestBuildBwrapArgsAuditLayerOrder(t *testing.T) {
 	e := testEnv(t)
 	app, p := seedApp(t, e)
@@ -26,6 +26,7 @@ func TestBuildBwrapArgsAuditLayerOrder(t *testing.T) {
 			Src: filepath.Join(e.Resolver.RealHome, "Downloads"),
 			Dst: filepath.Join(e.Resolver.Home, "Downloads"),
 		}},
+		WriteRoot: "/var/tmp/appclone/audit.0",
 	}
 	argv, err := BwrapCommand(p, in, o)
 	if err != nil {
@@ -36,7 +37,11 @@ func TestBuildBwrapArgsAuditLayerOrder(t *testing.T) {
 		"--proc /proc",
 		"--bind " + o.Audit.Merged + " " + e.Resolver.Home,
 		"--bind " + filepath.Join(e.Resolver.RealHome, "Downloads") + " " + filepath.Join(e.Resolver.Home, "Downloads"),
-		"--bind " + e.Base + " " + e.Base,
+		// AC_BASE 不再 bind 回真实位置，改为 tmpfs 遮蔽：顺序在审计 bind 之后、
+		// 实例 bind 之前，否则要么被 overlay 盖回来，要么把实例数据暴露给应用。
+		"--tmpfs " + o.BaseReal,
+		// 审计写层根对应用不可见：分身 A 不该读到分身 B 的 upper 副本。
+		"--tmpfs " + o.Audit.WriteRoot,
 	}
 	at := 0
 	for _, want := range order {

@@ -8,9 +8,9 @@ import (
 	"time"
 )
 
-// startPrivateDBus 等 --print-address 必须有界：daemon 卡住不输出时，
+// startSessionBus 等 --print-address 必须有界：daemon 卡住不输出时，
 // 整个 run 会停在 setup，信号泵拿不到 pgid，分身变成"停不掉也起不来"。
-func TestPrivateDBusAddressTimeout(t *testing.T) {
+func TestSessionBusAddressTimeout(t *testing.T) {
 	e := testEnv(t)
 	seedInstance(t, e)
 	in, err := e.GetInstance("testapp", "main")
@@ -27,7 +27,7 @@ func TestPrivateDBusAddressTimeout(t *testing.T) {
 	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
 
 	begin := time.Now()
-	_, _, err = e.startPrivateDBus(in)
+	_, err = e.startSessionBus(filepath.Join(in.Dir(), "dbus"))
 	elapsed := time.Since(begin)
 
 	var ce *Error

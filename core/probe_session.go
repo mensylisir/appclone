@@ -1,14 +1,11 @@
 package core
 
 import (
-	"bufio"
 	"context"
-	"errors"
 	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strings"
 	"syscall"
 	"time"
 )
@@ -48,63 +45,9 @@ func probeRuntimeSocks(hostRuntime, probeRuntime string) []BindPair {
 	return out
 }
 
-// startProbeBus 起探测期的私有会话总线（与运行期同一份生命周期实现）。
-func (e *Env) startProbeBus(dir string) (addr string, stop func()) {
-	daemon, err := exec.LookPath("dbus-daemon")
-	if err != nil {
-		return "", nil // 降级：没有 dbus-daemon 就不注入地址
-	}
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return "", nil
-	}
-	sock := filepath.Join(dir, "bus")
-	cmd := exec.Command(daemon, "--session", "--nofork", "--address=unix:path="+sock, "--print-address")
-	// GUI 崩溃或收到 SIGTERM 时没有机会跑 stop：让内核在父进程消失时把
-	// 私有总线也收掉。Pdeathsig 绑定创建它的线程，而 Go 从不销毁 OS 线程，
-	// 所以不会出现"进程还活着、线程没了"的误杀。
-	cmd.SysProcAttr = &syscall.SysProcAttr{Pdeathsig: syscall.SIGTERM}
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		return "", nil
-	}
-	if err := cmd.Start(); err != nil {
-		return "", nil
-	}
-	line, err := readFirstLine(stdout)
-	if err != nil || line == "" {
-		// Kill 后必须 Wait：否则进程在 GUI 生命周期内留成僵尸。用 cmd.Wait
-		// 而不是 cmd.Process.Wait：前者会关掉 StdoutPipe 的父端读 fd，
-		// 后者每探测一次就泄漏一个 fd。
-		_ = cmd.Process.Kill()
-		_ = cmd.Wait()
-		return "", nil
-	}
-	return line, func() {
-		_ = cmd.Process.Kill()
-		_ = cmd.Wait()
-		_ = os.Remove(sock)
-	}
-}
-
-// readFirstLine 读第一行（dbus-daemon 的 --print-address）。带超时：
-// 它不输出时不能把整个探测挂在这里（AGENTS：禁止死等）。
-func readFirstLine(r io.Reader) (string, error) {
-	type res struct {
-		line string
-		err  error
-	}
-	ch := make(chan res, 1)
-	go func() {
-		line, err := bufio.NewReader(r).ReadString('\n')
-		ch <- res{strings.TrimSpace(line), err}
-	}()
-	select {
-	case v := <-ch:
-		return v.line, v.err
-	case <-time.After(3 * time.Second):
-		return "", errors.New("dbus-daemon 3 秒内没有输出地址")
-	}
-}
+// 探测期的私有总线走 core/dbus_session.go 的 startSessionBus：与运行期
+// 同一份实现（同样的最小 busconfig、同样的生命周期），避免两份实现分叉后
+// 探测能跑、运行跑不起来。
 
 // setsidRunner 起独立会话并跑会话命令；退出时对**整个进程组**发信号。
 //

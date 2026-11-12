@@ -28,10 +28,12 @@ var messages = map[string]map[string]string{
 		"err.env.no_gio":           "系统缺少 gio（glib2 提供），无法把数据移入回收站。请安装 glib2 后重试；appclone 不会用 rm 代替它。",
 		"err.env.trash_failed":     "移入回收站失败：{output}",
 
-		"err.env.root":           "appclone 不能用 root 运行：root 会话下整个根文件系统是可写的，误操作会改到宿主系统；而且 root 下 bwrap 本来就能跑通，验证结果会掩盖普通用户的问题。请用你自己的账号运行。",
-		"err.env.bwrap_missing":  "系统里找不到 bwrap（bubblewrap），分身功能不可用。请先安装 bubblewrap（多数发行版包名就叫 bubblewrap）再打开 appclone。",
-		"err.env.no_dbus_daemon": "系统里没有 dbus-daemon，无法为这个分身启动私有会话总线；分身将与主实例共用会话总线，可能无法双开。",
-		"err.env.dbus_timeout":   "私有 DBus 总线没有在 {s} 秒内就绪，分身将与主实例共用会话总线，可能无法双开。",
+		"err.env.root":               "appclone 不能用 root 运行：root 会话下整个根文件系统是可写的，误操作会改到宿主系统；而且 root 下 bwrap 本来就能跑通，验证结果会掩盖普通用户的问题。请用你自己的账号运行。",
+		"err.env.bwrap_missing":      "系统里找不到 bwrap（bubblewrap），分身功能不可用。请先安装 bubblewrap（多数发行版包名就叫 bubblewrap）再打开 appclone。",
+		"err.env.no_dbus_daemon":     "系统里没有 dbus-daemon，无法为这个分身启动私有会话总线；分身将与主实例共用会话总线，可能无法双开。",
+		"err.env.dbus_timeout":       "私有 DBus 总线没有在 {s} 秒内就绪，分身将与主实例共用会话总线，可能无法双开。",
+		"err.env.dbus_path_too_long": "私有 DBus 总线的 socket 路径「{path}」超出系统上限；请把 AC_BASE 或 TMPDIR 设到更短的目录后重试。",
+		"err.env.bus_dir_unsafe":     "私有 DBus 总线的短路径目录「{path}」不属于当前用户或不是普通目录；请检查 /tmp 下是否有同名软链。",
 
 		// 运行
 		"err.run.start_failed": "启动失败（{exec}）。请用 appclone doctor 检查 bwrap 与命名空间是否可用。",
@@ -63,6 +65,8 @@ var messages = map[string]map[string]string{
 		"err.profile.under_public_path":        "「{path}」在公共目录「{public}」之下，隔离它会让两个分身各自保存一份（字段 {field}）。",
 		"err.profile.public_ancestor":          "「{path}」是公共目录「{public}」的上级，隔离它会连带隔离公共目录（字段 {field}）。",
 		"err.profile.base_path":                "「{path}」位于 appclone 自己的数据目录内，会造成绑定自指（字段 {field}）。",
+		"err.env.base_symlink":                 "appclone 的数据目录「{path}」是指向不存在目标的软链；请修正 AC_BASE 或删掉这个软链。",
+		"err.profile.base_exposure":            "「{path}」与 appclone 的运行时目录「{base}」重叠（等于、上级或下级），会把其他分身的数据、密钥环或私有总线暴露给应用（字段 {field}）。",
 		"err.profile.protected_path":           "「{path}」是系统级配置目录，不允许整体隔离（字段 {field}）。请选择具体的应用子目录。",
 		"err.profile.blanket_path":             "「{path}」不能写进 {field}：它等于放行整个主目录，隔离校验会因此对任何越界写入都说通过。请写具体的目录。",
 		"err.profile.isolate_and_share":        "「{path}」既在 paths 里又在 shared_writes 里（后者是 {other}）：同一路径不能既隔离又共享，两者谁生效取决于 bind 顺序。请只保留一个。",
@@ -411,11 +415,13 @@ var messages = map[string]map[string]string{
 		"err.env.no_gio":           "gio (from glib2) is missing, so data cannot be moved to the trash. Install glib2 and retry; appclone will not fall back to rm.",
 		"err.env.trash_failed":     "Moving to trash failed: {output}",
 
-		"err.env.root":           "appclone refuses to run as root: with root the whole filesystem is writable and a mistake can damage the host; also bwrap always works as root, which hides non-privileged failures. Run it as your own user.",
-		"err.env.bwrap_missing":  "bwrap (bubblewrap) was not found, so cloned apps cannot run. Install bubblewrap (the package is usually called bubblewrap) and reopen appclone.",
-		"err.env.no_dbus_daemon": "dbus-daemon is missing, so no private session bus can be started; this clone will share the session bus and may fail to run alongside the original.",
-		"err.env.dbus_timeout":   "The private DBus bus was not ready within {s} seconds; this clone will share the session bus and may fail to run alongside the original.",
-		"err.run.start_failed":   "Starting failed ({exec}). Run appclone doctor to check bwrap and user namespaces.",
+		"err.env.root":               "appclone refuses to run as root: with root the whole filesystem is writable and a mistake can damage the host; also bwrap always works as root, which hides non-privileged failures. Run it as your own user.",
+		"err.env.bwrap_missing":      "bwrap (bubblewrap) was not found, so cloned apps cannot run. Install bubblewrap (the package is usually called bubblewrap) and reopen appclone.",
+		"err.env.no_dbus_daemon":     "dbus-daemon is missing, so no private session bus can be started; this clone will share the session bus and may fail to run alongside the original.",
+		"err.env.dbus_timeout":       "The private DBus bus was not ready within {s} seconds; this clone will share the session bus and may fail to run alongside the original.",
+		"err.env.dbus_path_too_long": "The private DBus socket path \"{path}\" exceeds the system limit; set AC_BASE or TMPDIR to a shorter directory and retry.",
+		"err.env.bus_dir_unsafe":     "The private DBus short-path directory \"{path}\" is not owned by the current user or is not a plain directory; check /tmp for a symlink with the same name.",
+		"err.run.start_failed":       "Starting failed ({exec}). Run appclone doctor to check bwrap and user namespaces.",
 
 		"err.lock.timeout": "Another appclone is running. Retry when it finishes (waited {seconds}s).",
 
@@ -445,6 +451,8 @@ var messages = map[string]map[string]string{
 		"err.profile.under_public_path":        "\"{path}\" is inside the public folder \"{public}\"; isolating it would split your files between clones (field {field}).",
 		"err.profile.public_ancestor":          "\"{path}\" is a parent of the public folder \"{public}\" (field {field}).",
 		"err.profile.base_path":                "\"{path}\" is inside appclone's own data directory (field {field}).",
+		"err.env.base_symlink":                 "appclone's data directory \"{path}\" is a symlink to a missing target; fix AC_BASE or remove the symlink.",
+		"err.profile.base_exposure":            "\"{path}\" overlaps appclone's runtime directory \"{base}\" (equal, ancestor, or descendant); this would expose other clones' data, keyrings, or private bus to the app (field {field}).",
 		"err.profile.protected_path":           "\"{path}\" is a system-wide config directory and cannot be isolated as a whole (field {field}). Pick the app's own subdirectory.",
 		"err.profile.blanket_path":             "\"{path}\" cannot be listed in {field}: it allows the whole home directory, so the isolation check would pass any out-of-scope write. List a concrete directory instead.",
 		"err.profile.isolate_and_share":        "\"{path}\" is both isolated (paths) and shared (shared_writes: {other}); the same path cannot be both, since which one wins depends on bind order. Keep only one.",

@@ -45,6 +45,9 @@ func testEnv(t *testing.T) *Env {
 func (e *Env) opts() BuildOptions {
 	o := e.BuildOptions()
 	o.RuntimeDir = e.Resolver.XDG["RUNTIME_DIR"]
+	// HostBusPaths 来自宿主进程环境；测试默认清空，需要它的用例自己显式设置，
+	// 否则精确 argv 断言会随运行环境变化。
+	o.HostBusPaths = nil
 	return o
 }
 
@@ -61,6 +64,9 @@ func TestBuildBwrapArgsGoldenOrder(t *testing.T) {
 		{Src: o.RuntimeDir + "/pulse/native", Dst: o.RuntimeDir + "/pulse/native"},
 	}
 	o.DBusAddress = "unix:path=/run/user/1000/bus-private"
+	// 宿主总线固定在 /tmp（dbus-launch 形态），golden 显式钉住遮蔽位置：
+	// 私有总线在跑时用 /dev/null 盖住宿主 socket，必须排在 tmpfs 与实例 bind 之前。
+	o.HostBusPaths = []string{"/tmp/dbus-hostbus"}
 
 	p := Profile{
 		App:            "wechat",
@@ -88,6 +94,10 @@ func TestBuildBwrapArgsGoldenOrder(t *testing.T) {
 		"--bind", "/", "/",
 		"--dev-bind", "/dev", "/dev",
 		"--proc", "/proc",
+		// ④.1 宿主总线遮蔽（私有总线在跑时）
+		"--bind", "/dev/null", "/tmp/dbus-hostbus",
+		// ④.6 AC_BASE 遮蔽：必须在 paths 之前，否则实例 bind 会被它盖住
+		"--tmpfs", o.BaseReal,
 		// ⑤ paths：父先子后，源在实例 root 下
 		"--bind", instSrc(in.Root, o.Home+"/.config/WeChat"), o.Home + "/.config/WeChat",
 		"--bind", instSrc(in.Root, o.Home+"/.local/share/WeChat"), o.Home + "/.local/share/WeChat",
@@ -115,7 +125,9 @@ func TestBuildBwrapArgsGoldenOrder(t *testing.T) {
 	// 硬规则单点复核：只读 socket 必须在 runtime 目录 bind 之后，否则目录 bind 会盖掉它。
 	assertOrder(t, got, "--setenv XDG_RUNTIME_DIR", "--ro-bind-try")
 	assertOrder(t, got, "--bind / /", "--dev-bind")
-	assertOrder(t, got, "--bind "+instSrc(in.Root, o.Home+"/.config/WeChat"), "--bind-try")
+	assertOrder(t, got, "--bind /dev/null /tmp/dbus-hostbus", "--tmpfs "+o.BaseReal)
+	assertOrder(t, got, "--bind "+instSrc(in.Root, o.Home+"/.config/WeChat"),
+		"--bind-try "+o.Home+"/.config/gtk-3.0/bookmarks")
 }
 
 // assertOrder 断言 a 在 b 之前出现（参数按 argv 元素配对，不能只做字符串包含）。

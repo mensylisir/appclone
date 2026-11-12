@@ -1,13 +1,11 @@
 package core
 
 import (
-	"bufio"
 	"context"
 	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strings"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -41,6 +39,16 @@ func (e *Env) Run(ctx context.Context, app, id string, opt RunOptions) (RunResul
 	// 本来就能跑通，"验证通过"会把非特权路径的问题全藏起来（§3.1 末段）。
 	if err := CheckNotRoot(); err != nil {
 		return RunResult{}, err
+	}
+	// AC_BASE 是指向不存在目标的软链时，`--tmpfs Real(Base)` 会落到软链本身，
+	// bwrap 报 "Can't mount on symlink destination"——错误看起来像 bwrap 坏了。
+	// 在这里给出可操作的错误（用户去修 AC_BASE，而不是猜 bwrap）。
+	if e.Base != "" {
+		if st, lerr := os.Lstat(e.Base); lerr == nil && st.Mode()&os.ModeSymlink != 0 {
+			if _, rerr := filepath.EvalSymlinks(e.Base); rerr != nil {
+				return RunResult{}, errEnv("err.env.base_symlink", map[string]any{"path": e.Base}, rerr)
+			}
+		}
 	}
 	// 信号处理器必须在任何耗时步骤之前注册：否则 stop 在启动窗口内送达
 	// SIGTERM 会走默认处置，core.Run 的 defer 全不执行——run.pid 残留，
@@ -181,21 +189,37 @@ func (e *Env) Run(ctx context.Context, app, id string, opt RunOptions) (RunResul
 
 	// 私有 DBus 总线：必须先起 daemon（要 socket 存在才能 bind），
 	// 且 --nofork 不能少——fork 模式下 --print-address 的父进程会先退出（§6.6）。
-	var stopDBus func()
+	var dbusSess *dbusSession
 	if p.IsolateDBus {
-		addr, stop, derr := e.startPrivateDBus(in)
+		sess, derr := e.startSessionBus(filepath.Join(in.Dir(), "dbus"))
 		if derr != nil {
 			// 降级为共享总线，但必须明确告知：静默共享会让用户以为"应用不支持分身"。
+			// （keyring 开启时不允许降级——那等于把宿主总线连同宿主 keyring 交给应用。）
 			if opt.Stderr != nil {
 				_, _ = io.WriteString(opt.Stderr, "appclone: 未启动私有 DBus 总线，将与主实例共用会话总线（可能无法双开）\n")
 			}
 		} else {
-			o.DBusAddress = addr
-			stopDBus = stop
+			dbusSess = sess
+			o.DBusAddress = sess.Addr()
+			// bind 源用会话给出的真实 socket：路径过长时它不在 <inst>/dbus 下。
+			o.BusSock = sess.Sock()
+			// 应用侧地址是命名空间里的路径：AC_BASE 被 tmpfs 遮蔽后，宿主
+			// socket 路径在沙箱里不存在。
+			o.DBusAppAddress = AppDBusAddress(o.RuntimeDir)
 		}
 	}
-	if stopDBus != nil {
-		defer stopDBus()
+	if dbusSess != nil {
+		defer dbusSess.Stop()
+	}
+
+	// cwd 落在 AC_BASE 里（含软链解析）时回退 HOME：沙箱里 Base 已被 tmpfs
+	// 遮蔽，chdir 必失败。BuildBwrapArgs 也做词法兜底，doctor 与 run 同判据。
+	if o.BaseReal != "" && p.Cwd != "" {
+		if abs, cerr := o.expand(p.Cwd); cerr == nil {
+			if c := Real(abs); c == o.BaseReal || IsUnder(o.BaseReal, c) {
+				p.Cwd = o.Home
+			}
+		}
 	}
 
 	argv, err := BwrapCommand(p, in, o)
@@ -273,68 +297,5 @@ func (e *Env) Run(ctx context.Context, app, id string, opt RunOptions) (RunResul
 	return res, nil
 }
 
-// startPrivateDBus 起一个与 bwrap 同生共死的会话总线（§6.6）。
-func (e *Env) startPrivateDBus(in Instance) (addr string, stop func(), err error) {
-	daemon, err := exec.LookPath("dbus-daemon")
-	if err != nil {
-		return "", nil, errEnv("err.env.no_dbus_daemon", nil, err)
-	}
-	sock := filepath.Join(in.Dir(), "dbus", "bus")
-	if err := os.MkdirAll(filepath.Dir(sock), 0o700); err != nil {
-		return "", nil, errEnv("err.env.mkdir", map[string]any{"path": sock}, err)
-	}
-	// 上一轮被 kill 留下的 socket 文件会让 dbus-daemon 直接失败。
-	_ = os.Remove(sock)
-	cmd := exec.Command(daemon, "--session", "--nofork", "--address=unix:path="+sock, "--print-address")
-	// 与探测期一致：run 被信号打死、来不及跑 stopFn 时，内核把私有总线收掉。
-	cmd.SysProcAttr = &syscall.SysProcAttr{Pdeathsig: syscall.SIGTERM}
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		return "", nil, errEnv("err.env.no_dbus_daemon", nil, err)
-	}
-	if err := cmd.Start(); err != nil {
-		return "", nil, errEnv("err.env.no_dbus_daemon", nil, err)
-	}
-	// 读地址必须有界：daemon 被换成一个只 sleep 不输出的程序时，无超时的
-	// ReadString 会让整个 run 卡在 setup，信号泵也拿不到 pgid，分身变成
-	// "停不掉也起不来"（AGENTS.md「禁止死等」）。
-	type readResult struct {
-		line string
-		err  error
-	}
-	readCh := make(chan readResult, 1)
-	go func() {
-		line, rerr := bufio.NewReader(stdout).ReadString('\n')
-		readCh <- readResult{line: line, err: rerr}
-	}()
-	var line string
-	select {
-	case r := <-readCh:
-		if r.err != nil || strings.TrimSpace(r.line) == "" {
-			_ = cmd.Process.Kill()
-			_ = cmd.Wait()
-			_ = stdout.Close()
-			return "", nil, errEnv("err.env.no_dbus_daemon", nil, r.err)
-		}
-		line = r.line
-	case <-time.After(2 * time.Second):
-		_ = cmd.Process.Kill()
-		// 先关读端：假 daemon 若把 stdout 继承给了子进程，光 Kill 它不会
-		// 让 ReadString 返回；关掉读端才能保证读 goroutine 一定退出。
-		_ = stdout.Close()
-		select {
-		case <-readCh:
-		case <-time.After(time.Second):
-		}
-		_ = cmd.Wait()
-		return "", nil, errEnv("err.env.dbus_timeout", map[string]any{"s": 2}, nil)
-	}
-	_ = stdout.Close() // 地址已经拿到，daemon 之后不再往 stdout 写
-	stopFn := func() {
-		_ = cmd.Process.Kill()
-		_ = cmd.Wait()
-		_ = os.Remove(sock)
-	}
-	// 地址用 --print-address 的原文，不自己拼 unix:path=（地址格式是 dbus 的实现细节）。
-	return strings.TrimSpace(line), stopFn, nil
-}
+// 私有总线生命周期见 core/dbus_session.go（startSessionBus / dbusSession）：
+// run 与 probe 共用同一份实现，且配置里没有 servicedir（禁服务激活）。

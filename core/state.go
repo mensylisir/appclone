@@ -149,20 +149,32 @@ func (e *Env) resetProbeReaderLeak() { e.probeReaderLeaked.Store(false) }
 type AuditLayers struct {
 	Merged      string     // overlay 的 merged 视图，bind 到 HOME
 	PublicBinds []BindPair // Src = 真实目录，Dst = HOME 下的目标
+	// WriteRoot 是本 uid 的审计写层根（<tmpRoot>/appclone/audit.<uid>）。
+	// BuildBwrapArgs 对它做 --tmpfs：分身 A 不该读到分身 B 的 upper 副本。
+	WriteRoot string
 }
 
-// BuildOptions 把 Env 摊平成 BuildBwrapArgs 的输入。运行时相关的项
-// （RuntimeDir / RuntimeSocks / DBusAddress）由 run 自己填：它们依赖本次
-// 运行的探测结果，不属于 Env。
+// BuildOptions 把 Env 摊平成 BuildBwrapArgs 的输入。本次运行相关的项
+// （RuntimeSocks / DBusAddress / BusSock / DBusAppAddress）由 run 自己填：
+// 它们依赖本次探测与私有总线会话。HostBusPaths 来自进程环境
+// （DBUS_SESSION_BUS_ADDRESS），在这里一次解析好，BuildBwrapArgs 保持纯函数。
 func (e *Env) BuildOptions() BuildOptions {
+	// Real("") 会 Clean 成 "." 并解析成当前工作目录；空 Base 时不能让它
+	// 变成 `--tmpfs <cwd>` 把当前目录整个遮掉。
+	baseReal := ""
+	if e.Base != "" {
+		baseReal = Real(e.Base)
+	}
 	return BuildOptions{
-		Resolver:   e.Resolver,
-		RealHome:   e.Resolver.RealHome,
-		Home:       e.Resolver.Home,
-		UID:        e.UID,
-		Base:       e.Base,
-		RuntimeDir: e.Resolver.XDG["RUNTIME_DIR"],
-		XDG:        e.Resolver.Vars(),
+		Resolver:     e.Resolver,
+		RealHome:     e.Resolver.RealHome,
+		Home:         e.Resolver.Home,
+		UID:          e.UID,
+		Base:         e.Base,
+		BaseReal:     baseReal,
+		RuntimeDir:   e.Resolver.XDG["RUNTIME_DIR"],
+		XDG:          e.Resolver.Vars(),
+		HostBusPaths: e.hostBusPaths(),
 	}
 }
 

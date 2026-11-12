@@ -12,16 +12,17 @@ import (
 // 单独抽出来是为了让 argv 构造成为纯函数：这条命令一旦顺序写错，后果是
 // "用户存进 ~/Downloads 的文件被删"或者"探测零写入"，都必须能断言。
 type ProbeSpec struct {
-	Home        string            // 有效 HOME（AC_HOME 或真实 HOME）
-	Base        string            // AC_BASE（探测期要 bind 回去，否则工具自己的写入会进 upper）
-	Merged      string            // overlay 的 merged 视图
-	RuntimeDir  string            // 探测期私有 XDG_RUNTIME_DIR
-	RuntimeSock []BindPair        // 宿主 socket：Src 在宿主，Dst 在探测私有 runtime 里
-	DBusAddress string            // 私有会话总线地址；空 = 没有总线（降级）
-	PublicBinds []BindPair        // 公共目录：Src = 宿主真实目录，Dst = 有效 HOME 下的目标
-	SharedWrite []string          // 共享可写文件（输入法/书签），尽量 bind 回真实
-	LockBinds   []BindPair        // 锁文件：Src = 探测期空文件，Dst = 宿主锁路径
-	Env         map[string]string // 额外注入的环境变量（字典序输出）
+	Home         string            // 有效 HOME（AC_HOME 或真实 HOME）
+	Base         string            // AC_BASE（探测期要 bind 回去，否则工具自己的写入会进 upper）
+	Merged       string            // overlay 的 merged 视图
+	RuntimeDir   string            // 探测期私有 XDG_RUNTIME_DIR
+	RuntimeSock  []BindPair        // 宿主 socket：Src 在宿主，Dst 在探测私有 runtime 里
+	DBusAddress  string            // 私有会话总线地址；产品路径总会注入（不可用时注入不存在的私有路径）
+	HostBusPaths []string          // 宿主总线 unix socket（DBUS_SESSION_BUS_ADDRESS）；非空时用 /dev/null 遮蔽
+	PublicBinds  []BindPair        // 公共目录：Src = 宿主真实目录，Dst = 有效 HOME 下的目标
+	SharedWrite  []string          // 共享可写文件（输入法/书签），尽量 bind 回真实
+	LockBinds    []BindPair        // 锁文件：Src = 探测期空文件，Dst = 宿主锁路径
+	Env          map[string]string // 额外注入的环境变量（字典序输出）
 	// NoOverlay 是 strace 降级模式：不罩 overlay（HOME 就是真实的），
 	// 因此也没有"把公共目录绑回去"这回事——那句话的前提是 overlay 罩住了它们。
 	NoOverlay bool
@@ -70,6 +71,17 @@ func ProbeBwrapArgs(s ProbeSpec) ([]string, error) {
 		"--dev-bind", "/dev", "/dev",
 		"--proc", "/proc",
 	)
+	// 宿主会话总线遮蔽：探测期必须让应用只看到私有总线（起不来时看到的是
+	// 不存在的私有地址），否则 dbus-launch 放在 /tmp 的总线经 `--bind / /`
+	// 仍然可连，读证据/keyring 证据会被宿主会话污染。位置必须在
+	// --dev-bind/--proc 之后：宿主总线若在 /dev/shm，先遮蔽会被随后的
+	// dev-bind 覆盖回去。HostBusPaths 已过滤为真实 socket（含软链解析），
+	// 因此用 `--bind`；stat 与 bwrap 之间的极小竞态窗口由 fail-closed 接受。
+	if s.DBusAddress != "" {
+		for _, pth := range s.HostBusPaths {
+			argv = append(argv, "--bind", "/dev/null", pth)
+		}
+	}
 	if !s.NoOverlay {
 		argv = append(argv, "--bind", s.Merged, s.Home)
 		for _, pb := range s.PublicBinds {
