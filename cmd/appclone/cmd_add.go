@@ -120,7 +120,8 @@ func newAddCmd(a *app) *cobra.Command {
 			// 自动预填的 exec_args 只来自 RetKnown=false 证据时置位（run-scoped
 			// 诊断，只进 --json）。必须声明在 needProfile 之外：两处 payload
 			// 都要用。
-			var selfRelaunchUnknown bool
+			var selfRelaunchUnknown, selfRelaunchAmbiguous bool
+			var roundMarkerDropped int
 			needProfile := !hasProfile || !creatable || rediscover
 			if needProfile {
 				if !rediscover && hasProfile && !creatable {
@@ -188,6 +189,8 @@ func newAddCmd(a *app) *cobra.Command {
 				keyringEvidence = res.KeyringEvidence
 				keyringDropped = res.KeyringTraceDropped
 				selfRelaunchUnknown = res.SelfRelaunchUnknown
+				selfRelaunchAmbiguous = res.SelfRelaunchAmbiguous
+				roundMarkerDropped = res.RoundMarkerDropped
 			} else if hasOld {
 				p = old
 			} else if p, err = a.env.LoadProfile(appKey); err != nil {
@@ -217,7 +220,7 @@ func newAddCmd(a *app) *cobra.Command {
 					"isolate_keyring": p.IsolateKeyring, "keyring_evidence": keyringEvidence,
 					"keyring_trace_dropped": keyringDropped,
 				}
-				addProbeEvidence(payload, readsWarns, p, selfRelaunchUnknown)
+				addProbeEvidence(payload, readsWarns, p, selfRelaunchUnknown, selfRelaunchAmbiguous, roundMarkerDropped)
 				a.ok(payload, func() {
 					fmt.Printf("已保存「%s」的隔离档案（%d 条路径，来源 %s），未创建分身。\n",
 						appKey, len(p.Paths), p.ProbeMethod)
@@ -237,7 +240,7 @@ func newAddCmd(a *app) *cobra.Command {
 				"isolate_keyring": p.IsolateKeyring, "keyring_evidence": keyringEvidence,
 				"keyring_trace_dropped": keyringDropped,
 			}
-			addProbeEvidence(payload, readsWarns, p, selfRelaunchUnknown)
+			addProbeEvidence(payload, readsWarns, p, selfRelaunchUnknown, selfRelaunchAmbiguous, roundMarkerDropped)
 			a.ok(payload, func() {
 				fmt.Printf("已创建「%s（分身 %s）」\n", appKey, in.DisplayName)
 				fmt.Printf("  桌面入口：%s\n", a.env.LauncherPath(in.App, in.ID))
@@ -262,7 +265,7 @@ func newAddCmd(a *app) *cobra.Command {
 
 // addProbeEvidence 把 run-scoped 的读证据字段加进 `--json` 输出。空值不写，
 // 避免脚本把"没有告警"误读成"告警字段为空数组"。
-func addProbeEvidence(payload map[string]any, readsWarns []string, p core.Profile, selfRelaunchUnknown bool) {
+func addProbeEvidence(payload map[string]any, readsWarns []string, p core.Profile, selfRelaunchUnknown, selfRelaunchAmbiguous bool, roundMarkerDropped int) {
 	if len(readsWarns) > 0 {
 		payload["reads_warns"] = readsWarns
 	}
@@ -276,6 +279,12 @@ func addProbeEvidence(payload map[string]any, readsWarns []string, p core.Profil
 	}
 	if selfRelaunchUnknown {
 		payload["self_relaunch_unknown"] = true
+	}
+	if selfRelaunchAmbiguous {
+		payload["self_relaunch_ambiguous"] = true
+	}
+	if roundMarkerDropped > 0 {
+		payload["round_marker_dropped"] = roundMarkerDropped
 	}
 }
 

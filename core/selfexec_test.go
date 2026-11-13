@@ -380,6 +380,14 @@ func TestDangerousSelfRelaunchFlag(t *testing.T) {
 		"--client-secret=abc", "--api-key=abc", "--private-key=/tmp/k",
 		"--keystore=/tmp/k", "--password=abc", "--cookie=abc",
 		"--dbus-address=x", "--socket=/tmp/s", "--host-resolver-rules=x",
+		"--rootdir=/tmp/r", "--apppath=/tmp/a", "--keypath=/tmp/k", "--homepath=/tmp/h",
+		// 粘连/驼峰形式：短凭据词与 log/root/dbus/sandbox 的复合写法
+		"--x-user-data-dir=/tmp/u", "--dbpassword=abc", "--userpass=abc",
+		"--clientcert=/tmp/c", "--basicauth=abc", "--logdir=/tmp/l",
+		"--logDirectory=/tmp/l", "--logpath=/tmp/l", "--unsandboxed",
+		"--rootfs=/tmp/r", "--dbuspath=/tmp/d",
+		// 对抗性大小写：全名归一化后仍须命中长词
+		"--dIsAbLeWeBsEcUrItY", "--hOsTrEsOlVeRrUlEs",
 		"-", "--",
 	}
 	for _, arg := range denied {
@@ -392,6 +400,9 @@ func TestDangerousSelfRelaunchFlag(t *testing.T) {
 		"--enable-wayland-ime", "--wayland-text-input-version=3",
 		"--force-device-scale-factor=1.5", "--disable-gpu",
 		"--disable-dev-shm-usage", "-v", "-abc",
+		// 危险词只是更长单词的一部分，不能误拒（旧 Contains 会拒掉这些）：
+		"--catalog=/tmp/c", "--bypass", "--compass", "--author=me",
+		"--rootless", "--attempts=3", "--hotdog",
 	}
 	for _, arg := range allowed {
 		if dangerousSelfRelaunchFlag(arg) {

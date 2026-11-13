@@ -1,6 +1,7 @@
 package core
 
 import (
+	"os"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -44,6 +45,13 @@ func (r *PathResolver) MergeUpper(entries []UpperEntry) ([]Candidate, []string) 
 	added := map[string]bool{}         // 已进入 order 的应用目录
 	var order []string
 	var whiteouts []string
+	// upperSet 让"前缀文件只在写层里"的原子写临时文件也能被识别。
+	upperSet := make(map[string]bool, len(entries))
+	for _, en := range entries {
+		if strings.TrimSpace(en.Path) != "" {
+			upperSet[filepath.Clean(filepath.Join(r.Home, filepath.FromSlash(en.Path)))] = true
+		}
+	}
 
 	for _, en := range entries {
 		if strings.TrimSpace(en.Path) == "" {
@@ -57,6 +65,12 @@ func (r *PathResolver) MergeUpper(entries []UpperEntry) ([]Candidate, []string) 
 		}
 		if en.Kind == EntryWhiteout {
 			whiteouts = append(whiteouts, abs)
+			continue
+		}
+		if r.isAtomicTempArtifact(abs, upperSet) {
+			// GLib/GIO 的原子写会先建 `mimeapps.list.XXXXXX` 再 rename。
+			// 这类临时文件不持久、也不该进档案：用户看到一条随机名路径
+			// 只会困惑，隔离它更是毫无意义。
 			continue
 		}
 		owner, ok := r.ownerOf(abs)
@@ -233,6 +247,14 @@ func credentialNameStrength(base string) CredentialStrength {
 // 读它只是工具自己在工作，绝不能变成"用户应用要隔离的目录"。
 func (r *PathResolver) MergeUpperWithReads(entries []UpperEntry, reads, flagsHidden []string, acBase, app string) ([]Candidate, []string, int, []string) {
 	cands, whiteouts := r.MergeUpper(entries)
+	// 读证据也可能指向"前缀只在写层"的原子写临时文件（本次探测新建），
+	// 必须和写候选共用同一份 upper 集合。
+	upperSet := make(map[string]bool, len(entries))
+	for _, en := range entries {
+		if strings.TrimSpace(en.Path) != "" {
+			upperSet[filepath.Clean(filepath.Join(r.Home, filepath.FromSlash(en.Path)))] = true
+		}
+	}
 	for i := range cands {
 		cands[i].DisplayClass = cands[i].Class
 	}
@@ -267,6 +289,11 @@ func (r *PathResolver) MergeUpperWithReads(entries []UpperEntry, reads, flagsHid
 			abs = filepath.Clean(filepath.Join(r.Home, filepath.FromSlash(rel)))
 		}
 		if !IsUnder(r.Home, abs) {
+			continue
+		}
+		// 读证据同样不能把原子写临时文件摆成可勾选行：O_RDWR|O_CREAT 的
+		// 读打开也会进 reads（isReadOpen）。
+		if r.isAtomicTempArtifact(abs, upperSet) {
 			continue
 		}
 		if readSeen[realKey(abs)] {
@@ -479,6 +506,56 @@ func (r *PathResolver) MergeUpperWithReads(entries []UpperEntry, reads, flagsHid
 		warns = append(warns, w)
 	}
 	return out, whiteouts, hidden, sortCredentialWarns(warns)
+}
+
+// isAtomicTempArtifact 识别 XDG 配置根下"已知文件 + 随机后缀"的原子写临时
+// 文件（`~/.config/mimeapps.list.A1b2C3`）。只作用于配置文件根的直接子文件：
+// 应用目录里的普通文件名不受影响。upper 是同一次探测的 upper 路径集合：
+// 前缀文件可能只存在于写层（本次探测新建），宿主上 stat 不到，必须一起看。
+func (r *PathResolver) isAtomicTempArtifact(abs string, upper map[string]bool) bool {
+	dir, base := filepath.Split(abs)
+	if !samePathLoose(r.XDG["CONFIG_HOME"], dir) {
+		return false
+	}
+	for i := 1; i < len(base); i++ {
+		if base[i] != '.' {
+			continue
+		}
+		prefix, suffix := base[:i], base[i+1:]
+		if len(suffix) < 6 || len(suffix) > 12 || !mkstempSuffix(suffix) {
+			continue
+		}
+		sib := filepath.Join(dir, prefix)
+		if _, err := os.Stat(sib); err == nil {
+			return true
+		}
+		if upper[filepath.Clean(sib)] {
+			return true
+		}
+	}
+	return false
+}
+
+// mkstempSuffix 判定后缀是否像临时文件名：纯字母数字、至少一个字母，且至少
+// 一个数字或大写字母。这样 `20240101`（纯数字日期）与 `backup`/`local`
+// （纯小写单词）不会被误删，`A1b2C3`/`a1b2c3`/`ABCDEF` 会被识别。
+// 已知 tradeoff：glibc mkstemp 生成纯小写后缀的概率约 0.5%，这类临时文件
+// 不会被过滤；为不误删真实小写后缀（`.backup`）接受该漏判。
+func mkstempSuffix(s string) bool {
+	letter, digitOrUpper := false, false
+	for _, r := range s {
+		switch {
+		case r >= '0' && r <= '9':
+			digitOrUpper = true
+		case r >= 'A' && r <= 'Z':
+			letter, digitOrUpper = true, true
+		case r >= 'a' && r <= 'z':
+			letter = true
+		default:
+			return false
+		}
+	}
+	return letter && digitOrUpper
 }
 
 // realKey 是候选去重键：词法形态优先，存在软链时再取真实形态。

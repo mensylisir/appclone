@@ -212,7 +212,7 @@ func TestAddProbeEvidenceShape(t *testing.T) {
 		Warnings:          []string{"credential_scope_unsupported"},
 	}
 	payload := map[string]any{}
-	addProbeEvidence(payload, []string{"parse_error", "no_fd_annotation"}, p, true)
+	addProbeEvidence(payload, []string{"parse_error", "no_fd_annotation"}, p, true, true, 2)
 	warns, ok := payload["reads_warns"].([]string)
 	if !ok || len(warns) != 2 || warns[0] != "parse_error" || warns[1] != "no_fd_annotation" {
 		t.Fatalf("reads_warns 形状/顺序错：%#v", payload["reads_warns"])
@@ -228,9 +228,15 @@ func TestAddProbeEvidenceShape(t *testing.T) {
 	if unknown, ok := payload["self_relaunch_unknown"].(bool); !ok || !unknown {
 		t.Fatalf("self_relaunch_unknown 应为 true：%#v", payload["self_relaunch_unknown"])
 	}
+	if amb, ok := payload["self_relaunch_ambiguous"].(bool); !ok || !amb {
+		t.Fatalf("self_relaunch_ambiguous 应为 true：%#v", payload["self_relaunch_ambiguous"])
+	}
+	if dropped, ok := payload["round_marker_dropped"].(int); !ok || dropped != 2 {
+		t.Fatalf("round_marker_dropped 应为 2：%#v", payload["round_marker_dropped"])
+	}
 	// 空值不写键：保持 --json 的 omit-empty 约定（ADR-036）。
 	empty := map[string]any{}
-	addProbeEvidence(empty, nil, core.Profile{}, false)
+	addProbeEvidence(empty, nil, core.Profile{}, false, false, 0)
 	if len(empty) != 0 {
 		t.Fatalf("空值不应写键：%#v", empty)
 	}

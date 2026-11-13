@@ -412,3 +412,122 @@ func TestClassifyCustomCacheHomeAndCacheFile(t *testing.T) {
 		t.Fatal("名字里的 cache 不是缓存段")
 	}
 }
+
+// 原子写会先建 `mimeapps.list.XXXXXX` 再 rename：临时文件不该成为候选，
+// 否则用户会在确认页看到一条随机名路径。只过滤配置根下、前缀已存在且
+// 后缀像 mkstemp 产物的条目；真实后缀与应用目录内文件不受影响。
+func TestMergeUpperDropsAtomicTempSiblings(t *testing.T) {
+	r := classifyEnv(t)
+	cfg := r.XDG["CONFIG_HOME"]
+	if err := os.MkdirAll(cfg, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(cfg, "mimeapps.list"), []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	entries := []UpperEntry{
+		{Path: ".config/mimeapps.list.A1b2C3", Kind: EntryFile},        // 原子写临时文件
+		{Path: ".config/mimeapps.list.20240101", Kind: EntryFile},      // 纯数字日期，保留
+		{Path: ".config/newfile.B2c3D4", Kind: EntryFile},              // 前缀不存在，保留
+		{Path: ".config/fresh.conf", Kind: EntryFile},                  // 本次新建
+		{Path: ".config/fresh.conf.X9y8Z7", Kind: EntryFile},           // 前缀只在写层，仍过滤
+		{Path: ".config/App/state.A1b2C3", Kind: EntryFile},            // 应用目录内，保留
+		{Path: ".config/mimeapps.list.A1b2C3d4E5f6", Kind: EntryFile},  // 12 位边界，过滤
+		{Path: ".config/mimeapps.list.A1b2C3d4E5f6g", Kind: EntryFile}, // 13 位，保留
+		{Path: ".config/mimeapps.list.Ab1C2", Kind: EntryFile},         // 5 位，保留
+	}
+	cands, _ := r.MergeUpper(entries)
+	got := map[string]int{}
+	for _, c := range cands {
+		got[c.Path] = c.Observed
+	}
+	for _, dropped := range []string{
+		filepath.Join(r.Home, ".config", "mimeapps.list.A1b2C3"),
+		filepath.Join(r.Home, ".config", "fresh.conf.X9y8Z7"),
+		filepath.Join(r.Home, ".config", "mimeapps.list.A1b2C3d4E5f6"),
+	} {
+		if _, ok := got[dropped]; ok {
+			t.Fatalf("原子写临时文件不应成为候选：%s（%+v）", dropped, cands)
+		}
+	}
+	for _, kept := range []string{
+		filepath.Join(r.Home, ".config", "mimeapps.list.20240101"),
+		filepath.Join(r.Home, ".config", "newfile.B2c3D4"),
+		filepath.Join(r.Home, ".config", "fresh.conf"),
+		filepath.Join(r.Home, ".config", "mimeapps.list.A1b2C3d4E5f6g"),
+		filepath.Join(r.Home, ".config", "mimeapps.list.Ab1C2"),
+	} {
+		if _, ok := got[kept]; !ok {
+			t.Fatalf("非临时文件应保留：%s（%+v）", kept, cands)
+		}
+	}
+	app := filepath.Join(r.Home, ".config", "App")
+	if n, ok := got[app]; !ok || n != 1 {
+		t.Fatalf("应用目录内文件应归入 App 且 Observed=1，得到 %d/%v（%+v）", n, ok, cands)
+	}
+}
+
+// 读证据同样不能把原子写临时文件摆成可勾选行（O_RDWR|O_CREAT 会进 reads）。
+func TestMergeUpperWithReadsDropsAtomicTemp(t *testing.T) {
+	r := classifyEnv(t)
+	cfg := r.XDG["CONFIG_HOME"]
+	if err := os.MkdirAll(cfg, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(cfg, "mimeapps.list"), []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cands, _, _, _ := r.MergeUpperWithReads(nil, []string{".config/mimeapps.list.A1b2C3"}, nil, "", "app")
+	if len(cands) != 0 {
+		t.Fatalf("读证据里的原子写临时文件不应成为候选：%+v", cands)
+	}
+
+	// 前缀只在写层（本次探测新建）：读证据里的临时兄弟同样要过滤。
+	entries := []UpperEntry{{Path: ".config/fresh.conf", Kind: EntryFile}}
+	cands, _, _, _ = r.MergeUpperWithReads(entries, []string{".config/fresh.conf.X9y8Z7"}, nil, "", "app")
+	for _, c := range cands {
+		if filepath.Base(c.Path) == "fresh.conf.X9y8Z7" {
+			t.Fatalf("upper-only 前缀的读证据临时文件不应成为候选：%+v", cands)
+		}
+	}
+}
+
+// CONFIG_HOME 是软链时，upper 记录的是真实路径；过滤必须用 loose 比较。
+func TestMergeUpperAtomicTempSymlinkedConfigHome(t *testing.T) {
+	r := classifyEnv(t)
+	realCfg := filepath.Join(r.Home, "cfg-real")
+	if err := os.MkdirAll(realCfg, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(realCfg, "mimeapps.list"), []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(realCfg, r.XDG["CONFIG_HOME"]); err != nil {
+		t.Fatal(err)
+	}
+	cands, _ := r.MergeUpper([]UpperEntry{{Path: "cfg-real/mimeapps.list.A1b2C3", Kind: EntryFile}})
+	if len(cands) != 0 {
+		t.Fatalf("软链 CONFIG_HOME 下的临时文件应被过滤：%+v", cands)
+	}
+}
+
+// 写入计数与归并必须同一口径：只有原子写临时文件时不能报 writes>0，
+// 否则 add --json 的 writes 会与零写入门禁的 observed:0 自相矛盾。
+func TestCountProbeWritesIgnoresAtomicTemp(t *testing.T) {
+	e := probeEnv(t)
+	cfg := e.Resolver.XDG["CONFIG_HOME"]
+	if err := os.MkdirAll(cfg, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(cfg, "mimeapps.list"), []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	entries := []UpperEntry{{Path: ".config/mimeapps.list.A1b2C3", Kind: EntryFile}}
+	if n := e.countProbeWrites(entries); n != 0 {
+		t.Fatalf("原子写临时文件不应计入 writes，得到 %d", n)
+	}
+	entries = append(entries, UpperEntry{Path: ".config/App/state", Kind: EntryFile})
+	if n := e.countProbeWrites(entries); n != 1 {
+		t.Fatalf("真实写入应计入 writes，得到 %d", n)
+	}
+}

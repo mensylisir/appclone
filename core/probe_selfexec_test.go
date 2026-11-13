@@ -176,3 +176,64 @@ func TestProbeSessionNoReaderDoesNotPrefill(t *testing.T) {
 		t.Fatal("没有证据时不能标证据来源")
 	}
 }
+
+// ambiguousRunner 每轮追加不同的参数：检测器应报 Ambiguous，且 ProbeResult
+// 的 SelfRelaunchAmbiguous 必须置位（add --json 的诊断契约）。
+type ambiguousRunner struct {
+	q     string
+	calls int
+}
+
+func (f *ambiguousRunner) Run(_ context.Context, argv []string, _ io.Writer) (SessionResult, error) {
+	f.calls++
+	fifo := ""
+	for i, a := range argv {
+		if a == "-o" && i+1 < len(argv) {
+			fifo = argv[i+1]
+			break
+		}
+	}
+	if fifo != "" {
+		delta := "--flag-a"
+		if f.calls%2 == 0 {
+			delta = "--flag-b"
+		}
+		lines := fmt.Sprintf(
+			"1 execve(%q, [%q], 0x0) = 0\n1 execve(%q, [%q, %q], 0x0) = 0\n",
+			f.q, f.q, f.q, f.q, delta)
+		fh, err := os.OpenFile(fifo, os.O_WRONLY, 0)
+		if err != nil {
+			return SessionResult{}, err
+		}
+		if _, err := fh.WriteString(lines); err != nil {
+			_ = fh.Close()
+			return SessionResult{}, err
+		}
+		if err := fh.Close(); err != nil {
+			return SessionResult{}, err
+		}
+	}
+	return SessionResult{ExitCode: 0, Started: true}, nil
+}
+
+func TestProbeSessionSelfRelaunchAmbiguous(t *testing.T) {
+	e := probeEnv(t)
+	q := "/opt/Qoder CN/qoder-cn"
+	m := &fakeMounter{entries: []string{".config/QoderCN/state"}}
+	r := &ambiguousRunner{q: q}
+	res, err := e.probeSession(context.Background(), "qoder", ProbeOptions{
+		Command: []string{q}, Mounter: m, Runner: r, Rounds: 2,
+	}, m, r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !res.SelfRelaunchAmbiguous {
+		t.Fatal("多解 delta 应标记 SelfRelaunchAmbiguous")
+	}
+	if len(res.SelfRelaunchArgs) != 0 || len(res.Profile.ExecArgs) != 0 {
+		t.Fatalf("多解时不能预填：args=%q exec=%q", res.SelfRelaunchArgs, res.Profile.ExecArgs)
+	}
+	if res.SelfRelaunchUnknown {
+		t.Fatal("ambiguous 不是 unknown，不能混用诊断位")
+	}
+}

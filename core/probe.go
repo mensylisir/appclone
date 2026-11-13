@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sort"
+	"strings"
 	"time"
 )
 
@@ -86,6 +87,13 @@ type ProbeResult struct {
 	// 仅供 ProbeWithRetry 判断是否重探；不进入 `add --json` 契约，显式排除
 	// 任何直接序列化路径。
 	SelfRelaunchArgs []string `json:"-"`
+	// SelfRelaunchAmbiguous 表示有候选自重启增量但多解或轮次不足，因而没有
+	// 预填。它只做诊断：`add --json` 输出该键，界面/脚本能区分"没识别到"
+	// 与"识别到但不敢用"。
+	SelfRelaunchAmbiguous bool `json:"self_relaunch_ambiguous,omitempty"`
+	// RoundMarkerDropped 是轮次标记写入 FIFO 失败的次数。非零时跨轮证据
+	// 可能退化（同一轮重复被当成多轮），必须可诊断而不是静默。
+	RoundMarkerDropped int `json:"round_marker_dropped,omitempty"`
 }
 
 const probeTimeoutDefault = 30 * time.Minute
@@ -380,6 +388,7 @@ func (e *Env) probeStrace(ctx context.Context, app string, opt ProbeOptions, run
 	}
 	sr := DetectSelfRelaunchArgs(opt.Command[0], opt.Command[1:], trace.execCalls, minRounds)
 	var selfRelaunchArgs []string
+	selfRelaunchAmbiguous := sr.Ambiguous
 	if sr.OK {
 		selfRelaunchArgs = append([]string(nil), sr.Delta...)
 		// unknown 证据只做诊断：不落盘、不覆盖旧参数、不驱动重探。
@@ -402,26 +411,28 @@ func (e *Env) probeStrace(ctx context.Context, app string, opt ProbeOptions, run
 		p.Warnings = append(p.Warnings, warn)
 	}
 	return ProbeResult{
-		Profile:             p,
-		Candidates:          cands,
-		Whiteouts:           whiteouts,
-		ExitCode:            last.ExitCode,
-		Writes:              writes,
-		HomeReads:           len(trace.reads),
-		HomeReadsNoise:      trace.homeReadsNoise(),
-		Started:             last.Started,
-		ExecSeen:            trace.execSeen,
-		Activity:            activity,
-		ReadsDropped:        trace.stats.ReadsDropped,
-		ParseErrors:         trace.stats.ParseErrors,
-		SizeExceeded:        trace.stats.SizeExceeded,
-		ReadsHidden:         readsHidden,
-		ReadsWarns:          trace.warnsList(),
-		ReadTrace:           trace.readTrace(),
-		KeyringEvidence:     evidence,
-		KeyringTraceDropped: trace.keyringDropped,
-		SelfRelaunchUnknown: selfRelaunchUnknown,
-		SelfRelaunchArgs:    selfRelaunchArgs,
+		Profile:               p,
+		Candidates:            cands,
+		Whiteouts:             whiteouts,
+		ExitCode:              last.ExitCode,
+		Writes:                writes,
+		HomeReads:             len(trace.reads),
+		HomeReadsNoise:        trace.homeReadsNoise(),
+		Started:               last.Started,
+		ExecSeen:              trace.execSeen,
+		Activity:              activity,
+		ReadsDropped:          trace.stats.ReadsDropped,
+		ParseErrors:           trace.stats.ParseErrors,
+		SizeExceeded:          trace.stats.SizeExceeded,
+		ReadsHidden:           readsHidden,
+		ReadsWarns:            trace.warnsList(),
+		ReadTrace:             trace.readTrace(),
+		KeyringEvidence:       evidence,
+		KeyringTraceDropped:   trace.keyringDropped,
+		SelfRelaunchUnknown:   selfRelaunchUnknown,
+		SelfRelaunchArgs:      selfRelaunchArgs,
+		SelfRelaunchAmbiguous: selfRelaunchAmbiguous,
+		RoundMarkerDropped:    trace.stats.RoundMarkerDropped,
 	}, nil
 }
 
@@ -928,6 +939,7 @@ func (e *Env) probeSession(ctx context.Context, app string, opt ProbeOptions, mo
 	}
 	sr := DetectSelfRelaunchArgs(opt.Command[0], opt.Command[1:], trace.execCalls, minRounds)
 	var selfRelaunchArgs []string
+	selfRelaunchAmbiguous := sr.Ambiguous
 	if sr.OK {
 		selfRelaunchArgs = append([]string(nil), sr.Delta...)
 		// unknown 证据只做诊断：不落盘、不覆盖旧参数、不驱动重探。
@@ -952,26 +964,28 @@ func (e *Env) probeSession(ctx context.Context, app string, opt ProbeOptions, mo
 
 	discard()
 	return ProbeResult{
-		Profile:             p,
-		Candidates:          cands,
-		Whiteouts:           whiteouts,
-		ExitCode:            res.ExitCode,
-		Writes:              writes,
-		HomeReads:           len(trace.reads),
-		HomeReadsNoise:      trace.homeReadsNoise(),
-		Started:             res.Started,
-		ExecSeen:            trace.execSeen,
-		Activity:            activity,
-		ReadsDropped:        trace.stats.ReadsDropped,
-		ParseErrors:         trace.stats.ParseErrors,
-		SizeExceeded:        trace.stats.SizeExceeded,
-		ReadsHidden:         readsHidden,
-		ReadsWarns:          trace.warnsList(),
-		ReadTrace:           trace.readTrace(),
-		KeyringEvidence:     evidence,
-		KeyringTraceDropped: trace.keyringDropped,
-		SelfRelaunchUnknown: selfRelaunchUnknown,
-		SelfRelaunchArgs:    selfRelaunchArgs,
+		Profile:               p,
+		Candidates:            cands,
+		Whiteouts:             whiteouts,
+		ExitCode:              res.ExitCode,
+		Writes:                writes,
+		HomeReads:             len(trace.reads),
+		HomeReadsNoise:        trace.homeReadsNoise(),
+		Started:               res.Started,
+		ExecSeen:              trace.execSeen,
+		Activity:              activity,
+		ReadsDropped:          trace.stats.ReadsDropped,
+		ParseErrors:           trace.stats.ParseErrors,
+		SizeExceeded:          trace.stats.SizeExceeded,
+		ReadsHidden:           readsHidden,
+		ReadsWarns:            trace.warnsList(),
+		ReadTrace:             trace.readTrace(),
+		KeyringEvidence:       evidence,
+		KeyringTraceDropped:   trace.keyringDropped,
+		SelfRelaunchUnknown:   selfRelaunchUnknown,
+		SelfRelaunchArgs:      selfRelaunchArgs,
+		SelfRelaunchAmbiguous: selfRelaunchAmbiguous,
+		RoundMarkerDropped:    trace.stats.RoundMarkerDropped,
 	}, nil
 }
 
@@ -979,6 +993,12 @@ func (e *Env) probeSession(ctx context.Context, app string, opt ProbeOptions, mo
 // Classify → 剔除 cache 与 whiteout → 按路径去重。
 func (e *Env) countProbeWrites(entries []UpperEntry) int {
 	seen := map[string]bool{}
+	upperSet := make(map[string]bool, len(entries))
+	for _, ent := range entries {
+		if strings.TrimSpace(ent.Path) != "" {
+			upperSet[filepath.Clean(filepath.Join(e.Resolver.Home, filepath.FromSlash(ent.Path)))] = true
+		}
+	}
 	n := 0
 	for _, ent := range entries {
 		if ent.Kind == EntryWhiteout {
@@ -986,6 +1006,11 @@ func (e *Env) countProbeWrites(entries []UpperEntry) int {
 		}
 		abs := filepath.Join(e.Resolver.Home, filepath.FromSlash(ent.Path))
 		if !IsUnder(e.Resolver.Home, abs) {
+			continue
+		}
+		// 与 MergeUpper 同一口径：原子写临时文件不算"写入条目"，否则会出现
+		// writes>0 但 paths 为空、零写入门禁报 observed:0 的自相矛盾。
+		if e.Resolver.isAtomicTempArtifact(abs, upperSet) {
 			continue
 		}
 		if cls, _, _, _ := e.Resolver.Classify(abs); cls == ClassCache {

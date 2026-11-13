@@ -186,41 +186,133 @@ func childProcessSelector(arg string) bool {
 }
 
 // dangerousSelfRelaunchFlag 拒绝会改写数据目录/沙箱/调试/代理/日志边界或
-// 携带凭据的旗标。名称归一化后按**包含**匹配（--user-data-dir=… → userdatadir，
-// --x-user-data-dir → xuserdatadir，--disable-sandbox → disablesandbox 都命中），
-// 避免攻击者在危险词前加前缀绕过；自动预填宁可少写。
+// 携带凭据的旗标。名称按 `-`/`_`/`.` 等分隔符切成词，再逐词与连续词组合
+// 匹配：`--disable-sandbox` 命中词 sandbox，`--x-user-data-dir` 命中组合
+// userdatadir，而 `--catalog`/`--rootless`/`--attempts` 这类"危险词只是
+// 更长单词的一部分"不会被误拒。自动预填宁可少写，但不能把常见无害旗标
+// 一律拒掉——那会让分身起不来。
 func dangerousSelfRelaunchFlag(arg string) bool {
 	name := normalizeFlagName(arg)
 	if name == "" {
 		// `--` / `-` 没有旗标名，无法判断语义，不能带进档案。
 		return true
 	}
-	for _, bad := range []string{
-		// 凭据
-		"token", "accesstoken", "refreshtoken", "authtoken", "sessiontoken",
-		"passwd", "pwd", "secret", "clientsecret", "credential", "cookie",
-		"session", "apikey", "privatekey", "cert", "pass", "auth",
-		"keyfile", "keystore", "signingkey", "encryptionkey", "accesskey",
-		// 数据目录 / 状态 / 配置边界
-		"userdatadir", "profiledirectory", "profile", "diskcachedir", "cachedir",
-		"cache", "datadir", "configdir", "config", "homedir", "home",
-		"userdir", "userdata", "statedir", "state", "runtimedir", "runtime",
-		"tempdir", "tmpdir", "temp", "tmp", "workdir", "workingdir", "cwd",
-		"basedir", "storedir", "root", "prefix", "path",
-		// 沙箱 / 调试 / 网络 / 日志边界
-		"nosandbox", "sandbox", "disablesetuidsandbox", "disableseccomp",
-		"seccomp", "singleprocess", "disablegpusandbox",
-		"remotedebug", "inspect", "inspectbrk", "inspectport",
-		"proxyserver", "proxy", "hostresolverrules",
-		"logfile", "log", "sslkeylogfile", "enablelogging", "debug",
-		"jsflags", "disablewebsecurity", "ignorecertificateerrors",
-		"socket", "dbus",
-	} {
-		if strings.Contains(name, bad) {
-			return true
+	// 归一化全名兜底：对抗性大小写（--dIsAbLeWeBsEcUrItY）会被 camelCase 切出
+	// 很多段，超出 4 段组合窗口；对全名再做一次长词匹配把它关掉。
+	for _, cand := range append(flagWordJoins(flagNameWords(arg)), name) {
+		for _, bad := range dangerousFlagTokens {
+			if cand == bad {
+				return true
+			}
+			// 长词（≥5）允许前后缀：--mytoken / --app-config / --x-user-data-dir
+			// 这类加前缀的写法不能绕过；短词只认整词，避免 --catalog 命中 log。
+			if len(bad) >= 5 && (strings.HasPrefix(cand, bad) || strings.HasSuffix(cand, bad)) {
+				return true
+			}
+			// 短凭据词（pass/pwd/auth/cert）允许出现在单词任意位置：
+			// --dbpassword / --userpass / --clientcert / --basicauth 这类粘连写法
+			// 必须拒绝；少数普通单词（bypass/compass/author 等）显式放行。
+			if shortCredentialTokens[bad] && len(cand) > len(bad) &&
+				strings.Contains(cand, bad) && !shortTokenExceptions[cand] {
+				return true
+			}
 		}
 	}
 	return false
+}
+
+// flagNameWords 把旗标名切成小写单词（去掉前导 `-` 与 `=` 之后的值）。
+// 除分隔符外还按 camelCase 边界切：`--logDirectory` → log/directory，
+// 驼峰拼写（如 db + Password）否则会成为绕过路径。
+func flagNameWords(arg string) []string {
+	s := strings.TrimSpace(arg)
+	s = strings.TrimLeft(s, "-")
+	if i := strings.IndexByte(s, '='); i >= 0 {
+		s = s[:i]
+	}
+	var words []string
+	var b strings.Builder
+	flush := func() {
+		if b.Len() > 0 {
+			words = append(words, b.String())
+			b.Reset()
+		}
+	}
+	var prev rune
+	for _, r := range s {
+		lower := r
+		if r >= 'A' && r <= 'Z' {
+			lower = r + ('a' - 'A')
+		}
+		if r >= 'A' && r <= 'Z' && prev >= 'a' && prev <= 'z' {
+			flush() // camelCase 边界
+		}
+		if (lower >= 'a' && lower <= 'z') || (lower >= '0' && lower <= '9') {
+			b.WriteRune(lower)
+		} else {
+			flush()
+		}
+		prev = r
+	}
+	flush()
+	return words
+}
+
+// flagWordJoins 返回每个词及最多 4 个连续词的拼接，覆盖 user-data-dir →
+// userdatadir 这类多段旗标；上限 4 段足够，避免病态长旗标产生平方级组合。
+func flagWordJoins(words []string) []string {
+	out := make([]string, 0, len(words)*2)
+	for i := range words {
+		var b strings.Builder
+		for j := i; j < len(words) && j < i+4; j++ {
+			b.WriteString(words[j])
+			out = append(out, b.String())
+		}
+	}
+	return out
+}
+
+// shortCredentialTokens 是允许"单词内任意位置"匹配的短凭据词。它们太短，
+// 无法只靠整词判断：--dbpassword / --userpass / --clientcert / --basicauth
+// 都必须拒绝。匹配到这些词的普通英文单词在 shortTokenExceptions 里显式放行。
+var shortCredentialTokens = map[string]bool{
+	"pass": true, "pwd": true, "auth": true, "cert": true,
+}
+
+// shortTokenExceptions 是包含短凭据词、但语义无关的常见单词。宁可枚举，
+// 也不要让 --bypass 这类正常旗标被误拒（误拒会让分身起不来）。
+var shortTokenExceptions = map[string]bool{
+	"bypass": true, "compass": true, "surpass": true, "trespass": true,
+	"passage": true, "passenger": true,
+	"author": true, "authority": true, "authors": true,
+	"concert": true, "certain": true, "ascertain": true,
+}
+
+// dangerousFlagTokens 是归一化后的危险词表。短词（<5）只做整词匹配，
+// 长词额外允许前后缀匹配。
+var dangerousFlagTokens = []string{
+	// 凭据
+	"token", "accesstoken", "refreshtoken", "authtoken", "sessiontoken",
+	"passwd", "passphrase", "passcode", "pwd", "pass", "secret",
+	"clientsecret", "credential", "cookie", "session", "apikey", "privatekey",
+	"cert", "certificate", "auth", "oauth", "keyfile", "keystore", "signingkey",
+	"encryptionkey", "accesskey", "sshpass",
+	// 数据目录 / 状态 / 配置边界
+	"userdatadir", "profiledirectory", "profile", "diskcachedir", "cachedir",
+	"cache", "datadir", "datapath", "configdir", "config", "homedir", "home",
+	"homepath", "userdir", "userdata", "userpath", "statedir", "state",
+	"runtimedir", "runtime", "rundir", "tempdir", "tmpdir", "temppath", "tmppath",
+	"temp", "tmp", "workdir", "workingdir", "workpath", "cwd",
+	"basedir", "basepath", "storedir", "storepath", "rootdir", "rootpath",
+	"root", "chroot", "prefix", "path", "apppath", "keypath",
+	// 沙箱 / 调试 / 网络 / 日志边界
+	"nosandbox", "sandbox", "disablesetuidsandbox", "disableseccomp",
+	"seccomp", "singleprocess", "disablegpusandbox",
+	"remotedebug", "inspect", "inspectbrk", "inspectport",
+	"proxyserver", "proxy", "hostresolverrules",
+	"logfile", "log", "logdir", "logpath", "sslkeylogfile", "enablelogging", "debug",
+	"jsflags", "disablewebsecurity", "ignorecertificateerrors",
+	"socket", "dbus", "dbuspath", "unsandboxed", "rootfs",
 }
 
 func normalizeFlagName(arg string) string {
