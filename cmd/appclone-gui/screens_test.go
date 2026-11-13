@@ -2123,7 +2123,7 @@ func TestGtkConfirmReuseEvidence(t *testing.T) {
 				env.KeyringCapsOverride = &core.KeyringCaps{
 					Available: true, Daemon: "/usr/bin/gnome-keyring-daemon", DbusSend: "/usr/bin/dbus-send",
 				}
-				v2.applyProbeResult(core.ProbeResult{
+				pres := core.ProbeResult{
 					Candidates: []core.Candidate{
 						{Path: pub, Class: core.ClassPublic, DisplayClass: core.ClassPublic, Why: "probe.why.public"},
 						{Path: cfg, Class: core.ClassConfig, Checked: true,
@@ -2132,7 +2132,13 @@ func TestGtkConfirmReuseEvidence(t *testing.T) {
 					ReadTrace:       core.ReadTraceUnavailable,
 					KeyringEvidence: core.KeyringEvidenceObserved,
 					Profile:         core.Profile{App: "cred", ProbeMethod: "overlay", IsolateKeyring: true},
-				})
+				}
+				p2, c2, pf2, ferr := env.FinalizeProbe("cred", pres, core.ProbeFinalize{AllowEmpty: true})
+				if ferr != nil {
+					fail("降级确认页落案失败：%v", ferr)
+					return false
+				}
+				v2.applyFinalized(pres, p2, c2, pf2)
 				if v2.state != "confirm" {
 					fail("候选确认页没有进入 confirm：%s", v2.state)
 					return false

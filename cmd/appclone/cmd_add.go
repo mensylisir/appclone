@@ -145,7 +145,7 @@ func newAddCmd(a *app) *cobra.Command {
 				// L0 先扫一遍：它的锁文件线索能让探测不再"零写入"——主实例
 				// 在跑时应用会发现锁被占用、把参数转发过去然后自己退出（§3.2.2）。
 				hints := a.env.StaticHints(ctx, d)
-				res, perr := a.env.Probe(ctx, appKey, core.ProbeOptions{
+				res, fin, _, _, perr := a.env.ProbeWithRetry(ctx, appKey, core.ProbeOptions{
 					Command:          cmdline,
 					LockFile:         hints.LockFiles,
 					StaticPaths:      hints.Paths,
@@ -156,6 +156,17 @@ func newAddCmd(a *app) *cobra.Command {
 						// 而不是等确认页/档案落盘后才发现（§11.1）。
 						fmt.Fprintf(cmd.ErrOrStderr(), "appclone: %s\n", a.tr("probe.reads."+reason, nil))
 					},
+					OnRetry: func(args []string) {
+						// 零写入 + 自重启证据：解释为什么应用会被多启动一轮，
+						// 否则用户只看到"又开始了"。
+						fmt.Fprintf(cmd.ErrOrStderr(), "appclone: %s\n",
+							a.tr("probe.retry.self_relaunch", map[string]any{"args": strings.Join(args, " ")}))
+					},
+				}, core.ProbeFinalize{
+					Bundled:     bundled,
+					HasBundled:  hasBundled,
+					Existing:    old,
+					HasExisting: hasOld,
 				})
 				if perr != nil {
 					// 用户取消不是失败：有保留现场时让 main 打出路径（错误码
@@ -170,17 +181,8 @@ func newAddCmd(a *app) *cobra.Command {
 					return perr
 				}
 				// 预填、来源标注、零写入门槛、非路径字段合并只有 core 一份实现
-				// （FinalizeProbe）：GUI 确认页走同一个函数，否则同一个应用会被
-				// 两端落出两份档案（§6.1）。
-				fin, _, _, ferr := a.env.FinalizeProbe(appKey, res, core.ProbeFinalize{
-					Bundled:     bundled,
-					HasBundled:  hasBundled,
-					Existing:    old,
-					HasExisting: hasOld,
-				})
-				if ferr != nil {
-					return ferr
-				}
+				// （ProbeWithRetry → FinalizeProbe）：GUI 确认页走同一个函数，
+				// 否则同一个应用会被两端落出两份档案（§6.1）。
 				p = fin
 				readsWarns = res.ReadsWarns
 				keyringEvidence = res.KeyringEvidence

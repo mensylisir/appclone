@@ -485,7 +485,7 @@ func (v *setupView) probe() {
 		// app_running 直接失败。自检与探测各写一套判据迟早会说不到一处去。
 		hints := v.u.env.StaticHints(ctx, d)
 		cmdline := core.ProbeCommand(d.Exec, d.ExecArgs, v.existing, v.hasExisting)
-		res, perr := v.u.env.Probe(ctx, v.appKey, core.ProbeOptions{
+		res, fin, cands, prefilled, perr := v.u.env.ProbeWithRetry(ctx, v.appKey, core.ProbeOptions{
 			Command:     cmdline,
 			LockFile:    hints.LockFiles,
 			StaticPaths: hints.Paths,
@@ -523,6 +523,24 @@ func (v *setupView) probe() {
 					return false
 				})
 			},
+			OnRetry: func(args []string) {
+				// 零写入 + 自重启证据：说明应用会被多启动一轮，否则用户
+				// 只看到进度条从头再来。
+				v.u.goIdle(func(uintptr) bool {
+					if v.done || v.state != "probing" {
+						return false
+					}
+					v.countLabel.SetText(v.u.tr("probe.retry.self_relaunch",
+						map[string]any{"args": strings.Join(args, " ")}))
+					return false
+				})
+			},
+		}, core.ProbeFinalize{
+			Bundled:     v.bundled,
+			HasBundled:  v.hasBundled,
+			Existing:    v.existing,
+			HasExisting: v.hasExisting,
+			AllowEmpty:  v.mode == "setup" && !v.hasExisting,
 		})
 		v.u.goIdle(func(uintptr) bool {
 			v.release()
@@ -539,7 +557,7 @@ func (v *setupView) probe() {
 				v.showError(perr)
 				return false
 			}
-			v.applyProbeResult(res)
+			v.applyFinalized(res, fin, cands, prefilled)
 			return false
 		})
 	}()
@@ -565,30 +583,12 @@ func (v *setupView) release() {
 	v.u.app.Release()
 }
 
-// applyProbeResult 把探测结果落成确认页。落案规则（模板预填、来源标注、
-// 零写入门槛、非路径字段合并）全在 core.FinalizeProbe——CLI 的 `add` 用同一份，
-// 两个视图不会对同一探测结果落出两份语义不同的档案（§6.1）。
-func (v *setupView) applyProbeResult(res core.ProbeResult) {
+// applyFinalized 把已经落案的探测结果渲染成确认页。必须在 UI 线程调用。
+func (v *setupView) applyFinalized(res core.ProbeResult, p core.Profile, cands []core.Candidate, prefilled int) {
 	v.readsWarns = append([]string{}, res.ReadsWarns...)
 	v.readTrace = res.ReadTrace
 	// keyring 证据只来自本次探测；复用档案（open/clone）时没有证据。
 	v.keyringEvidence = res.KeyringEvidence
-	// AllowEmpty 只给 GUI 首次配置：读证据不可用时允许先进入确认页由用户
-	// 勾选；CLI 永不进入这条分支（§11.4）。
-	p, cands, prefilled, err := v.u.env.FinalizeProbe(v.appKey, res, core.ProbeFinalize{
-		Bundled:     v.bundled,
-		HasBundled:  v.hasBundled,
-		Existing:    v.existing,
-		HasExisting: v.hasExisting,
-		AllowEmpty:  v.mode == "setup" && !v.hasExisting,
-	})
-	if err != nil {
-		// 目前唯一可能的失败是"零写入"（只有缓存/共享/凭证被写过）：重探是
-		// 唯一有意义的动作，不能退化成一份什么都不隔离的空档案（§6.3）。
-		v.retry = v.probe
-		v.showError(err)
-		return
-	}
 	v.profile, v.cands, v.prefilled = p, cands, prefilled
 	v.u.setProfileWarns(v.appKey, p.Warnings)
 	v.setState("confirm")

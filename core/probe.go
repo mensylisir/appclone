@@ -43,6 +43,9 @@ type ProbeOptions struct {
 	StaticPaths []string
 	// OnReadsWarn 在每条读追踪告警产生时立即回调（可在后台线程调用）。
 	OnReadsWarn func(reason string)
+	// OnRetry 在零写入失败、准备用识别到的自重启参数重探时回调一次（可在
+	// 后台线程调用）。args 是追加到原命令后的增量，供界面说明"多启动一轮"。
+	OnRetry func(args []string)
 	// DisableReadTrace 关闭读追踪（零值 = 开启）。只用于性能对照/排障，
 	// 产品路径不设置它；关闭时 ReadTrace=unavailable 且不报 no_home_reads。
 	DisableReadTrace bool
@@ -78,6 +81,9 @@ type ProbeResult struct {
 	// SelfRelaunchUnknown 表示自动预填的 exec_args 只来自 RetKnown=false
 	// 的证据（`= ?` / `<unfinished>`）。run-scoped 诊断，只进 `add --json`。
 	SelfRelaunchUnknown bool `json:"self_relaunch_unknown,omitempty"`
+	// SelfRelaunchArgs 是本次探测接受的唯一自重启增量（不含初始参数）。
+	// 零写入失败时 ProbeWithRetry 用它再探一次；unknown 证据不触发重探。
+	SelfRelaunchArgs []string `json:"self_relaunch_args,omitempty"`
 }
 
 const probeTimeoutDefault = 30 * time.Minute
@@ -371,9 +377,11 @@ func (e *Env) probeStrace(ctx context.Context, app string, opt ProbeOptions, run
 		minRounds = 2
 	}
 	sr := DetectSelfRelaunchArgs(opt.Command[0], opt.Command[1:], trace.execCalls, minRounds)
+	var selfRelaunchArgs []string
 	if sr.OK {
 		probe.ExecArgs = sr.Args
 		probe.execArgsFromEvidence = true
+		selfRelaunchArgs = append([]string(nil), sr.Delta...)
 	}
 	selfRelaunchUnknown := sr.OK && !sr.Known
 	// 默认策略（方案 §6）：只有 observed 且能力可用才默认开启。KeyringSet
@@ -408,6 +416,7 @@ func (e *Env) probeStrace(ctx context.Context, app string, opt ProbeOptions, run
 		KeyringEvidence:     evidence,
 		KeyringTraceDropped: trace.keyringDropped,
 		SelfRelaunchUnknown: selfRelaunchUnknown,
+		SelfRelaunchArgs:    selfRelaunchArgs,
 	}, nil
 }
 
@@ -913,9 +922,11 @@ func (e *Env) probeSession(ctx context.Context, app string, opt ProbeOptions, mo
 		minRounds = 2
 	}
 	sr := DetectSelfRelaunchArgs(opt.Command[0], opt.Command[1:], trace.execCalls, minRounds)
+	var selfRelaunchArgs []string
 	if sr.OK {
 		probe.ExecArgs = sr.Args
 		probe.execArgsFromEvidence = true
+		selfRelaunchArgs = append([]string(nil), sr.Delta...)
 	}
 	selfRelaunchUnknown := sr.OK && !sr.Known
 	// 默认策略（方案 §6）：observed 且能力可用才默认开启；KeyringSet=false
@@ -952,6 +963,7 @@ func (e *Env) probeSession(ctx context.Context, app string, opt ProbeOptions, mo
 		KeyringEvidence:     evidence,
 		KeyringTraceDropped: trace.keyringDropped,
 		SelfRelaunchUnknown: selfRelaunchUnknown,
+		SelfRelaunchArgs:    selfRelaunchArgs,
 	}, nil
 }
 

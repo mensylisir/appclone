@@ -63,6 +63,9 @@ func TestProbeSessionSelfRelaunchArgs(t *testing.T) {
 	if !res.Profile.execArgsFromEvidence {
 		t.Fatal("自动预填必须标记证据来源")
 	}
+	if !slices.Equal(res.SelfRelaunchArgs, []string{"--ozone-platform=x11"}) {
+		t.Fatalf("ProbeResult 应带出自重启增量，得到 %q", res.SelfRelaunchArgs)
+	}
 	if res.SelfRelaunchUnknown {
 		t.Fatal("known 证据不应标 unknown")
 	}
