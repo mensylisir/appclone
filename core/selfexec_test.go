@@ -1,6 +1,7 @@
 package core
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -8,6 +9,15 @@ import (
 
 func execCall(path string, round int, known bool, argv ...string) ExecCall {
 	return ExecCall{Path: path, Args: argv, Round: round, RetKnown: known}
+}
+
+// manyFlags 生成 n 个互不相同、无危险语义的长旗标，用于验证增量上限。
+func manyFlags(n int) []string {
+	out := make([]string, n)
+	for i := range out {
+		out[i] = fmt.Sprintf("--feature-%d", i)
+	}
+	return out
 }
 
 func TestSameExecPath(t *testing.T) {
@@ -237,6 +247,90 @@ func TestDetectSelfRelaunchArgs(t *testing.T) {
 			},
 			min:    2,
 			wantOK: false,
+		},
+		{
+			// 危险词前加前缀不能绕过（Contains 匹配）。
+			name: "危险旗标前缀变体拒绝",
+			calls: []ExecCall{
+				execCall(q, 0, true, q),
+				execCall(q, 0, true, q, "--disable-sandbox"),
+				execCall(q, 1, true, q, "--disable-sandbox"),
+			},
+			min:    2,
+			wantOK: false,
+		},
+		{
+			name: "危险旗标后缀变体拒绝",
+			calls: []ExecCall{
+				execCall(q, 0, true, q),
+				execCall(q, 0, true, q, "--app-config=/tmp/c"),
+				execCall(q, 1, true, q, "--app-config=/tmp/c"),
+			},
+			min:    2,
+			wantOK: false,
+		},
+		{
+			name: "危险旗标加 x- 前缀拒绝",
+			calls: []ExecCall{
+				execCall(q, 0, true, q),
+				execCall(q, 0, true, q, "--x-user-data-dir=/tmp/u"),
+				execCall(q, 1, true, q, "--x-user-data-dir=/tmp/u"),
+			},
+			min:    2,
+			wantOK: false,
+		},
+		{
+			name: "危险旗标下划线写法拒绝",
+			calls: []ExecCall{
+				execCall(q, 0, true, q),
+				execCall(q, 0, true, q, "--app_profile=work"),
+				execCall(q, 1, true, q, "--app_profile=work"),
+			},
+			min:    2,
+			wantOK: false,
+		},
+		{
+			// 只接受长旗标：短旗标/单词参数语义不明，预填可能改变应用行为。
+			name: "短旗标拒绝",
+			calls: []ExecCall{
+				execCall(q, 0, true, q),
+				execCall(q, 0, true, q, "-v"),
+				execCall(q, 1, true, q, "-v"),
+			},
+			min:    2,
+			wantOK: false,
+		},
+		{
+			name: "位置参数拒绝",
+			calls: []ExecCall{
+				execCall(q, 0, true, q),
+				execCall(q, 0, true, q, "work"),
+				execCall(q, 1, true, q, "work"),
+			},
+			min:    2,
+			wantOK: false,
+		},
+		{
+			name: "增量超过上限拒绝",
+			calls: []ExecCall{
+				execCall(q, 0, true, q),
+				execCall(q, 0, true, append([]string{q}, manyFlags(17)...)...),
+				execCall(q, 1, true, append([]string{q}, manyFlags(17)...)...),
+			},
+			min:    2,
+			wantOK: false,
+		},
+		{
+			name: "增量恰为上限接受",
+			calls: []ExecCall{
+				execCall(q, 0, true, q),
+				execCall(q, 0, true, append([]string{q}, manyFlags(16)...)...),
+				execCall(q, 1, true, append([]string{q}, manyFlags(16)...)...),
+			},
+			min:       2,
+			wantOK:    true,
+			wantArgs:  manyFlags(16),
+			wantKnown: true,
 		},
 	}
 

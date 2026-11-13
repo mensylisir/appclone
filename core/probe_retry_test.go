@@ -3,7 +3,10 @@ package core
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
+	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
@@ -126,6 +129,38 @@ func TestProbeWithRetrySelfRelaunch(t *testing.T) {
 	}
 }
 
+// TestProbeWithRetryOverridesOldExecArgs 覆盖"旧档案已有 exec_args"的合并
+// 顺序：重探识别出的增量必须覆盖旧值，而不是被 merge 层用旧档案写回去
+// （ADR-036 审查 P2）。
+func TestProbeWithRetryOverridesOldExecArgs(t *testing.T) {
+	e := probeEnv(t)
+	q := "/opt/Qoder CN/qoder-cn"
+	ozone := "--ozone-platform=x11"
+	m := &retryMounter{
+		fakeMounter:   &fakeMounter{},
+		secondEntries: []string{".config/QoderCN/state"},
+	}
+	r := &execFifoRunner{q: q}
+	old := Profile{App: "qoder", Exec: q, ExecArgs: []string{"--old-flag"}}
+	_, p, _, _, err := e.ProbeWithRetry(context.Background(), "qoder", ProbeOptions{
+		Command: []string{q},
+		Mounter: m,
+		Runner:  r,
+		Rounds:  2,
+	}, ProbeFinalize{Existing: old, HasExisting: true})
+	if err != nil {
+		t.Fatalf("重探后应成功，得到 %v", err)
+	}
+	if !slices.Equal(p.ExecArgs, []string{ozone}) {
+		t.Fatalf("重探识别出的 exec_args 应覆盖旧档案，得到 %q", p.ExecArgs)
+	}
+	for _, w := range p.Warnings {
+		if w == "exec_args_preserved" {
+			t.Fatal("有本次证据时不应告警 exec_args_preserved")
+		}
+	}
+}
+
 // TestProbeWithRetryNoEvidence 确保没有自重启证据时不会多启动一轮：
 // 零写入错误原样返回，挂载只发生一次。
 func TestProbeWithRetryNoEvidence(t *testing.T) {
@@ -147,6 +182,85 @@ func TestProbeWithRetryNoEvidence(t *testing.T) {
 	}
 	if m.calls != 1 || r.calls != 1 {
 		t.Fatalf("没有证据时不能重探，得到挂载 %d 次、启动 %d 次", m.calls, r.calls)
+	}
+}
+
+// allowEmptyRunner 模拟 GUI 首次配置的降级路径：读证据不可用（strace 兜底），
+// 第一次探测只看到自重启、没有任何写入；带上增量重探后才写出配置目录。
+type allowEmptyRunner struct {
+	q, home string
+	calls   int
+}
+
+func (f *allowEmptyRunner) Run(_ context.Context, argv []string, _ io.Writer) (SessionResult, error) {
+	f.calls++
+	fifo := ""
+	for i, a := range argv {
+		if a == "-o" && i+1 < len(argv) {
+			fifo = argv[i+1]
+			break
+		}
+	}
+	if fifo == "" {
+		return SessionResult{ExitCode: 0, Started: true}, nil
+	}
+	lines := fmt.Sprintf(
+		"1 execve(%q, [%q], 0x0) = 0\n1 execve(%q, [%q, %q], 0x0) = 0\n",
+		f.q, f.q, f.q, f.q, "--ozone-platform=x11")
+	if f.calls > 2 {
+		lines += fmt.Sprintf("1 openat(AT_FDCWD, %q, O_WRONLY|O_CREAT, 0600) = 3\n",
+			filepath.Join(f.home, ".config/QoderCN/state"))
+	}
+	fh, err := os.OpenFile(fifo, os.O_WRONLY, 0)
+	if err != nil {
+		return SessionResult{}, err
+	}
+	if _, err := fh.WriteString(lines); err != nil {
+		_ = fh.Close()
+		return SessionResult{}, err
+	}
+	if err := fh.Close(); err != nil {
+		return SessionResult{}, err
+	}
+	return SessionResult{ExitCode: 0, Started: true}, nil
+}
+
+// TestProbeWithRetryAllowEmpty 锁定 GUI 降级确认页的重探：读证据不可用时
+// FinalizeProbe 返回 nil + 空 paths（AllowEmpty），有自重启证据就不该停在
+// 空确认页，而应带上增量再探一次拿到真实写入。
+func TestProbeWithRetryAllowEmpty(t *testing.T) {
+	e := probeEnv(t)
+	// 读能力不可用 → strace 兜底；exec 证据仍采集。
+	e.ProbeCapsOverride = &ProbeCaps{Read: false, Write: true, Y: true}
+	q := "/opt/Qoder CN/qoder-cn"
+	r := &allowEmptyRunner{q: q, home: e.Resolver.Home}
+	var retried [][]string
+	res, p, _, _, err := e.ProbeWithRetry(context.Background(), "qoder", ProbeOptions{
+		Command: []string{q},
+		// fuse-overlayfs 缺失 → Probe 走 strace 兜底（读证据不可用）。
+		Mounter:     &fakeMounter{failOn: "available"},
+		Runner:      r,
+		Rounds:      2,
+		StaticPaths: []string{filepath.Join(e.Resolver.Home, ".config/QoderCN")},
+		OnRetry:     func(args []string) { retried = append(retried, args) },
+	}, ProbeFinalize{AllowEmpty: true})
+	if err != nil {
+		t.Fatalf("降级页有自重启证据时应重探成功，得到 %v", err)
+	}
+	if r.calls != 4 {
+		t.Fatalf("应重探一次（2 轮 × 2 次），得到 %d", r.calls)
+	}
+	if len(retried) != 1 {
+		t.Fatalf("OnRetry 应回调一次，得到 %q", retried)
+	}
+	if len(p.Paths) == 0 {
+		t.Fatal("重探后应拿到真实写入路径，不能停在空确认页")
+	}
+	if !slices.Equal(p.ExecArgs, []string{"--ozone-platform=x11"}) {
+		t.Fatalf("重探后应带 exec_args，得到 %q", p.ExecArgs)
+	}
+	if res.ReadTrace != ReadTraceUnavailable {
+		t.Fatalf("本场景读证据应不可用，得到 %q", res.ReadTrace)
 	}
 }
 

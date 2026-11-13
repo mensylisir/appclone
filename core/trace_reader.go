@@ -175,11 +175,16 @@ func (r *traceReader) consume(line string) {
 		// 已到上限：继续解析但丢弃路径结果，保证 FIFO 被排空、strace 不阻塞。
 		// exec/keyring 证据是**采集级**状态，必须带回 r.res：它们是上限之外
 		// 的独立口径，不能每行重置（方案 §6 D3 / ADR-036）。
+		//
+		// 这里直接共享底层切片而不深拷贝：解析在 r.mu 内单线程进行，sink 的
+		// append/淘汰都作用于同一组数组，解析完再整体赋回 r.res。此前每行
+		// 深拷贝 256 条 argv，超限后（子进程反复 exec 时）会变成显著的 CPU
+		// 与内存抖动。
 		sink := StraceResult{
 			Stats:               r.res.Stats,
-			ExecCalls:           deepCopyExecCalls(r.res.ExecCalls),
+			ExecCalls:           r.res.ExecCalls,
 			ExecSeen:            r.res.ExecSeen,
-			Execs:               append([]string(nil), r.res.Execs...),
+			Execs:               r.res.Execs,
 			execEvidenceOnly:    r.res.execEvidenceOnly,
 			round:               r.res.round,
 			keyringSeen:         r.res.keyringSeen,

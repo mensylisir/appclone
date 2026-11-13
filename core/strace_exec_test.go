@@ -1,6 +1,7 @@
 package core
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 )
@@ -158,6 +159,79 @@ func TestExecCallRing(t *testing.T) {
 	}
 	if last := res.ExecCalls[len(res.ExecCalls)-1]; last.Path != "/opt/app/child" {
 		t.Fatalf("最近证据必须保留，得到 %q", last.Path)
+	}
+}
+
+func TestExecCallRingPinsPerPathBaseline(t *testing.T) {
+	// bwrap 先 exec，目标应用随后 exec：两者各自的第一条调用都是基线。
+	// 环形缓冲淘汰时若只保留 index 0，目标基线会被子进程刷掉，自重启识别
+	// 就会静默失效（ADR-036 审查 P2）。
+	var b strings.Builder
+	b.WriteString(`1 execve("/usr/bin/bwrap", ["bwrap"], 0x0) = 0` + "\n")
+	b.WriteString(`2 execve("/opt/Qoder CN/qoder-cn", ["qoder-cn"], 0x0) = 0` + "\n")
+	for i := 0; i < execCallLimit+50; i++ {
+		b.WriteString(`3 execve("/opt/Qoder CN/qoder-cn", ["qoder-cn", "--type=renderer"], 0x0) = 0` + "\n")
+	}
+	res := ParseStraceAll(strings.NewReader(b.String()), "/home/u")
+	if len(res.ExecCalls) != execCallLimit {
+		t.Fatalf("环形上限应为 %d，得到 %d", execCallLimit, len(res.ExecCalls))
+	}
+	var baseline *ExecCall
+	for i := range res.ExecCalls {
+		c := &res.ExecCalls[i]
+		if c.Path == "/opt/Qoder CN/qoder-cn" && len(c.Args) == 1 {
+			baseline = c
+			break
+		}
+	}
+	if baseline == nil {
+		t.Fatalf("目标应用基线被环形缓冲淘汰：%#v", res.ExecCalls[:3])
+	}
+	if !baseline.pinned {
+		t.Fatal("目标应用首条调用应标记为 pinned")
+	}
+	// 同一路径的后续调用不是基线，不能一起钉住（否则环形缓冲退化为只增）。
+	pinned := 0
+	for _, c := range res.ExecCalls {
+		if c.pinned {
+			pinned++
+		}
+	}
+	if pinned != 2 {
+		t.Fatalf("应只有两条基线（bwrap + 目标）被钉住，得到 %d", pinned)
+	}
+}
+
+func TestExecPathLimit(t *testing.T) {
+	var b strings.Builder
+	for i := 0; i < execPathLimit+20; i++ {
+		fmt.Fprintf(&b, "1 execve(\"/opt/app/bin%d\", [\"bin\"], 0x0) = 0\n", i)
+	}
+	res := ParseStraceAll(strings.NewReader(b.String()), "/home/u")
+	if len(res.Execs) != execPathLimit {
+		t.Fatalf("Execs 上限应为 %d，得到 %d", execPathLimit, len(res.Execs))
+	}
+}
+
+func TestExecveatEmptyPathFlags(t *testing.T) {
+	cases := []struct {
+		flags string
+		want  bool
+	}{
+		{"AT_EMPTY_PATH", true},
+		{"AT_SYMLINK_NOFOLLOW|AT_EMPTY_PATH", true},
+		{"0x1000", true},
+		{"4096", true},
+		{"0x1800", true}, // AT_EMPTY_PATH 与 AT_SYMLINK_NOFOLLOW 组合
+		{"0", false},
+		{"0x800", false},
+		{"AT_SYMLINK_NOFOLLOW", false},
+		{"", false},
+	}
+	for _, c := range cases {
+		if got := execveatEmptyPath(c.flags); got != c.want {
+			t.Fatalf("execveatEmptyPath(%q)=%v，期望 %v", c.flags, got, c.want)
+		}
 	}
 }
 

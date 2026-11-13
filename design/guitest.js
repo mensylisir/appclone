@@ -1,4 +1,4 @@
-// 交互回归（74 项）：三屏 + 探测四态（probing/confirm/creating/error）+ 五入口 + 三处破坏性确认
+// 交互回归（75 项）：三屏 + 探测四态（probing/confirm/creating/error）+ 五入口 + 三处破坏性确认
 //                    + 门禁 + 搜索 + 横幅语义 + 空态可达性 + 运行/停止状态
 //                    + 读证据四态/锁定缓存行/credential 徽标/confirm-empty
 //                    + 登录状态（独立密钥环）：默认策略/隐含锁定/能力缺失/迁移提示
@@ -9,7 +9,7 @@ const path = require('path');
 const fs = require('fs');
 const { pathToFileURL } = require('url');
 
-const EXPECTED = 74;   // 断言总数；改动断言必须同步改这里（否则退出码永远是 1）
+const EXPECTED = 75;   // 断言总数；改动断言必须同步改这里（否则退出码永远是 1）
 
 function loadPuppeteer() {
   const cands = [
@@ -150,6 +150,18 @@ const pp = loadPuppeteer();
       const txt = document.querySelector('#dlgBody').textContent;
       return txt.includes('个写入条目') && !txt.includes('命中');
     }); });
+  /* 零写入但识别到自重启参数时，core 会用该参数再探一次（ADR-036 ⑧）。
+     界面必须说明"又要多启动两轮"，否则用户看到窗口弹两次会以为出故障。 */
+  await t('重探态 → 显示自重启参数与「再启动两轮」说明', async () => {
+    const ok = await ev(() => {
+      showProbeRetry(['--ozone-platform=x11']);
+      const el = document.querySelector('#pretry');
+      return !!el && el.textContent.includes('--ozone-platform=x11')
+        && el.textContent.includes('再启动两轮') && !el.textContent.includes('命中');
+    });
+    await ev(() => { probeRetryArgs = null; renderDialog(); });
+    return ok || '重探说明缺失或不完整';
+  });
   await t('探测完成 → 进入确认态，按钮是「创建分身」', async () => {
     const ok = await waitFor(() => !!document.querySelector('[data-chk]'));
     if (!ok) return '探测没在上限内进入 confirm 态';

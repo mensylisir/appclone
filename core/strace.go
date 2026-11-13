@@ -7,6 +7,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"unicode"
 	"unicode/utf8"
 )
 
@@ -57,6 +58,10 @@ type ExecCall struct {
 	Args     []string
 	RetKnown bool
 	Round    int
+	// pinned 表示这是某个 exec 路径的第一条证据（自重启基线）。环形缓冲
+	// 淘汰时跳过 pinned，否则 bwrap/sh 先占掉首条、目标应用基线被挤掉，
+	// 识别会静默失效。
+	pinned bool
 }
 
 // StraceResult 是一次解析的全部证据。
@@ -540,8 +545,12 @@ func execveatEmptyPath(flags string) bool {
 	if strings.Contains(flags, "at_empty_path") {
 		return true
 	}
-	// 老 strace 可能只打印数值：AT_EMPTY_PATH == 0x1000。
-	return flags == "0x1000" || flags == "4096"
+	// 老 strace 可能只打印数值：AT_EMPTY_PATH == 0x1000，可能与其他 flags
+	// 组合（0x1800 等），必须按位判断而不是整值相等。
+	if v, err := strconv.ParseUint(flags, 0, 64); err == nil {
+		return v&0x1000 != 0
+	}
+	return false
 }
 
 // isReadOpen 判定 open 系列是否产生读证据：
@@ -572,11 +581,13 @@ func isWriteOpen(call, flags string) bool {
 	return false
 }
 
-// execCallLimit 是 ExecCall 环形上限：首条基线 + 最近 255 条。子进程会刷
-// 大量 execve，目标应用的自重启证据必须留在窗口里。
+// execCallLimit 是 ExecCall 环形上限：按 exec 路径钉住的首条基线 + 其余
+// 最近条目，共 256。子进程会刷大量 execve，目标应用的自重启证据必须留在
+// 窗口里。
 const execCallLimit = 256
 
-// deepCopyExecCalls 复制证据并逐条 clone Args，供 snapshot 与 100k sink 共用。
+// deepCopyExecCalls 复制证据并逐条 clone Args，供 snapshot 使用（100k sink
+// 在锁内直接共享切片，不再调用它）。
 func deepCopyExecCalls(in []ExecCall) []ExecCall {
 	if len(in) == 0 {
 		return nil
@@ -591,23 +602,44 @@ func deepCopyExecCalls(in []ExecCall) []ExecCall {
 
 // recordExecCall 记录一条 exec 证据。Path 必须是绝对路径（调用方已解析
 // dirfd/AT_EMPTY_PATH）；argv 解析失败时由调用方只计 ExecArgsSkipped。
+//
+// 环形缓冲为每个 exec 路径钉住第一条证据：生产命令是
+// `strace -- bwrap -- app`，首条 exec 是 bwrap，目标应用基线在索引 1；
+// 只保索引 0 的话，应用子进程一多就会把目标基线挤掉。
 func recordExecCall(res *StraceResult, path string, argv []string, retKnown bool) {
 	if path == "" || !filepath.IsAbs(path) {
 		return
 	}
+	path = stripDeleted(path)
 	call := ExecCall{
-		Path:     stripDeleted(path),
+		Path:     path,
 		Args:     append([]string(nil), argv...),
 		RetKnown: retKnown,
 		Round:    res.round,
 	}
+	first := true
+	for _, c := range res.ExecCalls {
+		if c.pinned && c.Path == path {
+			first = false
+			break
+		}
+	}
+	call.pinned = first
 	if len(res.ExecCalls) < execCallLimit {
 		res.ExecCalls = append(res.ExecCalls, call)
 		return
 	}
-	// 保留首条基线，丢弃索引 1（最旧的“最近”条目），再追加新证据。
-	copy(res.ExecCalls[1:], res.ExecCalls[2:])
-	res.ExecCalls = res.ExecCalls[:len(res.ExecCalls)-1]
+	// 淘汰最旧的非基线条目；全部是基线时退回索引 1，保证新证据能进来。
+	// 全 pinned 需要 >256 个不同 exec 路径（病态进程树），此时只能牺牲一条
+	// 基线换最近证据；后续同路径 exec 会重新建立基线。
+	evict := 1
+	for i := 1; i < len(res.ExecCalls); i++ {
+		if !res.ExecCalls[i].pinned {
+			evict = i
+			break
+		}
+	}
+	res.ExecCalls = append(res.ExecCalls[:evict], res.ExecCalls[evict+1:]...)
 	res.ExecCalls = append(res.ExecCalls, call)
 }
 
@@ -659,13 +691,14 @@ func quotedArray(arg string) ([]string, bool) {
 }
 
 // validExecArg 拒绝会破坏 argv/档案的字符串：非法 UTF-8、NUL、控制字符、
-// 超过 512 字节的单参数。空字符串是合法 argv 元素。
+// Unicode 格式/双向字符（U+202E 之类会伪造档案显示）、超过 512 字节的
+// 单参数。空字符串是合法 argv 元素。
 func validExecArg(s string) bool {
 	if len(s) > 512 || !utf8.ValidString(s) {
 		return false
 	}
 	for _, r := range s {
-		if r == 0 || (r < 0x20 && r != '\t') || r == 0x7f {
+		if unicode.IsControl(r) || unicode.Is(unicode.Cf, r) {
 			return false
 		}
 	}
@@ -727,6 +760,25 @@ func looseExecArgs(rest string) string {
 	return ""
 }
 
+// execPathLimit 是 Execs 的去重上限。Execs 只用于 setuid 目标检查，进程树
+// 反复 exec 时无上限会让解析结果随时间线性增长；目标应用通常在头几条里，
+// 保留前 64 条足够，超出的不再追加（不淘汰已有条目）。
+const execPathLimit = 64
+
+// recordExecPath 记录一次成功 exec 的目标路径（去重、有上限）。三个解析
+// 分支共用，避免各处各自 append 时漏掉去重或上限。
+func recordExecPath(res *StraceResult, raw string) {
+	for _, x := range res.Execs {
+		if x == raw {
+			return
+		}
+	}
+	if len(res.Execs) >= execPathLimit {
+		return
+	}
+	res.Execs = append(res.Execs, raw)
+}
+
 // parseLooseExecLine 解析 `= ?` / `<unfinished>` 的 exec 行。只记录
 // ExecCall（RetKnown=false）、ExecSeen/Execs，不追加 Reads、不计 ParseErrors。
 func parseLooseExecLine(line string, res *StraceResult) bool {
@@ -775,16 +827,7 @@ func parseLooseExecLine(line string, res *StraceResult) bool {
 		raw = filepath.Join(base, raw)
 	}
 	res.ExecSeen = true
-	dup := false
-	for _, x := range res.Execs {
-		if x == raw {
-			dup = true
-			break
-		}
-	}
-	if !dup {
-		res.Execs = append(res.Execs, raw)
-	}
+	recordExecPath(res, raw)
 	if argv, ok := execArgvFromParts(call, parts); ok {
 		recordExecCall(res, raw, argv, false)
 	} else {
@@ -882,7 +925,7 @@ func parseReadCall(c straceCall, home string, res *StraceResult, seen map[string
 	}
 	raw = stripDeleted(raw)
 	if isExec && filepath.IsAbs(raw) {
-		res.Execs = append(res.Execs, raw)
+		recordExecPath(res, raw)
 	}
 
 	// 相对路径优先用参数侧 dirfd 注解，其次用返回值注解（fd 指向的真实路径）。
@@ -913,16 +956,7 @@ func parseReadCall(c straceCall, home string, res *StraceResult, seen map[string
 resolved:
 	if isExec && filepath.IsAbs(raw) {
 		// 相对 execveat 解析后的目标也要记录（绝对路径已在上面记录过）。
-		dup := false
-		for _, x := range res.Execs {
-			if x == raw {
-				dup = true
-				break
-			}
-		}
-		if !dup {
-			res.Execs = append(res.Execs, raw)
-		}
+		recordExecPath(res, raw)
 		if execArgvOK {
 			recordExecCall(res, raw, execArgv, c.retKnown)
 		} else {

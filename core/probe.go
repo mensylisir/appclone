@@ -78,12 +78,14 @@ type ProbeResult struct {
 	// 非零表示"未观测到 keyring"可能是证据不全，而不是应用真的不用——
 	// 必须可诊断，否则探测结论会静默降级。
 	KeyringTraceDropped int `json:"keyring_trace_dropped,omitempty"`
-	// SelfRelaunchUnknown 表示自动预填的 exec_args 只来自 RetKnown=false
-	// 的证据（`= ?` / `<unfinished>`）。run-scoped 诊断，只进 `add --json`。
+	// SelfRelaunchUnknown 表示识别到的自重启增量只来自 RetKnown=false
+	// 的证据（`= ?` / `<unfinished>`）。它只做 run-scoped 诊断：unknown
+	// 证据不落盘、不覆盖旧参数、不驱动重探。
 	SelfRelaunchUnknown bool `json:"self_relaunch_unknown,omitempty"`
-	// SelfRelaunchArgs 是本次探测接受的唯一自重启增量（不含初始参数）。
-	// 零写入失败时 ProbeWithRetry 用它再探一次；unknown 证据不触发重探。
-	SelfRelaunchArgs []string `json:"self_relaunch_args,omitempty"`
+	// SelfRelaunchArgs 是本次探测接受的唯一自重启增量（不含初始参数），
+	// 仅供 ProbeWithRetry 判断是否重探；不进入 `add --json` 契约，显式排除
+	// 任何直接序列化路径。
+	SelfRelaunchArgs []string `json:"-"`
 }
 
 const probeTimeoutDefault = 30 * time.Minute
@@ -379,9 +381,12 @@ func (e *Env) probeStrace(ctx context.Context, app string, opt ProbeOptions, run
 	sr := DetectSelfRelaunchArgs(opt.Command[0], opt.Command[1:], trace.execCalls, minRounds)
 	var selfRelaunchArgs []string
 	if sr.OK {
-		probe.ExecArgs = sr.Args
-		probe.execArgsFromEvidence = true
 		selfRelaunchArgs = append([]string(nil), sr.Delta...)
+		// unknown 证据只做诊断：不落盘、不覆盖旧参数、不驱动重探。
+		if sr.Known {
+			probe.ExecArgs = sr.Args
+			probe.execArgsFromEvidence = true
+		}
 	}
 	selfRelaunchUnknown := sr.OK && !sr.Known
 	// 默认策略（方案 §6）：只有 observed 且能力可用才默认开启。KeyringSet
@@ -924,9 +929,12 @@ func (e *Env) probeSession(ctx context.Context, app string, opt ProbeOptions, mo
 	sr := DetectSelfRelaunchArgs(opt.Command[0], opt.Command[1:], trace.execCalls, minRounds)
 	var selfRelaunchArgs []string
 	if sr.OK {
-		probe.ExecArgs = sr.Args
-		probe.execArgsFromEvidence = true
 		selfRelaunchArgs = append([]string(nil), sr.Delta...)
+		// unknown 证据只做诊断：不落盘、不覆盖旧参数、不驱动重探。
+		if sr.Known {
+			probe.ExecArgs = sr.Args
+			probe.execArgsFromEvidence = true
+		}
 	}
 	selfRelaunchUnknown := sr.OK && !sr.Known
 	// 默认策略（方案 §6）：observed 且能力可用才默认开启；KeyringSet=false

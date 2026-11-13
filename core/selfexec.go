@@ -155,8 +155,8 @@ func filterSelfRelaunchDelta(rawDelta, initialArgs []string) ([]string, bool) {
 			remaining[a]--
 			continue // initialArgs 里已有的参数不重复追加
 		}
-		if !strings.HasPrefix(a, "-") || !validExecArg(a) {
-			return nil, false // 位置参数/裸值/非法字符串
+		if !strings.HasPrefix(a, "--") || !validExecArg(a) {
+			return nil, false // 位置参数/裸值/短旗标/非法字符串
 		}
 		if childProcessSelector(a) || dangerousSelfRelaunchFlag(a) {
 			return nil, false
@@ -164,6 +164,7 @@ func filterSelfRelaunchDelta(rawDelta, initialArgs []string) ([]string, bool) {
 		out = append(out, a)
 	}
 	if len(out) == 0 || len(out) > 16 {
+		// 上限 16：正常自重启只追加一两个旗标；异常长的增量宁可不预填。
 		return nil, false
 	}
 	return out, true
@@ -185,7 +186,9 @@ func childProcessSelector(arg string) bool {
 }
 
 // dangerousSelfRelaunchFlag 拒绝会改写数据目录/沙箱/调试/代理/日志边界或
-// 携带凭据的旗标。名称归一化后按前缀匹配（--user-data-dir=… → userdatadir）。
+// 携带凭据的旗标。名称归一化后按**包含**匹配（--user-data-dir=… → userdatadir，
+// --x-user-data-dir → xuserdatadir，--disable-sandbox → disablesandbox 都命中），
+// 避免攻击者在危险词前加前缀绕过；自动预填宁可少写。
 func dangerousSelfRelaunchFlag(arg string) bool {
 	name := normalizeFlagName(arg)
 	if name == "" {
@@ -213,7 +216,7 @@ func dangerousSelfRelaunchFlag(arg string) bool {
 		"jsflags", "disablewebsecurity", "ignorecertificateerrors",
 		"socket", "dbus",
 	} {
-		if strings.HasPrefix(name, bad) {
+		if strings.Contains(name, bad) {
 			return true
 		}
 	}

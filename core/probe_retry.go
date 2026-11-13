@@ -40,11 +40,16 @@ func (e *Env) ProbeWithRetry(ctx context.Context, app string, opt ProbeOptions, 
 		return res, Profile{}, nil, 0, err
 	}
 	p, cands, prefilled, ferr := e.FinalizeProbe(app, res, fin)
-	if ferr == nil {
+	if ferr == nil && len(p.Paths) > 0 {
 		return res, p, cands, prefilled, nil
 	}
+	// ferr==nil 但 paths 为空只可能是 GUI 的 AllowEmpty 降级页（读证据不可用）：
+	// 既然有自重启证据，重探能拿到真实写入，就不该停在空确认页。
+	if ferr != nil && !isNoWritesErr(ferr) {
+		return res, p, cands, prefilled, ferr
+	}
 	retry := ProbeRetryCommand(opt.Command, res)
-	if retry == nil || !isNoWritesErr(ferr) {
+	if retry == nil {
 		return res, p, cands, prefilled, ferr
 	}
 	if opt.OnRetry != nil {
@@ -55,6 +60,10 @@ func (e *Env) ProbeWithRetry(ctx context.Context, app string, opt ProbeOptions, 
 	if err != nil {
 		return res, Profile{}, nil, 0, err
 	}
+	// 重探命令里的增量来自第一次探测的 exec 证据。第二次探测本身看不到
+	// 自重启（参数已在命令行里），必须显式标记证据来源，否则合并层会用
+	// 旧档案的 exec_args 覆盖掉刚识别出的增量（ADR-036 ⑧）。
+	res.Profile.execArgsFromEvidence = true
 	p, cands, prefilled, ferr = e.FinalizeProbe(app, res, fin)
 	return res, p, cands, prefilled, ferr
 }

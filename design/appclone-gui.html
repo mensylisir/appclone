@@ -314,6 +314,10 @@
   @keyframes spin { to { transform:rotate(360deg) } }
   .probing .ptitle { font-size:14.5px; font-weight:600 }
   .probing .pcount { font-size:12.5px; color:var(--dim); margin-top:8px }
+  .probing .pretry {
+    font-size:12.5px; color:var(--dim); margin-top:10px; padding:8px 10px; border-radius:8px;
+    background:var(--hover); text-align:left; line-height:1.55;
+  }
   .probing .phint { font-size:12px; color:var(--faint); margin-top:14px; line-height:1.6 }
   .readonly-row {
     display:flex; align-items:center; gap:11px; padding:9px 12px; font-size:13px; color:var(--dim);
@@ -767,6 +771,14 @@ let forkOn = false;
 let probeReason = 'no_writes';   // error 态的原因，决定文案；所有失败共用一句"探测失败"等于没告诉用户任何事
 let probeTimer = null, probeTick = null, createTimer = null;
 let foundCount = 0;
+/* 零写入 + 已识别到应用自重启追加的参数：core 会用该参数再探一次（ADR-036 ⑧）。
+   界面必须说明"应用会再启动两轮"，否则用户看到窗口弹两次会以为出了故障。 */
+let probeRetryArgs = null;
+/* OnRetry 回调的界面映射：Go 侧在后台线程调用，GTK 侧用 idle 转到主线程后调这个。 */
+function showProbeRetry(args) {
+  probeRetryArgs = Array.isArray(args) ? args.slice() : [];
+  renderDialog();
+}
 let currentScreen = 1;   // 实际可见屏：closeDialog 之后 tab 高亮要以它为准，不用 currentApp 猜
 /* 屏1 的两个平级视图（对应 AdwViewStack 的 on / all 两页）：
    各自一个滚动区，上下一体、两条滚动条的结构已被否掉 */
@@ -929,7 +941,7 @@ function stopProbeTimers() {
 function startProbe(app) {
   stopProbeTimers();                  // 重入先清旧的，不能只覆盖句柄（泄漏）
   const epoch = probeEpoch;
-  dlgState = 'probing'; foundCount = 0;
+  dlgState = 'probing'; foundCount = 0; probeRetryArgs = null;
   /* 闸门在探测会话启动**之前**跑（discover.md §4）。目标应用还在运行时，新的启动请求会被转发给
      已运行的主实例，探测会话里一个字节都不会写——这时若走"没跟踪到任何写入"，就是把闸门失败
      误诊成"这个应用不写盘"，用户会反复重试一个永远不会成功的流程 */
@@ -1010,6 +1022,7 @@ function renderDialog() {
         <div class="spinner"></div>
         <div class="ptitle">正在跟踪「${a.name}」的写入…</div>
         <div class="pcount">已发现 <b id="pcount">${foundCount}</b> 个写入条目</div>
+        ${probeRetryArgs ? `<div class="pretry" id="pretry">应用自重启并追加了启动参数（${probeRetryArgs.join(' ')}），本轮没有可隔离的写入；正在带上该参数再探测一次（应用会再启动两轮）。</div>` : ''}
         <div class="phint">在应用里正常用一会儿——收发文件、改设置——然后关掉它。<br>随时可以点下面的「取消探测」。</div>
       </div>`;
     foot.style.display = 'none';   // 探测中没有"创建"这个动作

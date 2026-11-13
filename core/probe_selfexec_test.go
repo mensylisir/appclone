@@ -13,9 +13,10 @@ import (
 // 次数写入两轮 qoder 型 execve 证据。第 3 次（overlay 的 rerun）没有 -o，
 // 只返回结果，不写 FIFO。
 type execFifoRunner struct {
-	q     string
-	calls int
-	code  int
+	q       string
+	calls   int
+	code    int
+	unknown bool // 用 `= ?` 输出（调用发生但返回值未知）
 }
 
 func (f *execFifoRunner) Run(_ context.Context, argv []string, _ io.Writer) (SessionResult, error) {
@@ -28,9 +29,13 @@ func (f *execFifoRunner) Run(_ context.Context, argv []string, _ io.Writer) (Ses
 		}
 	}
 	if fifo != "" {
+		ret := "= 0"
+		if f.unknown {
+			ret = "= ?"
+		}
 		lines := fmt.Sprintf(
-			"1 execve(%q, [%q], 0x0) = 0\n1 execve(%q, [%q, %q], 0x0) = 0\n",
-			f.q, f.q, f.q, f.q, "--ozone-platform=x11")
+			"1 execve(%q, [%q], 0x0) %s\n1 execve(%q, [%q, %q], 0x0) %s\n",
+			f.q, f.q, ret, f.q, f.q, "--ozone-platform=x11", ret)
 		fh, err := os.OpenFile(fifo, os.O_WRONLY, 0)
 		if err != nil {
 			return SessionResult{}, err
@@ -106,6 +111,49 @@ func TestProbeStraceSelfRelaunchArgs(t *testing.T) {
 	}
 	if !slices.Equal(res.Profile.ExecArgs, []string{"--ozone-platform=x11"}) {
 		t.Fatalf("兜底路径应自动预填，得到 %q", res.Profile.ExecArgs)
+	}
+}
+
+func TestProbeSessionSelfRelaunchUnknownDoesNotPrefill(t *testing.T) {
+	e := probeEnv(t)
+	q := "/opt/Qoder CN/qoder-cn"
+	m := &fakeMounter{entries: []string{".config/QoderCN/state"}}
+	r := &execFifoRunner{q: q, unknown: true}
+	res, err := e.probeSession(context.Background(), "qoder", ProbeOptions{
+		Command: []string{q}, Mounter: m, Runner: r, Rounds: 2,
+	}, m, r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// `= ?` 证据只证明调用发生过，不能证明成功；落盘会污染档案、驱动重探
+	// 又会真的多启动应用，所以只做 run-scoped 诊断（ADR-036 审查 P2）。
+	if len(res.Profile.ExecArgs) != 0 || res.Profile.execArgsFromEvidence {
+		t.Fatalf("unknown 证据不能预填 exec_args：%q", res.Profile.ExecArgs)
+	}
+	if !res.SelfRelaunchUnknown {
+		t.Fatal("应标记 SelfRelaunchUnknown")
+	}
+	if !slices.Equal(res.SelfRelaunchArgs, []string{"--ozone-platform=x11"}) {
+		t.Fatalf("诊断字段仍应带出增量，得到 %q", res.SelfRelaunchArgs)
+	}
+}
+
+func TestProbeStraceSelfRelaunchUnknownDoesNotPrefill(t *testing.T) {
+	e := probeEnv(t)
+	e.ProbeCapsOverride = &ProbeCaps{Read: false, Write: true}
+	q := "/opt/Qoder CN/qoder-cn"
+	r := &execFifoRunner{q: q, unknown: true}
+	res, err := e.probeStrace(context.Background(), "qoder", ProbeOptions{
+		Command: []string{q}, Rounds: 2,
+	}, r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Profile.ExecArgs) != 0 || res.Profile.execArgsFromEvidence {
+		t.Fatalf("unknown 证据不能预填 exec_args：%q", res.Profile.ExecArgs)
+	}
+	if !res.SelfRelaunchUnknown {
+		t.Fatal("应标记 SelfRelaunchUnknown")
 	}
 }
 

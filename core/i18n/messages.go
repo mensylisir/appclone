@@ -392,7 +392,7 @@ var messages = map[string]map[string]string{
 		"probe.reads.setuid_child":         "应用启动了 setuid 子进程：它的读取可能未被追踪",
 		"probe.reads.no_home_reads":        "没有观察到应用读取家目录：登录态可能没有暴露",
 		"probe.reads.tracee_unverified":    "有写入但没有观察到应用执行：证据来源不明确",
-		"probe.retry.self_relaunch":        "应用自重启并追加了启动参数（{args}），本轮没有可隔离的写入；正在用该参数重试一次探测",
+		"probe.retry.self_relaunch":        "应用自重启并追加了启动参数（{args}），本轮没有可隔离的写入；正在带上该参数再探测一次（应用会再启动两轮）",
 
 		// 档案派生告警（Profile.Warnings）：解释"为什么范围变了"。
 		"probe.profile.credential_scope_narrowed":    "登录态范围因路径调整而收缩，已丢弃部分旧凭据路径",
@@ -789,7 +789,7 @@ var messages = map[string]map[string]string{
 		"probe.reads.setuid_child":         "The app started a setuid child; its reads may not have been traced",
 		"probe.reads.no_home_reads":        "No home-directory reads were observed; login state may not be exposed",
 		"probe.reads.tracee_unverified":    "Writes were observed but app execution was not; the evidence source is unclear",
-		"probe.retry.self_relaunch":        "The app relaunched itself with extra arguments ({args}) and wrote nothing isolatable; retrying the probe once with those arguments",
+		"probe.retry.self_relaunch":        "The app relaunched itself with extra arguments ({args}) and wrote nothing isolatable; probing once more with those arguments (the app will start twice again)",
 
 		"probe.profile.credential_scope_narrowed":    "The login-state scope shrank after path changes; some old credential paths were dropped",
 		"probe.profile.credential_scope_unsupported": "The old credential path is in a scope that cannot be isolated (public/shared/keyring/system) and was dropped",

@@ -36,6 +36,9 @@ type setupView struct {
 
 	spinner    *gtk.Spinner
 	countLabel *gtk.Label
+	// retryLabel 是零写入重探的常驻说明（ADR-036 ⑧）：Progress 只改 countLabel，
+	// 不能把"应用会再启动两轮"冲掉，否则用户只看到进度条从头再来。
+	retryLabel *gtk.Label
 	// createSpinner 只在 creating 态转：切出去还转的 spinner 会让人以为
 	// 还有操作没结束，也白白占着每帧的重绘。
 	createSpinner *gtk.Spinner
@@ -183,6 +186,12 @@ func (v *setupView) build() {
 	v.countLabel = gtk.NewLabel(v.u.tr("ui.setup.probing.count", map[string]any{"n": 0}))
 	v.countLabel.AddCssClass("dim-label")
 	v.fixed.own(&v.countLabel.Widget)
+	v.retryLabel = gtk.NewLabel("")
+	v.retryLabel.SetWrap(true)
+	v.retryLabel.SetJustify(gtk.JustifyLeftValue)
+	v.retryLabel.SetHalign(gtk.AlignStartValue)
+	v.retryLabel.AddCssClass("dim-label")
+	v.fixed.own(&v.retryLabel.Widget)
 	phint := gtk.NewLabel(v.u.tr("ui.setup.probing.hint", nil))
 	phint.SetWrap(true)
 	phint.SetJustify(gtk.JustifyCenterValue)
@@ -192,6 +201,7 @@ func (v *setupView) build() {
 	probing.Append(&v.spinner.Widget)
 	probing.Append(&ptitle.Widget)
 	probing.Append(&v.countLabel.Widget)
+	probing.Append(&v.retryLabel.Widget)
 	probing.Append(&phint.Widget)
 	v.stack.AddNamed(&probing.Widget, "probing")
 
@@ -433,6 +443,7 @@ func (v *setupView) probe() {
 	}
 	v.setState("probing")
 	v.countLabel.SetText(v.u.tr("ui.setup.probing.count", map[string]any{"n": 0}))
+	v.retryLabel.SetText("")
 
 	ctx, cancel := context.WithCancel(context.Background())
 	v.cancel = cancel
@@ -524,13 +535,13 @@ func (v *setupView) probe() {
 				})
 			},
 			OnRetry: func(args []string) {
-				// 零写入 + 自重启证据：说明应用会被多启动一轮，否则用户
-				// 只看到进度条从头再来。
+				// 零写入 + 自重启证据：说明应用会被多启动两轮。写进独立的
+				// retryLabel，Progress 的进度更新不会把它冲掉。
 				v.u.goIdle(func(uintptr) bool {
 					if v.done || v.state != "probing" {
 						return false
 					}
-					v.countLabel.SetText(v.u.tr("probe.retry.self_relaunch",
+					v.retryLabel.SetText(v.u.tr("probe.retry.self_relaunch",
 						map[string]any{"args": strings.Join(args, " ")}))
 					return false
 				})
