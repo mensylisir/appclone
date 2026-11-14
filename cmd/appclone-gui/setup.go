@@ -36,6 +36,8 @@ type setupView struct {
 
 	spinner    *gtk.Spinner
 	countLabel *gtk.Label
+	roundLabel *gtk.Label
+	probeSeq   uint64 // 忽略上一场探测排队中的 UI 进度
 	// retryLabel 是零写入重探的常驻说明（ADR-036 ⑧）：Progress 只改 countLabel，
 	// 不能把"应用会再启动两轮"冲掉，否则用户只看到进度条从头再来。
 	retryLabel *gtk.Label
@@ -185,7 +187,14 @@ func (v *setupView) build() {
 	v.fixed.own(&ptitle.Widget)
 	v.countLabel = gtk.NewLabel(v.u.tr("ui.setup.probing.count", map[string]any{"n": 0}))
 	v.countLabel.AddCssClass("dim-label")
+	v.countLabel.SetWrap(true)
+	v.countLabel.SetJustify(gtk.JustifyCenterValue)
 	v.fixed.own(&v.countLabel.Widget)
+	v.roundLabel = gtk.NewLabel("")
+	v.roundLabel.AddCssClass("dim-label")
+	v.roundLabel.SetWrap(true)
+	v.roundLabel.SetJustify(gtk.JustifyCenterValue)
+	v.fixed.own(&v.roundLabel.Widget)
 	v.retryLabel = gtk.NewLabel("")
 	v.retryLabel.SetWrap(true)
 	v.retryLabel.SetJustify(gtk.JustifyLeftValue)
@@ -200,6 +209,7 @@ func (v *setupView) build() {
 	v.fixed.own(&phint.Widget)
 	probing.Append(&v.spinner.Widget)
 	probing.Append(&ptitle.Widget)
+	probing.Append(&v.roundLabel.Widget)
 	probing.Append(&v.countLabel.Widget)
 	probing.Append(&v.retryLabel.Widget)
 	probing.Append(&phint.Widget)
@@ -442,7 +452,10 @@ func (v *setupView) probe() {
 		return
 	}
 	v.setState("probing")
-	v.countLabel.SetText(v.u.tr("ui.setup.probing.count", map[string]any{"n": 0}))
+	v.probeSeq++
+	seq := v.probeSeq
+	v.roundLabel.SetText(v.u.tr("ui.setup.probing.preparing", nil))
+	v.countLabel.SetText(v.u.tr("ui.setup.probing.writes_pending", nil))
 	v.retryLabel.SetText("")
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -502,24 +515,7 @@ func (v *setupView) probe() {
 			StaticPaths: hints.Paths,
 			Progress: func(pp core.ProbeProgress) {
 				v.u.goIdle(func(uintptr) bool {
-					if v.done {
-						return false
-					}
-					// 降级横幅从探测中起常驻，切到确认态也不消失——用户要在
-					// 确认路径范围之前就知道这份结果不完整（§4.5）。
-					if pp.Stage == "fallback" {
-						v.showDegraded()
-						return false
-					}
-					if v.state != "probing" {
-						return false
-					}
-					if pp.Reads > 0 {
-						v.countLabel.SetText(v.u.tr("ui.setup.probing.count_reads",
-							map[string]any{"n": pp.Entries, "r": pp.Reads}))
-					} else {
-						v.countLabel.SetText(v.u.tr("ui.setup.probing.count", map[string]any{"n": pp.Entries}))
-					}
+					v.applyProbeProgress(seq, pp)
 					return false
 				})
 			},

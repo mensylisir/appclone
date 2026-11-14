@@ -12,12 +12,62 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"codeberg.org/puregotk/puregotk/v4/adw"
 	"codeberg.org/puregotk/puregotk/v4/gtk"
 
 	"github.com/mensylisir/appclone/core"
 )
+
+func TestGtkProbeProgress(t *testing.T) {
+	gtkTestEnv(t, "progress")
+	gtk.Init()
+	for _, lang := range []string{"zh_CN", "en"} {
+		u := &ui{lang: lang}
+		v := &setupView{u: u, state: "probing", probeSeq: 1,
+			roundLabel: gtk.NewLabel(""), countLabel: gtk.NewLabel(""), retryLabel: gtk.NewLabel("retry")}
+		p := core.ProbeProgress{Stage: "round_running", Round: 1, Rounds: 2,
+			Elapsed: 65 * time.Second, Reads: 42, ReadAvailable: true}
+		v.applyProbeProgress(1, p)
+		if !strings.Contains(v.roundLabel.GetText(), "01:05") || !strings.Contains(v.countLabel.GetText(), "42") {
+			t.Fatalf("%s progress not rendered: %q %q", lang, v.roundLabel.GetText(), v.countLabel.GetText())
+		}
+		if v.retryLabel.GetText() != "retry" {
+			t.Fatal("heartbeat erased retry explanation")
+		}
+		p.Round, p.Elapsed, p.ReadAvailable = 2, 0, false
+		v.applyProbeProgress(1, p)
+		if !strings.Contains(v.roundLabel.GetText(), "2/2") || !strings.Contains(v.roundLabel.GetText(), "00:00") || v.countLabel.GetText() != u.tr("ui.setup.probing.writes_pending", nil) {
+			t.Fatal("round reset or unavailable evidence is misleading")
+		}
+		p.Stage = "round_stopped"
+		v.applyProbeProgress(1, p)
+		want := u.tr("ui.setup.probing.collecting", map[string]any{"round": 2, "rounds": 2})
+		if v.roundLabel.GetText() != want {
+			t.Fatal("missing collecting state")
+		}
+		p.Stage = "round_running"
+		v.probeSeq = 2
+		v.applyProbeProgress(1, p)
+		if v.roundLabel.GetText() != want {
+			t.Fatal("stale retry callback applied")
+		}
+		v.state = "confirm"
+		v.applyProbeProgress(2, p)
+		if v.roundLabel.GetText() != want {
+			t.Fatal("heartbeat changed completed page")
+		}
+		v.state, v.done = "probing", true
+		v.applyProbeProgress(2, p)
+		if v.roundLabel.GetText() != want {
+			t.Fatal("heartbeat changed canceled page")
+		}
+		v.roundLabel.Unref()
+		v.countLabel.Unref()
+		v.retryLabel.Unref()
+	}
+}
 
 // buildProfile 必须走 DeriveProfile：父 path + 子凭据要同时落进档案，
 // 非路径字段（isolate_dbus/env/lock_files）不能被界面重算抹掉。

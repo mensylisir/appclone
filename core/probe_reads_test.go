@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // fifoRunner 模拟 strace：把预置的日志行写进命令里的 `-o <fifo>`，再返回
@@ -230,6 +231,10 @@ func TestProbeSessionSetuidChild(t *testing.T) {
 func TestProbeSessionRerunsSuspiciousOverlay(t *testing.T) {
 	e := probeEnv(t)
 	m := &rerunMounter{}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	heartbeat := make(chan struct{}, 1)
+	var events []ProbeProgress
 	r := &fifoRunner{
 		lines: []string{
 			`1234  openat(AT_FDCWD, "` + filepath.Join(e.Resolver.Home, ".config/TestApp/settings.json") + `", O_RDONLY) = 3`,
@@ -238,17 +243,35 @@ func TestProbeSessionRerunsSuspiciousOverlay(t *testing.T) {
 			if call == 1 {
 				return SessionResult{Started: true, ExitCode: 1}, nil
 			}
-			return SessionResult{Started: true}, nil
+			select {
+			case <-heartbeat:
+				return SessionResult{Started: true}, nil
+			case <-ctx.Done():
+				return SessionResult{}, ctx.Err()
+			}
 		},
 	}
-	res, err := e.probeSession(context.Background(), "testapp", ProbeOptions{
+	res, err := e.probeSession(ctx, "testapp", ProbeOptions{
 		Command: []string{"/usr/bin/testapp"}, Mounter: m, Runner: r, Rounds: 1,
+		Progress: func(p ProbeProgress) {
+			events = append(events, p)
+			if p.Stage == "round_running" && !p.ReadAvailable && p.Elapsed >= time.Second {
+				select {
+				case heartbeat <- struct{}{}:
+				default:
+				}
+			}
+		},
 	}, m, r)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if r.calls != 2 || m.mounts != 2 {
 		t.Fatalf("应重跑一次：runner=%d mounts=%d", r.calls, m.mounts)
+	}
+	last := events[len(events)-1]
+	if last.Stage != "round_stopped" || last.Round != 1 || last.Rounds != 1 || last.ReadAvailable || last.Reads != 0 {
+		t.Fatalf("recovery progress must describe a single round without read tracing: %+v", last)
 	}
 	if res.ReadTrace != ReadTraceUnavailable {
 		t.Fatalf("重跑没有读追踪应为 unavailable，得到 %q", res.ReadTrace)

@@ -13,16 +13,18 @@ import (
 	"time"
 )
 
-// ProbeProgress 是探测的进度事件。GUI 靠它显示"已发现 N 个写入条目"，
-// 而不是等全部结束才一次性画出来——十几秒到一分钟的空屏会被当成卡死。
+// ProbeProgress 是探测的进度事件。会话运行时报告轮次、计时与读取路径数，
+// 写入条目在每轮结束后汇总；GUI 不需要等待应用退出才有反馈。
 //
 // Entries 是**写入条目数**，不是次数（overlay 拿不到次数，§6.1 文案红线）。
 type ProbeProgress struct {
-	Stage   string // round_done | fallback（无 fuse-overlayfs，本次走 strace）
-	Round   int
-	Rounds  int
-	Entries int
-	Reads   int // 跨轮累计去重后的 HOME 读取路径数（噪声过滤前）
+	Stage         string // round_running | round_stopped | round_done | fallback
+	Round         int
+	Rounds        int
+	Entries       int
+	Reads         int           // 跨轮累计去重后的 HOME 读取路径数（噪声过滤前）
+	Elapsed       time.Duration // 本轮已用时间；不代表完成百分比
+	ReadAvailable bool          // false 时不能把缺失证据显示成读取 0 条
 }
 
 // ProbeOptions 是探测的全部可调项。
@@ -32,7 +34,8 @@ type ProbeOptions struct {
 	Stderr   io.Writer // 会话的 stderr（GUI 无 stderr，可为 nil）
 	Mounter  OverlayMounter
 	Runner   SessionRunner
-	// Progress 可为 nil；调用发生在后台会话线程里，调用方自己负责切回 UI 线程。
+	// Progress 可为 nil；回调串行执行，但可能来自不同的后台 goroutine。
+	// 回调应及时返回，调用方自己负责切回 UI 线程。
 	Progress func(ProbeProgress)
 	// Timeout 是**每一轮**会话的硬上限：用户开了应用就不管了的情况必须有尽头。
 	Timeout time.Duration
@@ -328,7 +331,7 @@ func (e *Env) probeStrace(ctx context.Context, app string, opt ProbeOptions, run
 		}
 		sctx, cancel := context.WithTimeout(ctx, timeout)
 		trace.markRound(round)
-		res, runErr := runner.Run(sctx, trace.command(inner, true), trace.stderrWriter())
+		res, runErr := runProbeRound(sctx, runner, trace.command(inner, true), trace.stderrWriter(), opt, trace, round, rounds)
 		cancel()
 		if runErr != nil {
 			if errors.Is(runErr, context.Canceled) {
@@ -680,7 +683,7 @@ func (e *Env) probeSession(ctx context.Context, app string, opt ProbeOptions, mo
 			fmt.Fprintf(opt.Stderr, "appclone: 第 %d/%d 轮 —— 请打开应用用一下，然后把它关掉\n", round+1, rounds)
 		}
 		trace.markRound(round)
-		r, runErr := runner.Run(sctx, trace.command(argv, false), trace.stderrWriter())
+		r, runErr := runProbeRound(sctx, runner, trace.command(argv, false), trace.stderrWriter(), opt, trace, round, rounds)
 		cancel()
 		if runErr != nil {
 			// 没有可信证据。第 0 轮 Start 失败时应用还没 exec、写层安全；
@@ -817,7 +820,9 @@ func (e *Env) probeSession(ctx context.Context, app string, opt ProbeOptions, mo
 		}
 		sctx, cancel := context.WithTimeout(ctx, rto)
 		var runErr error
-		res, runErr = runner.Run(sctx, argv2, opt.Stderr)
+		// This recovery has one round and no read tracing. Keep its elapsed
+		// time live instead of leaving the GUI on the preceding collection.
+		res, runErr = runProbeRound(sctx, runner, argv2, opt.Stderr, opt, nil, 0, 1)
 		cancel()
 		if runErr != nil {
 			preserve := errors.Is(runErr, context.Canceled) || errors.Is(runErr, context.DeadlineExceeded)

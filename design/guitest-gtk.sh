@@ -118,6 +118,7 @@ for name in TestGtkScreensLifecycle TestGtkLandsOnClonesView TestGtkEmptyStateMa
             TestGtkDetailShowsStopWhenRunning TestGtkForkTogglePersists \
             TestGtkForkDisabledWhenFuseUnavailable TestGtkAppIconFallback \
             TestGtkConfirmReuseEvidence \
+            TestGtkProbeProgress \
             TestGtkDialogResponses TestGtkCloseSwitchDialog \
             TestDetachedRunnerSpawn \
             TestDetachLogHelpers TestDetachedTargetEnv \

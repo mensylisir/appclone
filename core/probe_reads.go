@@ -233,7 +233,7 @@ func (st *probeReadState) readsSoFar() int {
 	if st == nil || st.reader == nil {
 		return 0
 	}
-	return len(st.reader.snapshot().Reads)
+	return st.reader.readCount()
 }
 
 // writesSoFar 供兜底路径的进度显示：strace 写证据边采边报。

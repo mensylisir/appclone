@@ -712,6 +712,17 @@ func TestGtkSetupStates(t *testing.T) {
 					fail("探测中不该显示确认按钮")
 					return false
 				}
+				// Long English live feedback must wrap in a narrow native page.
+				u.lang = "en"
+				v.applyProbeProgress(v.probeSeq, core.ProbeProgress{Stage: "round_running",
+					Round: 1, Rounds: 2, ReadAvailable: true, Reads: 100000})
+				var minimum, natural, minBaseline, natBaseline int32
+				v.countLabel.Measure(gtk.OrientationHorizontalValue, -1, &minimum, &natural, &minBaseline, &natBaseline)
+				u.lang = "zh_CN"
+				if minimum > 300 {
+					fail("读取进度撑宽页面：最小宽度 %d", minimum)
+					return false
+				}
 				if v.cancelBtn.GetLabel() != "取消探测" {
 					fail("探测中取消按钮应叫「取消探测」，实际 %q", v.cancelBtn.GetLabel())
 					return false

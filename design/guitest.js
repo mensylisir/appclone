@@ -1,4 +1,4 @@
-// 交互回归（75 项）：三屏 + 探测四态（probing/confirm/creating/error）+ 五入口 + 三处破坏性确认
+// 交互回归（80 项）：三屏 + 探测四态（probing/confirm/creating/error）+ 五入口 + 三处破坏性确认
 //                    + 门禁 + 搜索 + 横幅语义 + 空态可达性 + 运行/停止状态
 //                    + 读证据四态/锁定缓存行/credential 徽标/confirm-empty
 //                    + 登录状态（独立密钥环）：默认策略/隐含锁定/能力缺失/迁移提示
@@ -9,7 +9,7 @@ const path = require('path');
 const fs = require('fs');
 const { pathToFileURL } = require('url');
 
-const EXPECTED = 75;   // 断言总数；改动断言必须同步改这里（否则退出码永远是 1）
+const EXPECTED = 80;   // 断言总数；改动断言必须同步改这里（否则退出码永远是 1）
 
 function loadPuppeteer() {
   const cands = [
@@ -145,11 +145,48 @@ const pp = loadPuppeteer();
               && document.querySelector('#dlgCancel').textContent.includes('取消探测')
               && document.querySelector('#dlgConfirm').style.display === 'none'); });
   /* overlay 只知道"写过/删过"，拿不到写入次数。文案写「命中 N 次」就是承诺了 core 给不出的数据 */
-  await t('探测中的计数措辞是「写入条目」而不是「命中次数」', async () => {
+  await t('准备探测时不显示尚未采集的零读取', async () => ev(() => {
+    probePhase = 'preparing';
+    renderDialog();
+    return document.querySelector('#pround').textContent === '正在准备探测…'
+      && !document.querySelector('#pcount').textContent.includes('读取');
+  }));
+  await t('探测中显示读取证据，写入结果注明本轮结束后整理', async () => {
     return ev(() => {
+      showProbeRound(1);
       const txt = document.querySelector('#dlgBody').textContent;
-      return txt.includes('个写入条目') && !txt.includes('命中');
+      return txt.includes('条读取路径') && txt.includes('写入结果将在本轮结束后整理') && !txt.includes('命中');
     }); });
+  await t('探测中显示轮次与已用时间，重绘不重置计时', async () => ev(() => {
+    showProbeRound(1);
+    probeRoundStarted = performance.now() - 65000;
+    renderDialog();
+    return document.querySelector('#pround').textContent === '第 1/2 轮 · 已用 01:05';
+  }));
+  await t('进入下一轮重置计时，读取累计数保留', async () => ev(() => {
+    liveReads = 42;
+    showProbeRound(2);
+    return document.querySelector('#pround').textContent === '第 2/2 轮 · 已用 00:00'
+      && document.querySelector('#pcount').textContent.includes('42 条读取路径');
+  }));
+  await t('读采集不可用时仍显示计时，不显示误导性零读取', async () => ev(() => {
+    showProbeRound(2);
+    liveReadsAvailable = false;
+    renderProbeProgress();
+    const ok = !document.querySelector('#pcount').textContent.includes('读取')
+      && document.querySelector('#pround').textContent.includes('第 2/2 轮');
+    liveReadsAvailable = true;
+    renderProbeProgress();
+    return ok;
+  }));
+  await t('本轮结束后显示整理结果，下一轮重新开始计时', async () => ev(() => {
+    probeRound = 1;
+    probePhase = 'collecting';
+    renderDialog();
+    const ok = document.querySelector('#pround').textContent === '第 1/2 轮已结束 · 正在整理结果…';
+    showProbeRound(2);
+    return ok && document.querySelector('#pround').textContent === '第 2/2 轮 · 已用 00:00';
+  }));
   /* 零写入但识别到自重启参数时，core 会用该参数再探一次（ADR-036 ⑧）。
      界面必须说明"又要多启动两轮"，否则用户看到窗口弹两次会以为出故障。 */
   await t('重探态 → 显示自重启参数与「再启动两轮」说明', async () => {

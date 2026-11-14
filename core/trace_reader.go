@@ -10,6 +10,8 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	"golang.org/x/sys/unix"
 )
 
 // traceReader 是探测会话的 FIFO 读端（ADR-034 §5）。
@@ -150,7 +152,19 @@ func (r *traceReader) loop() {
 			// stop 后已把本轮读到的数据全部按行消费；n==0 说明写端已无数据。
 			return
 		}
-		time.Sleep(10 * time.Millisecond)
+		// Sleep(10ms) wakes 100 times per second even when the app is idle,
+		// and holds a newly arrived burst until the next tick. Poll wakes as
+		// soon as data arrives; its bounded timeout also observes stop without
+		// closing a descriptor from another goroutine (fd reuse race).
+		fds := []unix.PollFd{{Fd: int32(r.fd), Events: unix.POLLIN}}
+		_, perr := unix.Poll(fds, 250)
+		if (perr != nil && perr != unix.EINTR) || fds[0].Revents&(unix.POLLERR|unix.POLLNVAL) != 0 {
+			// A broken descriptor must not turn the recovery path into a spin.
+			select {
+			case <-r.stop:
+			case <-time.After(250 * time.Millisecond):
+			}
+		}
 	}
 }
 
@@ -255,4 +269,11 @@ func (r *traceReader) snapshot() StraceResult {
 	sort.Strings(out.Reads)
 	out.Stats.SizeExceeded = r.sizeHit
 	return out
+}
+
+// readCount is the progress-only view: O(1), no snapshot allocation or sort.
+func (r *traceReader) readCount() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return len(r.res.Reads)
 }
