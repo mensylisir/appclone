@@ -1,4 +1,4 @@
-// 交互回归（80 项）：三屏 + 探测四态（probing/confirm/creating/error）+ 五入口 + 三处破坏性确认
+// 交互回归（82 项）：三屏 + 探测四态（probing/confirm/creating/error）+ 五入口 + 三处破坏性确认
 //                    + 门禁 + 搜索 + 横幅语义 + 空态可达性 + 运行/停止状态
 //                    + 读证据四态/锁定缓存行/credential 徽标/confirm-empty
 //                    + 登录状态（独立密钥环）：默认策略/隐含锁定/能力缺失/迁移提示
@@ -9,7 +9,7 @@ const path = require('path');
 const fs = require('fs');
 const { pathToFileURL } = require('url');
 
-const EXPECTED = 80;   // 断言总数；改动断言必须同步改这里（否则退出码永远是 1）
+const EXPECTED = 82;   // 断言总数；改动断言必须同步改这里（否则退出码永远是 1）
 
 function loadPuppeteer() {
   const cands = [
@@ -377,6 +377,21 @@ const pp = loadPuppeteer();
       /* 微信此时 0 实例（前面删过），应在"所有应用"组里且是唯一匹配 */
       return unc.includes('微信') && !unc.includes('Chrome') && !unc.includes('Telegram');
     }); });
+  await t('匹配集合不变时保留原行和键盘焦点', async () => {
+    await ev(() => {
+      window.savedSearchRow = document.querySelector('#unconfBox [data-sw="wechat"]');
+      window.savedSearchRow.focus();
+    });
+    await setSearch('微信');
+    return ev(() => document.querySelector('#unconfBox [data-sw="wechat"]') === window.savedSearchRow
+      && document.activeElement === window.savedSearchRow);
+  });
+  await t('连续无结果查询更新提示中的搜索词', async () => {
+    await setSearch('no-such-app-1');
+    await setSearch('no-such-app-2');
+    return ev(() => document.querySelector('#unconfBox').textContent.includes('no-such-app-2')
+      && !document.querySelector('#unconfBox').textContent.includes('no-such-app-1'));
+  });
   await t('清空搜索 → 列表恢复', async () => {
     await setSearch('');
     return ev(() => document.querySelector('#unconfBox').textContent.includes('Chrome'));

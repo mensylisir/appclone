@@ -26,7 +26,7 @@ import (
 const (
 	listLimit   = 30
 	searchLimit = 100
-	// 搜索防抖：逐字符重建两组（最多 130 行）会让输入卡顿。
+	// 由 GtkSearchEntry 自己防抖，不再叠加第二次等待。
 	searchDebounceMs = 120
 )
 
@@ -137,10 +137,8 @@ type ui struct {
 	// 与 setup 的 creating 同属事务态：进程被关窗带走会留下"删了一半"的
 	// 实例目录。Hold 让 GApplication 活到事务结束，关窗则直接拒绝。
 	busy int
-
-	// 搜索防抖用的一次性定时源（字段持有 → C 槽只有一个）。
-	searchFn    glib.SourceFunc
-	searchTimer uint32
+	// Coalesce transient empty text from GTK replacement into one idle update.
+	searchPending bool
 
 	// keep 只保活"取过地址、交给 puregotk"的回调变量：它的信号 trampoline 在
 	// 触发时会解引用那个地址，变量被回收就是读已释放内存。
@@ -256,22 +254,18 @@ func (u *ui) buildWindow() {
 	u.header = adw.NewHeaderBar()
 	u.search = gtk.NewSearchEntry()
 	u.search.SetPlaceholderText(u.tr("ui.search.placeholder", nil))
-	u.searchFn = func(uintptr) bool {
-		u.searchTimer = 0
-		q := strings.ToLower(strings.TrimSpace(u.search.GetText()))
-		if q == u.query {
-			return false
-		}
-		u.query = q
-		u.renderList()
-		return false
-	}
+	u.search.SetSearchDelay(searchDebounceMs)
 	// 窗口级回调只建一次（地址恒定），符合 handlers.go 的回调纪律。
 	searchcb := func(_ gtk.SearchEntry) {
-		if u.searchTimer != 0 {
-			glib.SourceRemove(u.searchTimer)
+		if u.searchPending {
+			return
 		}
-		u.searchTimer = glib.TimeoutAdd(searchDebounceMs, &u.searchFn, 0)
+		u.searchPending = true
+		u.goIdle(func(uintptr) bool {
+			u.searchPending = false
+			u.applySearch()
+			return false
+		})
 	}
 	u.search.ConnectSearchChanged(&searchcb)
 	// 标题栏只放标题与应用菜单，搜索条单独一行（见下面的 searchBox）。
@@ -797,17 +791,8 @@ func (u *ui) renderList() {
 	sc := &renderScope{c: u.cb}
 	u.listScope = sc
 
-	var on, off []core.App
-	for _, a := range u.apps {
-		if a.InstanceN > 0 {
-			on = append(on, a)
-			continue
-		}
-		if u.query == "" || strings.Contains(strings.ToLower(a.Name), u.query) ||
-			strings.Contains(strings.ToLower(a.Key), u.query) {
-			off = append(off, a)
-		}
-	}
+	view := projectAppList(u.apps, u.query, u.expanded)
+	on, pool := view.on, view.off
 
 	// 空态只取代「分身」视图的列表，不影响「所有应用」——后者是首启用户
 	// 唯一能操作的入口，空态里的「选择应用」按钮也指向它。
@@ -853,17 +838,14 @@ func (u *ui) renderList() {
 	// 组名不再重复标题栏上的「所有应用」：视图名已经说了这是全部应用，
 	// 再写一遍只是噪声。留一句规则说明就够。
 	g.SetDescription(u.tr("ui.group.all.desc", nil))
-	pool := off
 	var extra *adw.ActionRow
-	if u.query == "" && !u.expanded && len(off) > listLimit {
-		pool = off[:listLimit]
-		extra = u.moreRow(u.tr("ui.row.show_all", map[string]any{"n": len(off)}), sc)
-	} else if u.query != "" && len(off) > searchLimit {
-		pool = off[:searchLimit]
+	if view.tail == "more" {
+		extra = u.moreRow(u.tr("ui.row.show_all", map[string]any{"n": view.total}), sc)
+	} else if view.tail == "limited" {
 		// 搜索溢出说明是纯文本，不是可点的「显示全部」：搜索分支不读
 		// expanded，做成可点行就是一个点不动的死点击（设计稿也是纯文本）。
 		row := adw.NewActionRow()
-		row.SetTitle(u.tr("ui.row.search_limit", map[string]any{"shown": searchLimit, "total": len(off)}))
+		row.SetTitle(u.tr("ui.row.search_limit", map[string]any{"shown": searchLimit, "total": view.total}))
 		row.SetSensitive(false)
 		sc.own(&row.Widget)
 		extra = row
@@ -875,7 +857,7 @@ func (u *ui) renderList() {
 		row := adw.NewActionRow()
 		sc.own(&row.Widget)
 		if u.query != "" {
-			row.SetTitle(u.tr("ui.row.no_match", map[string]any{"query": u.search.GetText()}))
+			row.SetTitle(u.tr("ui.row.no_match", map[string]any{"query": u.query}))
 		} else {
 			row.SetTitle(u.tr("ui.row.all_clones", nil))
 		}

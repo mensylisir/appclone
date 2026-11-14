@@ -1874,8 +1874,8 @@ func TestGtkAppIconFallback(t *testing.T) {
 	gtk.Init()
 	u := &ui{lang: "zh_CN"}
 	dir := t.TempDir()
-	real := filepath.Join(dir, "real.png")
-	if err := os.WriteFile(real, []byte("not-a-real-image-but-exists"), 0o600); err != nil {
+	real := filepath.Join(dir, "real.svg")
+	if err := os.WriteFile(real, []byte(`<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32"><rect width="32" height="32" fill="#3584e4"/></svg>`), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	missing := filepath.Join(dir, "not-there.png")
@@ -1887,6 +1887,7 @@ func TestGtkAppIconFallback(t *testing.T) {
 		{missing, true},                // 绝对路径但文件没了
 		{"ac-test-no-such-icon", true}, // 主题里没有这个名字
 		{real, false},                  // 存在的绝对路径
+		{"folder", false},              // 系统主题中的真实图标
 	} {
 		w, fallback := u.appIcon(tc.icon, "微信", 32)
 		if w == nil {
@@ -1897,6 +1898,16 @@ func TestGtkAppIconFallback(t *testing.T) {
 		}
 		w.Unref()
 	}
+	img, ok := u.iconImage(real)
+	if !ok || img == nil {
+		t.Fatal("valid file icon was rejected")
+	}
+	paintable := img.GetPaintable()
+	if paintable == nil {
+		t.Fatal("file icon did not decode into a paintable")
+	}
+	gobject.ObjectNewFromInternalPtr(paintable.GoPointer()).Unref()
+	img.Unref()
 	if _, ok := u.iconImage("ac-test-no-such-icon"); ok {
 		t.Fatal("主题里不存在的图标名不该被判为可用")
 	}

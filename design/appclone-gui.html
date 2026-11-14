@@ -866,9 +866,24 @@ function rowHtml(a, on) {
       ${on ? '<span class="chev">›</span>' : ''}
     </div>`;
 }
+let renderedQuery = '';
+function searchProjection(q) {
+  const off = apps.filter(a => !a.instances.length && (!q || a.name.toLowerCase().includes(q) || a.id.toLowerCase().includes(q)));
+  const limit = q ? SEARCH_LIMIT : expandAll ? off.length : LIST_LIMIT;
+  const tail = !off.length ? (q ? `no-match:${q}` : 'all-clones')
+    : off.length > limit ? (q ? 'limited' : 'more') : '';
+  return JSON.stringify([off.slice(0, limit).map(a => a.id), off.length, tail]);
+}
+function applySearch() {
+  const q = ($('#search')?.value || '').trim().toLowerCase();
+  const unchanged = searchProjection(q) === searchProjection(renderedQuery);
+  renderedQuery = q;
+  if (!unchanged) renderList(); // 相同结果保留原行、焦点与滚动位置
+}
 function renderList() {
   const q = ($('#search')?.value || '').trim().toLowerCase();
-  const hit = a => !q || a.name.toLowerCase().includes(q) || a.id.includes(q);
+  renderedQuery = q;
+  const hit = a => !q || a.name.toLowerCase().includes(q) || a.id.toLowerCase().includes(q);
   /* 分组键是"有没有实例"，不是"有没有档案"：hasProfile 只表示曾经配过；
      关掉开关后实例没了，应用必须回到「所有应用」，否则组名与行内状态自相矛盾 */
   const on = apps.filter(a => a.instances.length > 0);
@@ -1593,7 +1608,7 @@ document.addEventListener('change', e => {
 document.addEventListener('input', e => {
   if (e.target.id !== 'search') return;
   clearTimeout(searchTimer);
-  searchTimer = setTimeout(renderList, SEARCH_DEBOUNCE);
+  searchTimer = setTimeout(applySearch, SEARCH_DEBOUNCE);
 });
 /* 内联重命名：失焦提交（focusout = 冒泡版 blur，contenteditable 均可靠触发） */
 document.addEventListener('focusout', e => {
