@@ -43,6 +43,9 @@ type Env struct {
 	// KeyringCapsOverride 覆盖独立密钥环的能力结论（测试注入）。空值走
 	// KeyringCapability()：单测不能依赖宿主是否装了 gnome-keyring-daemon。
 	KeyringCapsOverride *KeyringCaps
+	// Named fault checkpoints for snapshot race tests; nil in production.
+	forkTestHook func(string)
+	forkRun      *forkRunIdentity
 
 	// probeReaderLeaked 是进程级"读追踪采集线程没停下"标记（ADR-034 §5.2）。
 	// reader 仍持有 FIFO 读端时，再开一次探测会与旧 reader 抢同一份数据，

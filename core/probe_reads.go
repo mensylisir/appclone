@@ -1,8 +1,7 @@
 package core
 
 // 读证据会话状态（ADR-034 §3.3/§4/§5/§11）：把"预检 → FIFO → 每轮命令 →
-// 停止 → 告警/三态"收在一个类型里。overlay 与兜底两条路径共用它，避免
-// 两套告警推导各写一遍后对不上（确认页横幅与档案里的 read_trace 必须同源）。
+// 停止 → 告警/三态"收在一个类型里，确认页横幅与档案的 read_trace 同源。
 
 import (
 	"context"
@@ -12,13 +11,13 @@ import (
 	"sort"
 )
 
-// readsWarnOrder 是 §3.3 的固定顺序。前 10 项是完整性告警（决定 ReadTrace），
-// 后 2 项是证据告警（只描述观察结果）。
+// readsWarnOrder 是 §3.3 的固定顺序。no_home_reads 之前为完整性告警，
+// 其后的证据告警只描述观察结果，不改变 ReadTrace。
 var readsWarnOrder = []string{
-	"unavailable", "preflight_failed", "strace_failed", "parse_error",
+	"unavailable", "manual_finish", "preflight_failed", "strace_failed", "parse_error",
 	"size_exceeded", "no_fd_annotation", "openat2_unavailable",
 	"openat2_flags_hidden", "reader_stuck", "setuid_child",
-	"no_home_reads", "tracee_unverified",
+	"no_home_reads", "tracee_unverified", "round_marker_dropped",
 }
 
 func isIntegrityWarn(key string) bool {
@@ -61,11 +60,10 @@ type probeReadState struct {
 	keyringDropped int
 }
 
-// newProbeReadState 做能力预检并启动 FIFO reader。needWriteTrace 为 true 时
-// 表示调用方依赖 strace 提供写证据（兜底路径），此时 FIFO 建不起来是硬错误。
-func (e *Env) newProbeReadState(ctx context.Context, traceDir string, opt ProbeOptions, needWriteTrace bool) (*probeReadState, error) {
+// newProbeReadState 做能力预检并启动读证据 FIFO；写入始终从 overlay upper 收集。
+func (e *Env) newProbeReadState(ctx context.Context, traceDir string, opt ProbeOptions) (*probeReadState, error) {
 	st := &probeReadState{e: e, opt: opt, warns: map[string]bool{}}
-	if opt.DisableReadTrace && !needWriteTrace {
+	if opt.DisableReadTrace {
 		// 排障/基准对照：不碰 FIFO、不跑预检，写证据照常（overlay upper）。
 		st.addWarn("unavailable")
 		return st, nil
@@ -78,7 +76,7 @@ func (e *Env) newProbeReadState(ctx context.Context, traceDir string, opt ProbeO
 		var err error
 		caps, err = e.ProbeCaps(ctx, traceDir)
 		if err != nil {
-			// bwrap 预检失败是两条路径共同的硬错误，不能降级成"读不可用"。
+			// bwrap 预检失败是硬错误，不能降级成"读不可用"。
 			return nil, err
 		}
 	}
@@ -87,10 +85,6 @@ func (e *Env) newProbeReadState(ctx context.Context, traceDir string, opt ProbeO
 		switch {
 		case opt.DisableReadTrace:
 			// 排障/基准对照：显式关闭。
-			st.addWarn("unavailable")
-		case needWriteTrace:
-			// 兜底路径读能力不可用：整条读追踪都不存在，只报 unavailable；
-			// 叠加 openat2/-y 告警会把用户引向错误的排障方向（§4.3）。
 			st.addWarn("unavailable")
 		default:
 			// overlay 路径写证据来自 upper，读失败只降级证据。
@@ -106,7 +100,7 @@ func (e *Env) newProbeReadState(ctx context.Context, traceDir string, opt ProbeO
 			st.addWarn("openat2_unavailable")
 		}
 	}
-	if !st.readOK && !needWriteTrace {
+	if !st.readOK {
 		// overlay 下没有读能力：写证据来自 upper，不需要 FIFO。
 		return st, nil
 	}
@@ -115,11 +109,7 @@ func (e *Env) newProbeReadState(ctx context.Context, traceDir string, opt ProbeO
 	}
 	r, rerr := newTraceReaderOpts(traceDir, e.Resolver.Home, e.markProbeReaderLeaked, !st.readOK)
 	if rerr != nil {
-		if needWriteTrace {
-			// 兜底路径的写证据完全依赖这条 FIFO；没有它只能报环境错误，
-			// 绝不能静默返回"零写入"。
-			return nil, rerr
-		}
+
 		st.readOK = false
 		st.addWarn("unavailable")
 		return st, nil
@@ -166,56 +156,16 @@ func keyringSyscalls() []string {
 	return []string{"sendmsg"}
 }
 
-// writeSyscalls 是写列表（§4.1）。open/openat 也在此列：兜底路径靠它们
-// 捕获带写入意图的打开。
-func (st *probeReadState) writeSyscalls() []string {
-	out := []string{"open", "openat"}
-	if st.caps.Openat2 {
-		out = append(out, "openat2")
-	}
-	return append(out,
-		"creat", "mkdir", "mkdirat", "rename", "renameat", "renameat2",
-		"link", "linkat", "symlink", "symlinkat", "unlink", "unlinkat",
-		"truncate", "chmod", "fchmodat", "utimensat",
-	)
-}
-
-// fallbackSyscalls 是读 ∪ 写（读不可用时只剩写列表）。顺序固定，golden 可断言。
-// execve/execveat 在兜底路径里仍要显式加入：自动预填依赖 exec 证据，而
-// writeSyscalls 不含它们。
-func (st *probeReadState) fallbackSyscalls() []string {
-	if !st.readOK {
-		return append(st.writeSyscalls(), "execve", "execveat")
-	}
-	out := st.readSyscalls()
-	seen := map[string]bool{}
-	for _, s := range out {
-		seen[s] = true
-	}
-	for _, s := range st.writeSyscalls() {
-		if !seen[s] {
-			seen[s] = true
-			out = append(out, s)
-		}
-	}
-	return out
-}
-
-// command 生成一轮会话命令。overlay 用读列表；兜底用读写并集。读不可用时
-// overlay 直接跑 bwrap（不套 strace），兜底仍要套写列表。
-func (st *probeReadState) command(inner []string, fallback bool) []string {
+// command 生成 overlay 会话命令；读能力不可用时直接运行 bwrap。
+func (st *probeReadState) command(inner []string) []string {
 	if st == nil || st.reader == nil {
 		return inner
 	}
-	if !fallback && !st.readOK {
+	if !st.readOK {
 		return inner
 	}
 	list := st.readSyscalls()
-	if fallback {
-		list = st.fallbackSyscalls()
-	}
-	// sendmsg 只用于 keyring 字面量扫描（方案 §6），两个分支都要有：
-	// 兜底会话里 libsecret 照样经 D-Bus 找密钥环。**唯一拼接点**，不改
+	// sendmsg 只用于 keyring 字面量扫描（方案 §6）。唯一拼接点，不改
 	// readSyscalls()——probeCapsReadList 的 golden 依赖它保持原样。
 	list = append(list, keyringSyscalls()...)
 	return StraceCommandWith(StraceSpec{
@@ -236,14 +186,6 @@ func (st *probeReadState) readsSoFar() int {
 	return st.reader.readCount()
 }
 
-// writesSoFar 供兜底路径的进度显示：strace 写证据边采边报。
-func (st *probeReadState) writesSoFar() []UpperEntry {
-	if st == nil || st.reader == nil {
-		return nil
-	}
-	return st.reader.snapshot().Writes
-}
-
 // markRound 在每轮 runner.Run 之前写轮次标记行；没有 reader 时 no-op。
 func (st *probeReadState) markRound(n int) {
 	if st == nil || st.reader == nil {
@@ -258,7 +200,7 @@ func (st *probeReadState) checkRound(res SessionResult) {
 	if st == nil {
 		return
 	}
-	if res.ExitCode != 0 {
+	if res.ExitCode != 0 && !res.ManualFinish {
 		st.unclean = true
 	}
 	if st.stderr == nil {
@@ -281,6 +223,9 @@ func (st *probeReadState) stop() {
 	st.reads = res.Reads
 	st.flagsHidden = res.FlagsHidden
 	st.stats = res.Stats
+	if st.stats.RoundMarkerDropped > 0 {
+		st.addWarn("round_marker_dropped")
+	}
 	st.execSeen = res.ExecSeen
 	st.execs = res.Execs
 	st.execCalls = deepCopyExecCalls(res.ExecCalls)

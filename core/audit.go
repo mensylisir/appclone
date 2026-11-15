@@ -35,7 +35,9 @@ type AuditSession struct {
 	// finish 不能重新解析：运行中软链布局变化会让 run.toml 与真实 argv 不一致。
 	keyringBinds []string
 	// stop 是卸载 overlay 的闭包；finish/abort 之后置 nil，避免二次卸载。
-	stop func() error
+	stop    func() error
+	scene   *overlayScene
+	stopErr error
 }
 
 // auditRoot 是所有审计写层的根：<tmpRoot>/appclone/audit.<uid>。每个实例的
@@ -67,9 +69,15 @@ func (e *Env) ensureAuditRoot() error {
 // lower 里会 ELOOP）；④ 删掉上一轮的 run.toml——否则新审计中途崩掉时，
 // verify 会把旧凭证当成本次"正常跑完"。
 func (e *Env) beginAudit(in Instance, p Profile, keyringBinds []string) (*AuditSession, *AuditLayers, error) {
-	if err := e.quarantinePendingAudit(in); err != nil {
+	previous, err := e.quarantinePendingAudit(in)
+	if err != nil {
 		return nil, nil, err
 	}
+	defer func() {
+		for _, ev := range previous {
+			ev.close()
+		}
+	}()
 	// 写层根在 AC_BASE 里时，`--tmpfs Base` 会把它一起盖住（应用看不到，
 	// 工具自己也挂不上）；而且写层嵌在实例目录里等于把证据暴露给应用。
 	writeRoot := e.auditRoot()
@@ -104,6 +112,14 @@ func (e *Env) beginAudit(in Instance, p Profile, keyringBinds []string) (*AuditS
 		ID:        in.ID,
 		StartedAt: start.Format(time.RFC3339),
 	}
+	for _, ev := range previous {
+		if err := ev.check(); err != nil {
+			return nil, nil, err
+		}
+		if !ev.source.absent {
+			return nil, nil, sceneError(ev.upper, fmt.Errorf("previous audit source remains"))
+		}
+	}
 	if err := writeRunRecord(filepath.Join(audit, "run.toml"), attempt); err != nil {
 		return nil, nil, err
 	}
@@ -116,16 +132,30 @@ func (e *Env) beginAudit(in Instance, p Profile, keyringBinds []string) (*AuditS
 	if err := os.MkdirAll(work, 0o700); err != nil {
 		return nil, nil, errEnv("err.env.mkdir", map[string]any{"path": work}, err)
 	}
+	scene, err := openOverlayScene(work)
+	if err != nil {
+		return nil, nil, err
+	}
+	transferred := false
+	defer func() {
+		if !transferred {
+			scene.close()
+		}
+	}()
+	fail := func(cause error) (*AuditSession, *AuditLayers, error) {
+		if err := scene.remove("."); err != nil {
+			return nil, nil, err
+		}
+		return nil, nil, cause
+	}
 	for _, sub := range []string{"upper", "work", "merged"} {
 		if err := os.Mkdir(filepath.Join(work, sub), 0o700); err != nil {
-			os.RemoveAll(work)
-			return nil, nil, errEnv("err.env.mkdir", map[string]any{"path": sub}, err)
+			return fail(errEnv("err.env.mkdir", map[string]any{"path": sub}, err))
 		}
 	}
 	pubs, err := e.probePublicBinds()
 	if err != nil {
-		os.RemoveAll(work)
-		return nil, nil, err
+		return fail(err)
 	}
 	mounter := e.Mounter
 	if mounter == nil {
@@ -134,8 +164,7 @@ func (e *Env) beginAudit(in Instance, p Profile, keyringBinds []string) (*AuditS
 	unmount, err := mounter.Mount(e.Resolver.Home, filepath.Join(work, "upper"),
 		filepath.Join(work, "work"), filepath.Join(work, "merged"))
 	if err != nil {
-		os.RemoveAll(work)
-		return nil, nil, err
+		return fail(err)
 	}
 	// 拆成两个变量再返回：gofmt 1.26 与 1.27 对「return 多个复合字面量」
 	// 的缩进规则不同，写成一条 return 会让 CI（1.26.0）与本地（1.27）
@@ -149,12 +178,14 @@ func (e *Env) beginAudit(in Instance, p Profile, keyringBinds []string) (*AuditS
 		shared:       e.existingSharedWrites(p),
 		base:         e.Base,
 		keyringBinds: keyringBinds,
+		scene:        scene,
 	}
 	layers := &AuditLayers{
 		Merged:      filepath.Join(work, "merged"),
 		PublicBinds: pubs,
 		WriteRoot:   writeRoot,
 	}
+	transferred = true
 	return sess, layers, nil
 }
 
@@ -181,6 +212,9 @@ func (e *Env) existingSharedWrites(p Profile) []string {
 // run.toml 是"这次审计正常跑完"的凭证，也是 verify 判断证据完不完整的唯一依据；
 // 所以在应用退出之后才写——中途崩掉就不该留下它（那正是"证据不完整"的定义）。
 func (s *AuditSession) finish(exitCode int) error {
+	if s.scene != nil {
+		defer s.scene.close()
+	}
 	if err := s.detach(); err != nil {
 		return err
 	}
@@ -235,20 +269,35 @@ func writeRunRecord(path string, rec runRecord) error {
 // abandon 收尾一条没走到 finish 的会话。started 表示应用**已经启动过**：
 // 那时写层里就可能有用户文件（哪怕 Wait 返回的是非 ExitError），只能卸载后
 // 原样保留，让下一次 verify 判 audit_incomplete——删掉等于销毁证据。
-func (s *AuditSession) abandon(started bool) {
-	_ = s.detach()
-	if !started {
-		os.RemoveAll(s.work)
+func (s *AuditSession) abandon(started bool) error {
+	if s.scene != nil {
+		defer s.scene.close()
 	}
+	if err := s.detach(); err != nil {
+		return err
+	}
+	if !started {
+		return s.scene.remove(".")
+	}
+	return nil
 }
 
 func (s *AuditSession) detach() error {
 	if s.stop == nil {
-		return nil
+		return s.stopErr
 	}
-	err := s.stop()
+	if s.scene != nil {
+		if err := s.scene.checkIdle(); err != nil {
+			s.stopErr = err
+			return err
+		}
+	}
+	s.stopErr = s.stop()
 	s.stop = nil
-	return err
+	if s.stopErr == nil && s.scene != nil {
+		s.stopErr = s.scene.checkUnmounted()
+	}
+	return s.stopErr
 }
 
 // runRecord 是 `audit/run.toml` 的形状（§6.5）。
@@ -319,35 +368,55 @@ func readRunRecord(path string) (runRecord, bool, error) {
 // 现在改为**搬走而不是拒绝**：写层里有内容就挪到实例 audit/quarantine-<唯一名>
 // （保留文件、永不自动删），临时目录随后清掉。新审计与旧证据互不覆盖，
 // 用户想找回文件时路径仍在摘要/verify 的输出里。
-func (e *Env) quarantinePendingAudit(in Instance) error {
-	work := e.AuditWorkDir(in.App, in.ID)
-	// 上一轮若是被 SIGKILL 掉的，overlay 可能还挂在 work/merged 上
-	// （fuse-overlayfs 1.18 忽略 auto_unmount）。此时搬走 upper 等于让仍活着的
-	// fuse 进程继续引用一个已改名目录，必须先把挂载卸掉——与 sweepStaleAudits
-	// 的顺序一致，否则"先搬后扫"会在这条崩溃路径上反过来。
-	if merged := filepath.Join(work, "merged"); mounted(merged) {
-		if err := umount(merged); err != nil {
-			return errEnv("err.probe.stale_mount", map[string]any{"path": merged}, err)
-		}
+func (e *Env) quarantinePendingAudit(in Instance) ([]*auditEvidence, error) {
+	audit := e.AuditDir(in.App, in.ID)
+	if _, err := checkedOrdinaryPath(audit, false); err != nil {
+		return nil, err
 	}
-	upper := filepath.Join(work, "upper")
-	entries, present, err := readUpperTree(upper)
+	if err := os.MkdirAll(audit, 0o700); err != nil {
+		return nil, err
+	}
+	all, err := e.openAuditScenes(in.App, in.ID)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	if present && len(entries) > 0 {
-		audit := e.AuditDir(in.App, in.ID)
-		if err := os.MkdirAll(audit, 0o700); err != nil {
-			return errEnv("err.env.mkdir", map[string]any{"path": audit}, err)
+	fail := func(err error) ([]*auditEvidence, error) {
+		for _, ev := range all {
+			ev.close()
 		}
-		q := filepath.Join(audit, "quarantine-"+time.Now().UTC().Format("20060102T150405")+"-"+randSuffix())
-		if err := moveDir(upper, q); err != nil && !dstComplete(err) {
-			// 搬不动就拒绝开始：覆盖现场才是真正的数据丢失。副本完整、只是
-			// 源删不干净时按已搬走处理，残留交给下一次清扫。
-			return errEnv("err.probe.quarantine_failed", map[string]any{"path": q}, err)
+		return nil, err
+	}
+	// Capture every upper before changing any source.
+	for _, ev := range all {
+		if err := ev.scene.detachStale(); err != nil {
+			return fail(err)
+		}
+		if err := ev.captureUpper(); err != nil {
+			return fail(err)
 		}
 	}
-	return os.RemoveAll(work)
+	for _, ev := range all {
+		if !ev.source.absent {
+			q := filepath.Join(audit, "quarantine-"+time.Now().UTC().Format("20060102T150405")+"-"+randSuffix())
+			if err := moveSceneDir(ev.scene, ev.source, q); err != nil {
+				// Even a complete destination does not authorize reusing an old
+				// upper which still contains evidence from the previous run.
+				return fail(errEnv("err.probe.quarantine_failed", map[string]any{"path": q}, err))
+			}
+		}
+		if err := ev.removeWork(); err != nil {
+			return fail(err)
+		}
+	}
+	for _, ev := range all {
+		if err := ev.check(); err != nil {
+			return fail(err)
+		}
+		if !ev.source.absent {
+			return fail(sceneError(ev.upper, fmt.Errorf("previous audit source remains")))
+		}
+	}
+	return all, nil
 }
 
 // sweepStaleAudits 清掉上一轮崩掉留下的 audit 写层（同 probe 的规则：先卸载、
@@ -373,19 +442,28 @@ func (e *Env) sweepStaleAudits() error {
 }
 
 func (e *Env) sweepAuditRoot(root string) error {
+	if _, err := checkedOrdinaryPath(filepath.Join(root, "appclone", fmt.Sprintf("audit.%d", e.UID)), true); err != nil {
+		return err
+	}
 	dirs, _ := filepath.Glob(filepath.Join(root, "appclone", fmt.Sprintf("audit.%d", e.UID), "*"))
 	for _, d := range dirs {
 		// 属主判断用进程真实 uid，不用 e.UID（可注入的配置值）：见 sweepProbeRoot。
-		if !dirOwnedBy(d, os.Getuid()) {
+		scene, err := ownedOverlayScene(d)
+		if err != nil {
+			return err
+		}
+		if scene == nil {
 			continue
 		}
 		skip, release := e.lockAuditWork(filepath.Base(d))
 		if skip {
 			release()
+			scene.close()
 			continue
 		}
-		serr := e.sweepOneAudit(d)
+		serr := e.sweepOneAudit(scene)
 		release()
+		scene.close()
 		if serr != nil {
 			return serr
 		}
@@ -399,19 +477,19 @@ func (e *Env) sweepAuditRoot(root string) error {
 // quarantine 而不是删除：读失败恰恰说明里面有我们看不见的东西，而它们可能
 // 是用户文件。跨设备拷贝读不动这样的子树，quarantineDir 会退回写层根内的
 // 同 fs rename，现场仍然留下。
-func (e *Env) sweepOneAudit(d string) error {
-	merged := filepath.Join(d, "merged")
-	if mounted(merged) {
-		if err := umount(merged); err != nil {
-			return errEnv("err.probe.stale_mount", map[string]any{"path": merged}, err)
-		}
+func (e *Env) sweepOneAudit(scene *overlayScene) error {
+	d := scene.lexical
+	if err := scene.detachStale(); err != nil {
+		return err
 	}
-	entries, present, rerr := readUpperTree(filepath.Join(d, "upper"))
+	entries, present, rerr := scene.readUpper()
 	if rerr == nil && present && len(entries) == 0 {
-		os.RemoveAll(d)
-		return nil
+		return scene.remove(".")
 	}
-	if _, err := e.quarantineDir(d); err != nil {
+	if err := scene.checkUnmounted(); err != nil {
+		return err
+	}
+	if _, err := e.quarantineScene(scene); err != nil {
 		return errEnv("err.probe.quarantine_failed", map[string]any{"path": d}, err)
 	}
 	return nil

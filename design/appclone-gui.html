@@ -115,7 +115,7 @@
   .wc.min:hover, .wc.max:hover { background:rgba(0,0,0,.28) }
   html.dark .wc.min:hover, html.dark .wc.max:hover { background:rgba(255,255,255,.3) }
 
-  /* AdwBanner（致命状态：bwrap 缺失；降级状态：fuse 缺失） */
+  /* AdwBanner（致命状态：bwrap 缺失；配置不可用：fuse 缺失） */
   .banner {
     display:none; align-items:center; gap:10px; padding:9px 14px; font-size:13.5px;
     background:rgba(224,27,36,.1); color:var(--destructive); border-bottom:1px solid var(--border);
@@ -124,8 +124,8 @@
     background:rgba(252,127,0,.1); color:var(--chip-orange-fg);
   }
   .banner.show { display:flex }
-  /* 探测页里的降级横幅：它常驻在对话框里，因为窗口顶部那条已被遮罩盖住。
-     区别是结构性的——列表那条可以「了解」收掉，这里不能：降级是事实，不是通知 */
+  /* 探测页里的配置不可用横幅：它常驻在对话框里，因为窗口顶部那条已被遮罩盖住。
+     区别是结构性的——列表那条可以「了解」收掉，这里不能：环境限制是事实，不是通知 */
   .banner.inline {
     display:none; margin:12px 14px 0; border:1px solid var(--border); border-bottom:1px solid var(--border);
     border-radius:10px; font-size:12.5px; padding:8px 12px;
@@ -393,7 +393,7 @@
   <span class="spacer"></span>
   <button class="chipbtn" id="btnEmpty">空态演示</button>
   <button class="chipbtn" id="btnBanner">致命横幅</button>
-  <button class="chipbtn" id="btnSoftBanner">降级横幅</button>
+  <button class="chipbtn" id="btnSoftBanner">配置不可用横幅</button>
   <button class="chipbtn" id="btnTheme">深色主题</button>
 </div>
 
@@ -433,11 +433,11 @@
   </div>
   <!-- AdwBanner · 探测能力下降：可确认关闭，不影响已有分身的开关。
        两种原因共用这一条横幅、交互完全相同（显示 / 「了解」收起），只有文案不同：
-       ① 缺 fuse-overlayfs → 走 strace 兼容模式，结果可能不完整；
+       ① 缺 fuse-overlayfs → 阻止新探测，既有普通分身仍可用；
        ② fuse 存在但挂载被拒（权限 / 沙盒）→ **不降级**，提示从普通桌面会话启动、
           确认 /dev/fuse 与 fusermount3 的 setuid。见 ADR-032。 -->
   <div class="banner soft" id="bannerSoft">
-    ⚠ 探测将在兼容模式下进行（未检测到 fuse-overlayfs），结果可能不完整。
+    ⚠ 无法安全配置新应用：需要可用的 FUSE 写层。请安装完整软件包并从普通桌面会话重试。已有普通分身仍可使用。
     <button id="bannerSoftDismiss">了解</button>
   </div>
 
@@ -558,9 +558,9 @@
         <h3 id="dlgTitle">首次配置 · 钉钉</h3>
         <p id="dlgSub">appclone 跟踪到该应用写入了以下路径。勾选属于「应用自身数据」的目录——它们会被隔离，其余文件与主空间保持共享。</p>
       </div>
-      <!-- 降级横幅在探测页里常驻（列表那条可「了解」收掉，这条不行：降级是事实不是通知） -->
+      <!-- 配置不可用横幅在探测页里常驻（列表那条可「了解」收掉，这条不行：环境限制是事实不是通知） -->
       <div class="banner soft inline" id="dlgBanner">
-        ⚠ 本次走兼容模式（未检测到 fuse-overlayfs）：只记录到实际跑到的路径，没走到的分支看不到。
+        ⚠ 无法安全配置分身：未能建立独立写层，应用尚未启动。请检查 FUSE 环境后重试。
       </div>
       <div class="dialog-body" id="dlgBody"><!-- JS 按四态渲染 --></div>
       <div class="dialog-foot" id="dlgFoot">
@@ -605,7 +605,7 @@
       <tr><td>所有应用</td><td>未开启的一行一个 <span class="w">AdwSwitchRow</span>（不进详情，没有实例可管）；无搜索词时只渲染前 30 个，组尾「显示全部 N 个应用」——<span class="w">AdwPreferencesGroup</span> 不是虚拟化列表，400 行要分页（ADR-024）；<b>搜索命中封顶 100 条</b>并提示"再输几个字"，且输入 120ms 防抖</td></tr>
       <tr><td>来源说明</td><td>系统级 / 用户级 / Flatpak 三个目录（只写用户级会漏 97% 的应用）</td></tr>
     </table>
-    <div class="states">状态：<span>默认（有分身 → 「分身」；没有 → 「所有应用」）</span><span>空态（AdwStatusPage 取代「分身」视图的列表，<b>「所有应用」照常</b>）</span><span>致命横幅（bwrap 缺失 → 开关全部失效）</span><span>降级横幅（fuse 缺失，可「了解」）</span><span>搜索无结果</span><span>副标题显示实例数与「N 个运行中」</span><span>角标（分身体量，只在另一个视图里显示）</span></div>
+    <div class="states">状态：<span>默认（有分身 → 「分身」；没有 → 「所有应用」）</span><span>空态（AdwStatusPage 取代「分身」视图的列表，<b>「所有应用」照常</b>）</span><span>致命横幅（bwrap 缺失 → 开关全部失效）</span><span>配置不可用横幅（fuse 缺失，可「了解」）</span><span>搜索无结果</span><span>副标题显示实例数与「N 个运行中」</span><span>角标（分身体量，只在另一个视图里显示）</span></div>
     跳转：点行体 → 屏2 详情；点亮开关 → 屏3（首次配置 / 重新配置 / 开启分身）；关闭开关 → 确认对话框；「选择应用」/「添加应用分身」/ 视图切换器 → 「所有应用」。<br>
     <b>空态不能把入口藏掉</b>：首启用户看到"还没有分身"时，必须有路去点亮第一个开关——空态里的「选择应用」按钮与标题栏的「所有应用」是对的，把整个列表页藏掉才是死路。
   </div>
@@ -628,14 +628,14 @@
     <h4>屏3 · 探测页 — 四态与六组</h4>
     <table>
       <tr><td>承载</td><td>原生为 <span class="w">AdwNavigationView</span> 的 push 页（不是对话框）；本稿用遮罩对话框表达同一状态机</td></tr>
-      <tr><td>闸门（探测前）</td><td>四道闸门跑在探测会话启动<b>之前</b>：bwrap 不可用 / 缺 fuse（降级不阻断）/ <b>目标应用还在运行</b> / 拿不到全局写锁。硬闸门失败<b>直接进 error 并带原因</b>，不启动会话</td></tr>
+      <tr><td>闸门（探测前）</td><td>四道闸门跑在探测会话启动<b>之前</b>：bwrap 不可用 / 缺少可用 FUSE 写层（不启动目标应用）/ <b>目标应用还在运行</b> / 拿不到全局写锁。硬闸门失败<b>直接进 error 并带原因</b>，不启动会话</td></tr>
       <tr><td>探测中</td><td><span class="w">GtkSpinner</span> + 「正在跟踪写入…」+ 准备/第 N/M 轮与已用时间/整理结果 + <b>实时读取路径数</b>（写入条目在本轮结束后汇总）+ HeaderBar「取消探测」——<b>取消必给</b>，探测十秒到一分钟。措辞是"条目"不是"命中次数"：overlay 只知道"写过/删过"，拿不到次数</td></tr>
       <tr><td>确认</td><td>六组：① 应用自身数据（可勾 <span class="w">AdwSwitchRow</span>，<b>缓存项也在这组</b>、默认不勾并标「缓存」）② <b>数据来源</b>（可勾 <span class="w">AdwSwitchRow</span>「从现有应用数据克隆起步」，<b>默认关</b>；只更新档案的 rediscover 入口必须隐藏；缺 fuse-overlayfs 时禁用——拨了也不会生效）③ 单例处理（可勾 <span class="w">AdwSwitchRow</span>：私有 runtime / 私有 DBus，<b>由检出的单例项驱动、没检出就不出现</b>；本稿用 <span class="w">app.singleton</span> 演示——firefox/chrome/notion 就没有这一组）<b>注意</b>：本稿把 <span class="w">~/.dingtalk</span>、<span class="w">~/.mozilla</span> 这类顶层点目录标成「配置」且默认勾选，<b>只是演示</b>；真实 L2 规则里它们是灰区、默认不勾（discover.md §5 第 5 条）。照抄会把用户自己放在点目录里的文件误判成应用数据。<br>④ <b>公共目录（强制共享）</b>：只读 <span class="w">AdwActionRow</span> + <span class="w">.dim-label</span>，<b>一律显示、不可勾</b> ⑤ <b>共享但可写（不隔离）</b>：只读，<b>并写清代价</b>（"两个分身的最近文件会混在一起"）——不说，用户遇到就判定产品坏了 ⑥ <b>登录状态</b>（<span class="w">AdwSwitchRow</span>「独立密钥环」，<b>始终出现</b>，证据只定默认值与副标题；开启即隐含私有总线与 runtime，行同步点亮并锁定；能力缺失时禁用并说明原因，已开时可关）</td></tr>
       <tr><td>创建中</td><td><b>独立第四态</b>，不是"confirm 里加个 flag"：写档案 + 建实例目录 + 生成 .desktop 是几百毫秒的事务，期间再点一次确认会<b>建出两个实例</b>；中途取消会留下"档案写了、实例没建成"的半成品。故：确认按钮变「正在创建…」并禁用，<b>取消也禁用</b>，Esc 同样不生效</td></tr>
       <tr><td>失败</td><td><span class="w">AdwStatusPage</span>：<b>按 Reason 分文案</b>——<code>app_running</code> / <code>env_unavailable</code> / <code>no_writes</code> / <code>public_dir_leak</code>，每类一条独立键与"下一步做什么"；<b>禁止所有失败共用一句"探测失败"</b>。「这次没有跟踪到任何写入」也走这一态，<b>不生成空档案</b></td></tr>
       <tr><td>确认按钮</td><td><span class="w">suggested-action</span>：创建分身（setup/reconfig/clone）/ 开启分身（open）/ 保存档案（rediscover）；<b>门禁只数「应用自身数据」</b>——只勾缓存或单例时仍禁用，否则会生成一个什么都不隔离的空档案；探测中与创建中该按钮不存在/不可用</td></tr>
       <tr><td>失败态的「重试」</td><td>恒可用——<b>不能沿用上一轮 confirm 的 disabled</b>。失败态只有「重试」与「取消」两条出路，一个点不动的重试等于让用户关窗口</td></tr>
-      <tr><td>降级横幅</td><td>对话框里另有一条 <span class="w">AdwBanner</span>：窗口顶部那条已被遮罩盖住。列表那条可「了解」收掉，<b>这条不能</b>——降级是事实，不是通知</td></tr>
+      <tr><td>配置不可用横幅</td><td>对话框里另有一条 <span class="w">AdwBanner</span>：窗口顶部那条已被遮罩盖住。列表那条可「了解」收掉，<b>这条不能</b>——环境限制是事实，不是通知</td></tr>
     </table>
     <div class="states">态：<span>probing</span><span>confirm</span><span>creating</span><span>error</span>　入口：<span>首次配置（无档案）</span><span>重新配置（档案失效）</span><span>开启分身（档案可用）</span><span>新建分身（详情页 ＋）</span><span>重新探测</span></div>
     入口标题必须点名当前在做哪件事：<b>从没配过</b>才叫「首次配置」（要跑探测），<b>配过但关掉了</b>叫「开启分身」（复用档案、跳过探测），
@@ -754,6 +754,12 @@ const sharedWrites = [
   { path:'~/.local/share/recently-used.xbel', why:'GTK 最近使用记录 — 两个分身的「最近文件」会混在一起' },
   { path:'~/.config/fcitx5',                  why:'输入法状态 — 隔离会导致分身里打不出中文' },
 ];
+const sharedCertificateNotice = '系统证书库保持共享，分身可能使用同一客户端证书；独立密钥环不隔离它。';
+function appSharedWrites(a) {
+  return a?.sharedCertificates
+    ? [...sharedWrites, {path:'~/.local/share/pki', why:sharedCertificateNotice}]
+    : sharedWrites;
+}
 
 const $  = s => document.querySelector(s);
 const $$ = s => [...document.querySelectorAll(s)];
@@ -773,18 +779,30 @@ let probeTimer = null, probeTick = null, createTimer = null;
 let foundCount = 0;
 let probeRound = 1, probeRoundStarted = 0, probePhase = 'preparing';
 let liveReads = 0, liveReadsAvailable = true;
+let probeSessionToken = 0, probeTokenSerial = 0, probeManualFinish = false;
 function probeElapsed() {
   const s = Math.max(0, Math.floor((performance.now() - probeRoundStarted) / 1000));
   return `${String(Math.floor(s / 60)).padStart(2, '0')}:${String(s % 60).padStart(2, '0')}`;
 }
 function showProbeRound(round) {
+  probeSessionToken = ++probeTokenSerial;
   probePhase = 'running';
   probeRound = round;
   probeRoundStarted = performance.now();
   renderProbeProgress();
 }
+function finishProbeRound(token) {
+  if (!token || token !== probeSessionToken || dlgState !== 'probing' || probePhase !== 'running') return false;
+  probeSessionToken = 0;
+  probeManualFinish = true;
+  probePhase = 'collecting';
+  renderProbeProgress();
+  return true;
+}
 function renderProbeProgress() {
   if (dlgState !== 'probing' || !$('#overlay').classList.contains('open')) return;
+  const end = $('#finishProbeRound');
+  if (end) { end.disabled = !probeSessionToken || probePhase !== 'running'; end.textContent = probePhase === 'collecting' ? '正在结束…' : '结束本轮'; }
   const round = $('#pround'), reads = $('#pcount');
   if (round) round.textContent = probePhase === 'preparing' ? '正在准备探测…'
     : probePhase === 'collecting' ? `第 ${probeRound}/2 轮已结束 · 正在整理结果…`
@@ -810,9 +828,9 @@ const SEARCH_LIMIT = 100; // 搜索结果上限（方案设计 §6.1.1）：命�
 const SEARCH_DEBOUNCE = 120; // ms。逐键重排 400 行 = 输入框顿挫，GtkSearchEntry 也有同样的防抖
 let searchTimer = null;
 let expandAll = false;
-/* fuse 缺失 = 探测能力下降。这是**事实**，不是通知：列表那条横幅可以「了解」收掉，
-   但探测页里的降级说明必须仍在——否则用户在最需要知道"结果不完整"的时刻看不到它 */
-let envDegraded = false;
+/* fuse 缺失 = 不能安全探测。这是**事实**，不是通知：列表那条横幅可以「了解」收掉，
+   但配置页仍须阻止目标启动，收起横幅不能绕过环境闸门 */
+let envFuseUnavailable = false;
 /* 「空态演示」的备份：演示要真的清空实例（不是盖假页面），再点一次原样还原 */
 let emptyBackup = null;
 
@@ -939,9 +957,11 @@ function renderDetail() {
   $('#detConfidence').textContent = a.probeMethod === 'strace'
     ? 'strace 跟踪 · 覆盖率低（只记录实际跑到的路径，建议多操作一会儿后重跑一次）'
     : 'overlay-diff 跟踪 · 覆盖本次会话实际发生的写入（没走到的功能分支查不到）';
-  $('#detSharedCount').textContent = `${sharedWrites.length} 项`;
+  const shared = appSharedWrites(a);
+  $('#detSharedCount').textContent = `${shared.length} 项`;
   /* 真实实现读档案的 shared_writes（core 已解析）；本稿用全局常量是因为它是所有 GTK 应用的共项 */
-  $('#detShared').innerHTML = sharedWrites.map(s => `<span class="mono">${s.path}</span>`).join(' · ');
+  $('#detShared').innerHTML = shared.map(s => `<span class="mono">${s.path}</span>`).join(' · ')
+    + (a.sharedCertificates ? `<div data-shared-certificates>${sharedCertificateNotice}</div>` : '');
   const rows = a.instances.map((inst, i) => `
     <div class="row">
       <div class="insticon">${a.letter}</div>
@@ -949,7 +969,7 @@ function renderDetail() {
         <div class="row-title">
           <span class="iname" data-i="${i}" contenteditable="true" spellcheck="false"
                 style="padding:2px 6px;border-radius:6px;outline:none;min-width:40px">${inst.display_name || inst.id}</span>
-          ${inst.running ? '<span class="runbadge">运行中</span>' : ''}
+          ${inst.running ? `<span class="runbadge">${inst.preparing ? '正在准备数据，可随时停止' : '运行中'}</span>` : ''}
         </div>
         <div class="row-sub">${inst.size} · 上次使用 ${inst.last}</div>
       </div>
@@ -971,6 +991,7 @@ let probeEpoch = 0;
 /* 只有这三条要真跑探测；open（复用档案）与 clone（沿用档案再建一个）都跳过 */
 const PROBE_MODES = new Set(['setup', 'reconfig', 'rediscover']);
 function stopProbeTimers() {
+  probeSessionToken = 0;
   probeEpoch++;                       // 旧回调从此全部作废
   clearTimeout(probeTimer); clearInterval(probeTick); clearTimeout(createTimer);
   probeTimer = probeTick = createTimer = null;
@@ -978,12 +999,17 @@ function stopProbeTimers() {
 function startProbe(app) {
   stopProbeTimers();                  // 重入先清旧的，不能只覆盖句柄（泄漏）
   const epoch = probeEpoch;
-  dlgState = 'probing'; foundCount = 0; probeRetryArgs = null;
+  dlgState = 'probing'; foundCount = 0; probeRetryArgs = null; probeManualFinish = false;
   probeRound = 1; probeRoundStarted = performance.now(); probePhase = 'preparing';
   liveReads = 0; liveReadsAvailable = app.readTrace !== 'unavailable';
   /* 闸门在探测会话启动**之前**跑（discover.md §4）。目标应用还在运行时，新的启动请求会被转发给
      已运行的主实例，探测会话里一个字节都不会写——这时若走"没跟踪到任何写入"，就是把闸门失败
      误诊成"这个应用不写盘"，用户会反复重试一个永远不会成功的流程 */
+  if (envFuseUnavailable) {
+    dlgState = 'error'; probeReason = 'env_unavailable';
+    renderDialog();
+    return;
+  }
   if (app.hostRunning) {
     dlgState = 'error'; probeReason = 'app_running';
     renderDialog();
@@ -998,7 +1024,7 @@ function startProbe(app) {
     tick++;
     if (tick === 1) showProbeRound(1);
     else if (tick === 3) showProbeRound(2);
-    else probePhase = 'collecting';
+    else { probeSessionToken = 0; probePhase = 'collecting'; }
     liveReads += target;
     renderProbeProgress();
   }, 260);
@@ -1024,8 +1050,8 @@ const ERROR_TEXT = {
   }),
   env_unavailable: a => ({
     title: '探测环境不满足条件',
-    body: '在容器里或缺少必要的系统组件时，跟踪层建不起来；降级到兼容模式也失败时，探测无法进行。',
-    hint: '可以点「重新检查环境」再试一次；如果一直不行，把这条提示反馈给支持，附上你的发行版版本。',
+    body: '无法安全配置分身：未能建立独立写层，应用尚未启动，主应用数据不会用于可写降级。',
+    hint: '请安装完整软件包，并在普通桌面会话重试；已有普通分身仍可使用。',
   }),
   no_writes: a => ({
     title: '这次没有跟踪到任何写入',
@@ -1056,9 +1082,8 @@ function renderDialog() {
   const body = $('#dlgBody'), sub = $('#dlgSub'), foot = $('#dlgConfirm'), cancel = $('#dlgCancel');
   foot.style.display = '';
   cancel.disabled = false;
-  /* 降级说明只对"刚跑过的这次探测"成立。open/clone 复用档案、没有探测会话，
-     说"本次走兼容模式"是假话；要提示就说"档案来自上次探测"（这里选择不提示，详情页已写明探测方式） */
-  $('#dlgBanner').classList.toggle('show', envDegraded && PROBE_MODES.has(dlgMode));
+  /* 新探测必须有安全写层；open/clone 复用档案，由克隆开关单独反映能力。 */
+  $('#dlgBanner').classList.toggle('show', envFuseUnavailable && PROBE_MODES.has(dlgMode));
   cancel.textContent = (dlgState === 'probing') ? '取消探测' : '取消';
 
   if (dlgState === 'probing') {
@@ -1070,7 +1095,8 @@ function renderDialog() {
         <div class="pcount" id="pround"></div>
         <div class="pcount" id="pcount"></div>
         ${probeRetryArgs ? `<div class="pretry" id="pretry">应用自重启并追加了启动参数（${probeRetryArgs.join(' ')}），本轮没有可隔离的写入；正在带上该参数再探测一次（应用会再启动两轮）。</div>` : ''}
-        <div class="phint">每轮请在应用里正常用一会儿——收发文件、改设置——然后完全退出。<br>应用会启动两轮，以检查第二次启动时才使用的数据。随时可以取消探测。</div>
+        <button id="finishProbeRound" class="button" disabled onclick="finishProbeRound(probeSessionToken)">结束本轮</button>
+        <div class="phint">每轮请在应用里正常用一会儿——收发文件、改设置——然后完全退出。<br>应用会启动两轮，以检查第二次启动时才使用的数据。可结束本轮并保留已采集结果；取消探测将放弃本次配置。</div>
       </div>`;
     foot.style.display = 'none';   // 探测中没有"创建"这个动作
     renderProbeProgress();
@@ -1113,14 +1139,16 @@ function renderDialog() {
   /* confirm */
   sub.textContent = '勾选属于「应用自身数据」的目录——它们会被隔离，其余文件与主空间保持共享。';
   const cands = pathCandidates[a.id] || [];
-  const rt = a.readTrace === undefined ? 'ok' : a.readTrace;
-  const readsBanner = rt === 'partial'
+  const rawRT = a.readTrace === undefined ? 'ok' : a.readTrace;
+  const manual = probeManualFinish && PROBE_MODES.has(dlgMode);
+  const rt = manual && rawRT !== 'unavailable' ? 'partial' : rawRT;
+  const readsBanner = (manual ? '<div class="banner soft inline show" data-banner="manual-finish">已主动结束本轮并保留已采集结果；尚未写入的数据可能未被覆盖。</div>' : '') + (rt === 'partial'
     ? `<div class="banner soft inline show" data-banner="reads-partial">⚠ 本次读证据不完整，登录态可能未覆盖。确认前请核对带「登录态」标记的路径。</div>`
     : rt === 'unavailable'
       ? `<div class="banner soft inline show" data-banner="reads-unavailable">⚠ 本次读证据不完整，登录态可能未覆盖。请至少勾选一条要隔离的路径。</div>`
       : rt === ''
         ? `<div class="banner soft inline show" data-banner="reads-legacy">旧档案，重新探测可获取读证据。</div>`
-        : `<div class="banner soft inline show" data-banner="reads-ok">读证据只覆盖 open/openat 观察到的路径；openat2 被移除、setuid 子进程等盲区不在其中。</div>`;
+        : `<div class="banner soft inline show" data-banner="reads-ok">读证据只覆盖 open/openat 观察到的路径；openat2 被移除、setuid 子进程等盲区不在其中。</div>`);
   const noHomeReads = a.noHomeReads
     ? `<div class="banner soft inline show" data-banner="no-home-reads" id="no-home-reads">本次没有观察到读取路径；登录态可能仍然未被覆盖。</div>`
     : '';
@@ -1180,7 +1208,7 @@ function renderDialog() {
         <span class="cb"></span>
         <div class="tt">
           <div class="path">从现有应用数据克隆起步</div>
-          <div class="why">写时复制继承当前应用数据，不复制文件，主实例数据不会被改动；需要 fuse-overlayfs。登录状态目录不参与克隆，应用可能从空数据开始。</div>
+          <div class="why">首次启动时保存独立的数据副本，请先关闭主应用；准备完成后可同时使用。需要额外磁盘空间。登录状态目录不参与克隆，应用可能从空数据开始。</div>
         </div>
       </label>
     </div>`}
@@ -1223,7 +1251,7 @@ function renderDialog() {
          会判定产品坏了 -->
     <div class="dlg-group">
       <div class="group-label">共享但可写（不隔离）</div>
-      ${sharedWrites.map(s => `<div class="readonly-row">
+      ${appSharedWrites(a).map(s => `<div class="readonly-row">
         <span class="path">${s.path}</span><span class="shared-tag">共享</span></div>
         <div class="readonly-row" style="border-top:none;padding-top:0;font-size:11.5px">${s.why}</div>`).join('')}
     </div>`;
@@ -1405,6 +1433,17 @@ document.addEventListener('click', e => {
     /* 用户可见文案里不能出现内部 id 与引擎名（work / bwrap）：id 是目录名，用户只认显示名 */
     const inst = currentApp.instances[l.dataset.launch];
     toast(`正在启动「${currentApp.name} · ${inst.display_name || inst.id}」…`);
+    if (inst.fork && !inst.prepared) {
+      const app = currentApp, seq = inst.prepareSeq = (inst.prepareSeq || 0) + 1;
+      inst.running = true; inst.preparing = true;
+      renderDetail(); renderList();
+      setTimeout(() => {
+        if (!inst.running || seq !== inst.prepareSeq) return;
+        inst.preparing = false; inst.prepared = true;
+        if (currentApp === app) renderDetail();
+        renderList();
+      }, 1500);
+    }
     return;
   }
   const st = t.closest('[data-stop]');
@@ -1416,7 +1455,7 @@ document.addEventListener('click', e => {
       body: '正在运行的应用会退出；未保存的内容可能丢失。',
       okText: '停止',
       onOk: () => {
-        inst.running = false;
+        inst.running = false; inst.preparing = false; inst.prepareSeq = (inst.prepareSeq || 0) + 1;
         renderDetail(); renderList();
         toast(`已停止「${inst.display_name || inst.id}」`);
       },
@@ -1479,7 +1518,7 @@ document.addEventListener('click', e => {
         : mode === 'open'
           ? `已开启「${app.name} · ${dispName}」（复用原有档案，隔离 ${nIsolated} 个路径）`
           : `已创建「${dispName}」（隔离 ${nIsolated} 个路径）`)
-        + (forkNow ? '，已从现有数据克隆起步' : ''));
+        + (forkNow ? '，首次启动时准备独立数据副本' : ''));
       /* 首次配置也落到详情页：用户此刻该看到刚建出来的实例（方案设计 §6.1，replace 而非 pop） */
       closeDialog(true); renderList();
       /* 建完把视图放回「分身」：返回时刚建出的实例就在眼前，
@@ -1520,20 +1559,20 @@ document.addEventListener('click', e => {
        并排摆着会让人以为要分别处理两个问题。致命优先，降级让位——
        但"让位"和"用户主动收掉"是两件事：环境恢复后降级那条要回来（否则用户以为它没了） */
     if (on) { $('#bannerSoft').classList.remove('show'); $('#btnSoftBanner').classList.remove('on'); }
-    else if (envDegraded) { $('#bannerSoft').classList.add('show'); $('#btnSoftBanner').classList.add('on'); }
+    else if (envFuseUnavailable) { $('#bannerSoft').classList.add('show'); $('#btnSoftBanner').classList.add('on'); }
     t.classList.toggle('on', on); return;
   }
   if (t.closest('#btnSoftBanner')) {
     if ($('#banner').classList.contains('show')) return;   // 致命态下不给开第二条（互斥）
-    envDegraded = !envDegraded;
-    $('#bannerSoft').classList.toggle('show', envDegraded);
+    envFuseUnavailable = !envFuseUnavailable;
+    $('#bannerSoft').classList.toggle('show', envFuseUnavailable);
     /* 探测页里那条是同一事实的另一处呈现：对话框开着时切换演示，两边必须同步，
        否则演示会给人一种"探测页说的是上一轮状态"的错觉 */
     if ($('#overlay').classList.contains('open')) renderDialog();
-    t.classList.toggle('on', envDegraded); return;
+    t.classList.toggle('on', envFuseUnavailable); return;
   }
   if (t.closest('#bannerSoftDismiss')) {
-    /* 「了解」只收起**这一条**横幅：降级是事实，探测页里的降级说明必须照旧（envDegraded 不动） */
+    /* 「了解」只收起**这一条**横幅：降级是事实，探测页里的降级说明必须照旧（envFuseUnavailable 不动） */
     $('#bannerSoft').classList.remove('show');
     $('#btnSoftBanner').classList.remove('on');
   }

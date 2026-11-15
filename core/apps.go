@@ -19,6 +19,7 @@ type App struct {
 	DesktopID      string
 	Key            string // 目录名 <app>（归一化结果），与档案/实例目录同名
 	Name           string // 已按当前 locale 取好 Name[lang]
+	EnglishName    string // 桌面英文/默认名称，供跨语言搜索
 	Icon           string
 	Exec           string
 	ExecArgs       []string
@@ -187,6 +188,7 @@ func parseDesktopFile(path string) (*App, error) {
 		DesktopID:      strings.TrimSuffix(base, ".desktop"),
 		Key:            key,
 		Name:           localizedName(keys),
+		EnglishName:    englishName(keys),
 		Icon:           keys["Icon"],
 		Exec:           exec,
 		ExecArgs:       execArgs,
@@ -230,6 +232,15 @@ func localizedName(keys map[string]string) string {
 		return v
 	}
 	return keys["Name[zh]"]
+}
+
+func englishName(keys map[string]string) string {
+	for _, key := range []string{"Name[en]", "Name[en_US]", "Name"} {
+		if value := strings.TrimSpace(keys[key]); value != "" {
+			return value
+		}
+	}
+	return ""
 }
 
 // parseExecLine 把 Exec= 拆成（可执行文件, 参数, 字段码）。

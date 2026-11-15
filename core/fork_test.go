@@ -13,14 +13,18 @@ type mountCall struct {
 	lower, upper, work, merged string
 }
 
-// recordingMounter 记录挂载参数，用来钉住"lower 必须是主实例数据、upper 必须
-// 是实例 root"这条克隆语义。
+// recordingMounter records parameters and maintains a realistic mount table.
 type recordingMounter struct {
+	table       *forkTableMounter
 	calls       []mountCall
 	available   error
 	mountErr    error
 	unmountErr  error
 	unmountCall int
+}
+
+func newRecordingMounter(t *testing.T) *recordingMounter {
+	return &recordingMounter{table: forkTableFixture(t)}
 }
 
 func (m *recordingMounter) Available() error { return m.available }
@@ -30,9 +34,16 @@ func (m *recordingMounter) Mount(lower, upper, work, merged string) (func() erro
 		return nil, m.mountErr
 	}
 	m.calls = append(m.calls, mountCall{lower, upper, work, merged})
+	unmount, err := m.table.Mount(lower, upper, work, merged)
+	if err != nil {
+		return nil, err
+	}
 	return func() error {
 		m.unmountCall++
-		return m.unmountErr
+		if m.unmountErr != nil {
+			return m.unmountErr
+		}
+		return unmount()
 	}, nil
 }
 
@@ -66,7 +77,7 @@ func TestCreateForkInstancePersists(t *testing.T) {
 	}
 }
 
-// forkMounts：lower=主实例真实目录、upper=实例 root 下的同名子路径，
+// forkMounts：lower=实例固定副本、upper=实例 root 下的同名子路径，
 // 返回的 bind 源是挂载点；cleanup 必须卸载并删掉临时目录。
 func TestForkMountsBindsPrimaryData(t *testing.T) {
 	e := testEnv(t)
@@ -75,7 +86,7 @@ func TestForkMountsBindsPrimaryData(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(primary, "state.db"), []byte("main"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	fm := &recordingMounter{}
+	fm := newRecordingMounter(t)
 	e.Mounter = fm
 
 	in, err := e.CreateInstanceWith(context.Background(), app, p, "work", CreateOptions{Fork: true})
@@ -88,13 +99,19 @@ func TestForkMountsBindsPrimaryData(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	sources, cleanup := e.forkMounts(p, in, nil, func(string) {})
+	sources, cleanup, _, ferr := e.forkMounts(p, in, nil, func(string) {})
+	if ferr != nil {
+		t.Fatal(ferr)
+	}
 	if len(fm.calls) != 1 {
 		t.Fatalf("应为主实例数据挂一次 overlay，得到 %d 次：%+v", len(fm.calls), fm.calls)
 	}
 	c := fm.calls[0]
-	if c.lower != abs {
-		t.Fatalf("lower 必须是主实例真实目录：want %q got %q", abs, c.lower)
+	if !IsUnder(filepath.Join(in.Dir(), "fork-base"), c.lower) || c.lower == abs {
+		t.Fatalf("lower must be a private snapshot: %q", c.lower)
+	}
+	if data, err := os.ReadFile(filepath.Join(c.lower, "state.db")); err != nil || string(data) != "main" {
+		t.Fatalf("fixed copy missing: %v", err)
 	}
 	if c.upper != upper {
 		t.Fatalf("upper 必须是实例 root 下的持久层：want %q got %q", upper, c.upper)
@@ -120,7 +137,7 @@ func TestForkMountsBindsPrimaryData(t *testing.T) {
 func TestForkMountsSkipsEmptyAndUnavailable(t *testing.T) {
 	e := testEnv(t)
 	app, p := seedApp(t, e)
-	fm := &recordingMounter{}
+	fm := newRecordingMounter(t)
 	e.Mounter = fm
 	in, err := e.CreateInstanceWith(context.Background(), app, p, "work", CreateOptions{Fork: true})
 	if err != nil {
@@ -128,25 +145,28 @@ func TestForkMountsSkipsEmptyAndUnavailable(t *testing.T) {
 	}
 
 	// seedApp 只建了空目录。
-	sources, cleanup := e.forkMounts(p, in, nil, func(string) {})
+	sources, cleanup, _, ferr := e.forkMounts(p, in, nil, func(string) {})
+	if ferr != nil {
+		t.Fatal(ferr)
+	}
 	cleanup()
-	if len(sources) != 0 || len(fm.calls) != 0 {
+	if len(sources) != 1 || len(fm.calls) != 0 {
 		t.Fatalf("空目录不应挂 overlay：sources=%v calls=%v", sources, fm.calls)
 	}
 
-	// 有内容但 fuse 不可用：降级为普通实例目录，并告诉用户。
+	// fuse 不可用必须停止，不能把故障当作不继承数据。
 	if err := os.WriteFile(filepath.Join(e.Resolver.Home, ".config", "TestApp", "x"), []byte("x"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	fm.available = errEnv("err.probe.no_dev_fuse", nil, nil)
 	var warns []string
-	sources, cleanup = e.forkMounts(p, in, nil, func(msg string) { warns = append(warns, msg) })
+	sources, cleanup, _, ferr = e.forkMounts(p, in, nil, func(msg string) { warns = append(warns, msg) })
 	cleanup()
 	if len(sources) != 0 {
 		t.Fatalf("fuse 不可用时不应给出 bind 源：%v", sources)
 	}
-	if len(warns) != 1 || !strings.Contains(warns[0], "fuse-overlayfs") {
-		t.Fatalf("应告警一次说明降级原因，得到 %v", warns)
+	if ferr == nil {
+		t.Fatal("missing fuse must fail closed")
 	}
 }
 
@@ -173,13 +193,16 @@ func TestMountInfoHasEscapedPaths(t *testing.T) {
 func TestForkMountsNoopForPlainInstance(t *testing.T) {
 	e := testEnv(t)
 	app, p := seedApp(t, e)
-	fm := &recordingMounter{}
+	fm := newRecordingMounter(t)
 	e.Mounter = fm
 	in, err := e.CreateInstance(context.Background(), app, p, "plain")
 	if err != nil {
 		t.Fatal(err)
 	}
-	sources, cleanup := e.forkMounts(p, in, nil, func(string) { t.Fatal("普通实例不该告警") })
+	sources, cleanup, _, ferr := e.forkMounts(p, in, nil, func(string) { t.Fatal("普通实例不该告警") })
+	if ferr != nil {
+		t.Fatal(ferr)
+	}
 	cleanup()
 	if sources != nil || len(fm.calls) != 0 {
 		t.Fatalf("普通实例不应挂载：sources=%v calls=%v", sources, fm.calls)
@@ -248,9 +271,9 @@ func TestResetForkBaseRefusesRemoveWhileMounted(t *testing.T) {
 		t.Fatalf("拒绝删除时 base 必须保留：%v", err)
 	}
 
-	// 现场消失后（mountinfo 为空）同样的调用才允许删。
+	// 现场消失后，完整挂载表只有根挂载，同样的调用才允许删。
 	empty := filepath.Join(t.TempDir(), "empty")
-	if err := os.WriteFile(empty, nil, 0o600); err != nil {
+	if err := os.WriteFile(empty, []byte("1 2 0:3 / / rw - ext4 /dev/root rw\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	procMountInfo = empty
@@ -270,7 +293,9 @@ func TestForkMountsKeepsWorkDirWhenMountRaisedButPresent(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(primary, "state.db"), []byte("main"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	e.Mounter = &recordingMounter{mountErr: errEnv("err.probe.mount_timeout", nil, nil)}
+	fm := newRecordingMounter(t)
+	fm.mountErr = errEnv("err.probe.mount_timeout", nil, nil)
+	e.Mounter = fm
 	in, err := e.CreateInstanceWith(context.Background(), app, p, "work", CreateOptions{Fork: true})
 	if err != nil {
 		t.Fatal(err)
@@ -287,7 +312,10 @@ func TestForkMountsKeepsWorkDirWhenMountRaisedButPresent(t *testing.T) {
 	}
 	procMountInfo = fixture
 
-	sources, cleanup := e.forkMounts(p, in, nil, func(string) {})
+	sources, cleanup, _, ferr := e.forkMounts(p, in, nil, func(string) {})
+	if ferr == nil {
+		t.Fatal("must fail closed")
+	}
 	cleanup()
 	if len(sources) != 0 {
 		t.Fatalf("Mount 报错的路径不应成为 bind 源：%v", sources)
@@ -333,16 +361,19 @@ func TestForkMountsSkipsLowerContainingUpper(t *testing.T) {
 	}
 	ancestor := filepath.Join(root, "data")
 	p.Paths = []string{ancestor}
-	fm := &recordingMounter{}
+	fm := newRecordingMounter(t)
 	e.Mounter = fm
 	var warns []string
-	sources, cleanup := e.forkMounts(p, in, nil, func(msg string) { warns = append(warns, msg) })
+	sources, cleanup, _, ferr := e.forkMounts(p, in, nil, func(msg string) { warns = append(warns, msg) })
+	if ferr == nil {
+		t.Fatal("must fail closed")
+	}
 	cleanup()
 	if len(sources) != 0 || len(fm.calls) != 0 {
 		t.Fatalf("upper 在 lower 内时不应挂载：sources=%v calls=%v", sources, fm.calls)
 	}
-	if len(warns) != 1 || !strings.Contains(warns[0], "无法克隆起步") {
-		t.Fatalf("应告警说明该路径不继承，得到 %v", warns)
+	if ferr == nil {
+		t.Fatal("overlap must fail closed")
 	}
 }
 

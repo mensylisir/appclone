@@ -6,15 +6,19 @@
 package main
 
 import (
+	"context"
 	"errors"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
 
 	"codeberg.org/puregotk/puregotk/v4/adw"
+	"codeberg.org/puregotk/puregotk/v4/gobject"
 	"codeberg.org/puregotk/puregotk/v4/gtk"
 
 	"github.com/mensylisir/appclone/core"
@@ -26,7 +30,7 @@ func TestGtkProbeProgress(t *testing.T) {
 	for _, lang := range []string{"zh_CN", "en"} {
 		u := &ui{lang: lang}
 		v := &setupView{u: u, state: "probing", probeSeq: 1,
-			roundLabel: gtk.NewLabel(""), countLabel: gtk.NewLabel(""), retryLabel: gtk.NewLabel("retry")}
+			finishRoundBtn: gtk.NewButton(), roundLabel: gtk.NewLabel(""), countLabel: gtk.NewLabel(""), retryLabel: gtk.NewLabel("retry")}
 		p := core.ProbeProgress{Stage: "round_running", Round: 1, Rounds: 2,
 			Elapsed: 65 * time.Second, Reads: 42, ReadAvailable: true}
 		v.applyProbeProgress(1, p)
@@ -63,6 +67,7 @@ func TestGtkProbeProgress(t *testing.T) {
 		if v.roundLabel.GetText() != want {
 			t.Fatal("heartbeat changed canceled page")
 		}
+		v.finishRoundBtn.Unref()
 		v.roundLabel.Unref()
 		v.countLabel.Unref()
 		v.retryLabel.Unref()
@@ -291,5 +296,100 @@ func TestBuildProfileKeyringExplicitAndRowSync(t *testing.T) {
 	p = v.buildProfile()
 	if p.IsolateKeyring || !p.KeyringSet {
 		t.Fatalf("关闭必须写成显式 false（不是「未设置」）：%+v", p)
+	}
+}
+
+type finishRoundMounter struct{}
+
+func (finishRoundMounter) Available() error { return nil }
+func (finishRoundMounter) Mount(_ string, upper, _ string, _ string) (func() error, error) {
+	dir := filepath.Join(upper, ".config", "FinishDemo")
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		return nil, err
+	}
+	if err := os.WriteFile(filepath.Join(dir, "state"), []byte("synthetic"), 0600); err != nil {
+		return nil, err
+	}
+	return func() error { return nil }, nil
+}
+
+type finishRoundRunner struct{}
+
+func (finishRoundRunner) Run(ctx context.Context, _ []string, _ io.Writer) (core.SessionResult, error) {
+	return core.SessionResult{}, ctx.Err()
+}
+func (finishRoundRunner) RunWithStart(ctx context.Context, _ []string, _ io.Writer, start func(core.SessionProcess) error) (core.SessionResult, error) {
+	if err := start(core.SessionProcess{}); err != nil {
+		return core.SessionResult{}, err
+	}
+	<-ctx.Done()
+	return core.SessionResult{Started: true}, ctx.Err()
+}
+
+func TestGtkFinishProbeRound(t *testing.T) {
+	env, _ := gtkTestEnv(t, "finish-round")
+	gtk.Init()
+	env.ProbeCapsOverride = &core.ProbeCaps{}
+	if err := os.MkdirAll(filepath.Join(env.Resolver.Home, "Downloads"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(env.Resolver.XDG["CONFIG_HOME"], "user-dirs.dirs"), []byte("XDG_DOWNLOAD_DIR=\"$HOME/Downloads\"\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	c := newCallbacks()
+	scope := &renderScope{c: c}
+	defer scope.close()
+	v := &setupView{u: &ui{lang: "zh_CN"}, state: "probing", probeSeq: 1, probeControl: &core.ProbeControl{},
+		roundLabel: gtk.NewLabel(""), countLabel: gtk.NewLabel(""), finishRoundBtn: gtk.NewButton()}
+	scope.own(v.roundLabel)
+	scope.own(v.countLabel)
+	scope.own(v.finishRoundBtn)
+	scope.button(v.finishRoundBtn, v.finishProbeRound)
+	events := make(chan core.ProbeProgress, 16)
+	type result struct {
+		res core.ProbeResult
+		err error
+	}
+	done := make(chan result, 1)
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancel()
+	go func() {
+		res, err := env.Probe(ctx, "finishdemo", core.ProbeOptions{Command: []string{"/synthetic/finishdemo"}, Mounter: finishRoundMounter{}, Runner: finishRoundRunner{}, Control: v.probeControl, Progress: func(p core.ProbeProgress) { events <- p }, Rounds: 2})
+		done <- result{res, err}
+	}()
+	finished := 0
+	var old uint64
+	for {
+		select {
+		case p := <-events:
+			v.applyProbeProgress(1, p)
+			if !p.CanFinish {
+				continue
+			}
+			if !v.finishRoundBtn.GetSensitive() {
+				t.Fatal("started round cannot be ended")
+			}
+			if old != 0 && v.probeControl.Finish(old) {
+				t.Fatal("old round token accepted")
+			}
+			old = p.SessionToken
+			gobject.SignalEmitByName(&v.finishRoundBtn.Widget.Object, "clicked")
+			if v.finishRoundBtn.GetSensitive() {
+				t.Fatal("clicked button remains enabled")
+			}
+			v.applyProbeProgress(1, p) // old queued heartbeat cannot re-enable the button
+			if v.finishRoundBtn.GetSensitive() {
+				t.Fatal("stale heartbeat re-enabled button")
+			}
+			gobject.SignalEmitByName(&v.finishRoundBtn.Widget.Object, "clicked")
+			finished++
+		case got := <-done:
+			if got.err != nil || finished != 2 || len(got.res.Profile.Paths) == 0 || !slices.Contains(got.res.ReadsWarns, "manual_finish") {
+				t.Fatalf("rounds=%d err=%v paths=%v warns=%v", finished, got.err, got.res.Profile.Paths, got.res.ReadsWarns)
+			}
+			return
+		case <-ctx.Done():
+			t.Fatal("finish round timed out")
+		}
 	}
 }

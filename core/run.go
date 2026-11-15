@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -34,7 +35,7 @@ type RunResult struct {
 // 不 exec bwrap 的原因：--die-with-parent 只保证直接子进程，应用自己
 // fork+setsid 出来的进程会逃出这条链路。所以 run 自己 setsid 起 bwrap、
 // 常驻等待，退出时对**整个进程组**发 SIGTERM，3 秒后 SIGKILL。
-func (e *Env) Run(ctx context.Context, app, id string, opt RunOptions) (RunResult, error) {
+func (e *Env) Run(ctx context.Context, app, id string, opt RunOptions) (result RunResult, retErr error) {
 	// root 会话下 --bind / / 是 rw，误操作能改宿主系统；而且 root 下 bwrap
 	// 本来就能跑通，"验证通过"会把非特权路径的问题全藏起来（§3.1 末段）。
 	if err := CheckNotRoot(); err != nil {
@@ -74,9 +75,17 @@ func (e *Env) Run(ctx context.Context, app, id string, opt RunOptions) (RunResul
 	}()
 	defer close(done)
 
+	identity := e.captureForkRun(app, id)
 	in, err := e.GetInstance(app, id)
 	if err != nil {
 		return RunResult{}, err
+	}
+	if in.Fork {
+		if err := identity.check(); err != nil {
+			return RunResult{}, forkPreparationError(err)
+		}
+		e = e.withForkRun(identity)
+		in.Root = filepath.Join(identity.instance.canonical, "root")
 	}
 	// 运行态判定用 LOCK_NB 立刻返回：桌面图标被点两次是常态，
 	// 阻塞的后果是"点了没反应"再叠加一个永不返回的进程（§4.3）。
@@ -84,6 +93,9 @@ func (e *Env) Run(ctx context.Context, app, id string, opt RunOptions) (RunResul
 	if err != nil {
 		if opt.Wait {
 			for {
+				if err := e.forkRun.check(); err != nil {
+					return RunResult{}, forkPreparationError(err)
+				}
 				select {
 				case <-ctx.Done():
 					// 用户取消不是失败：CLI 把它映射成 0（§11 sentinel）。
@@ -99,11 +111,23 @@ func (e *Env) Run(ctx context.Context, app, id string, opt RunOptions) (RunResul
 		}
 	}
 	defer lock.Close()
+	if err := e.forkRun.check(); err != nil {
+		return RunResult{}, forkPreparationError(err)
+	}
+	if err := writeRunPhase(lock, "preparing"); err != nil {
+		return RunResult{}, err
+	}
 	// run.pid 供 stop 定位本进程（ADR-028）：defer 顺序是"先删记录、再放锁"，
 	// 这样 stop 看到记录消失时，锁一定还没释放，不会把新的 run 当成旧的杀。
 	// 运行态判定仍只看 run.lock（ADR-023）。
 	instDir := e.InstancePath(app, id)
+	if err := e.forkRun.check(); err != nil {
+		return RunResult{}, forkPreparationError(err)
+	}
 	if err := writeRunPID(instDir, os.Getpid()); err != nil {
+		if in.Fork {
+			return RunResult{}, forkPreparationError(err)
+		}
 		// 拿不到 stop 的目标记录不影响应用启动（磁盘满/实例目录只读时，
 		// 让应用照常跑比拦下来更重要）；明确告知本次不支持停止。
 		if opt.Stderr != nil {
@@ -118,10 +142,54 @@ func (e *Env) Run(ctx context.Context, app, id string, opt RunOptions) (RunResul
 	if err != nil {
 		return RunResult{}, err
 	}
+	// Snapshot preparation precedes host placeholders, preserving missing/empty
+	// decisions. Promotion holds the global lock only for the schema barrier.
+	var forkSources map[string]string
+	checkFork := func() error { return nil }
+	if in.Fork {
+		p, err = e.promoteForkProfile(ctx, app)
+		if err != nil {
+			return RunResult{}, err
+		}
+		if err := ValidateProfile(p, e.BuildOptions()); err != nil {
+			return RunResult{}, err
+		}
+		var cleanup func() error
+		var checkSources func() error
+		forkSources, cleanup, checkSources, err = e.forkMounts(p, in, func() bool { return stopping.Load() || ctx.Err() != nil }, nil)
+		if err != nil {
+			return RunResult{}, err
+		}
+		defer func() {
+			if err := cleanup(); err != nil {
+				retErr = forkCleanupError(err)
+			}
+		}()
+		var owners []string
+		for path := range forkSources {
+			owners = append(owners, path)
+		}
+		sort.Slice(owners, func(i, j int) bool { return pathLess(owners[i], owners[j]) })
+		original := p
+		aliases, err := e.forkAliases(original, owners)
+		if err != nil {
+			return RunResult{}, err
+		}
+		checkFork = func() error {
+			if err := checkSources(); err != nil {
+				return forkPreparationError(err)
+			}
+			return e.checkForkPaths(original, owners, aliases)
+		}
+		if err := checkFork(); err != nil {
+			return RunResult{}, err
+		}
+		p.Paths = owners
+	}
 	// 先补建、再校验存在性：宿主的 `paths` 目标如果被删掉了（应用重装、用户清理），
 	// 补一个空目录就能继续跑——那正是 `add` 建实例时做的事。反过来先校验的话，
 	// 用户会得到一个"档案已失效"的死胡同，而唯一的出路是重新探测（得到同一份档案）。
-	if _, err := e.prepareBindTargets(p, in); err != nil {
+	if _, err := e.prepareBindTargetsWith(p, in, in.Fork); err != nil {
 		return RunResult{}, err
 	}
 	// cwd 不存在时回退到有效 HOME：应用升级删了自己的工作目录是偶然事件，
@@ -141,21 +209,6 @@ func (e *Env) Run(ctx context.Context, app, id string, opt RunOptions) (RunResul
 	// 那个失败看起来就像"应用自己退出了"，会被映射成 1，与 appclone 的码混在一起（§6.3）。
 	if err := e.ValidateRunnable(p); err != nil {
 		return RunResult{}, err
-	}
-
-	// 克隆起步（§8.1）：fork 实例在 bwrap 之前把主实例数据挂成只读 lower，
-	// bind 源换成挂载点；run 结束（含失败/信号）由 defer 卸载。
-	var forkSources map[string]string
-	if in.Fork {
-		var forkCleanup func()
-		forkSources, forkCleanup = e.forkMounts(p, in, func() bool {
-			return stopping.Load() || ctx.Err() != nil
-		}, func(msg string) {
-			if opt.Stderr != nil {
-				_, _ = io.WriteString(opt.Stderr, "appclone: "+msg+"\n")
-			}
-		})
-		defer forkCleanup()
 	}
 
 	// RuntimeDir 保持宿主值（它是 bind 的**目标**，命名空间里应用看到的路径）；
@@ -182,7 +235,9 @@ func (e *Env) Run(ctx context.Context, app, id string, opt RunOptions) (RunResul
 		// 会判 audit_incomplete）；Start 之前删是安全的。
 		defer func() {
 			if audit != nil {
-				audit.abandon(started)
+				if err := audit.abandon(started); err != nil {
+					retErr = err
+				}
 			}
 		}()
 	}
@@ -239,6 +294,12 @@ func (e *Env) Run(ctx context.Context, app, id string, opt RunOptions) (RunResul
 		}
 	}
 
+	if in.Fork {
+		e.forkCheckpoint("before-build")
+	}
+	if err := checkFork(); err != nil {
+		return RunResult{}, err
+	}
 	argv, err := BwrapCommand(p, in, o)
 	if err != nil {
 		return RunResult{}, err
@@ -257,12 +318,19 @@ func (e *Env) Run(ctx context.Context, app, id string, opt RunOptions) (RunResul
 		cmd.Stderr = os.Stderr
 	}
 	// 启动前收到过停止信号：不为一次注定要杀的运行把应用拉起来。
-	if stopping.Load() {
+	if in.Fork {
+		e.forkCheckpoint("before-start")
+	}
+	if err := checkFork(); err != nil {
+		return RunResult{}, err
+	}
+	if stopping.Load() || ctx.Err() != nil {
 		return RunResult{}, ErrCanceled
 	}
 	if err := cmd.Start(); err != nil {
 		return RunResult{}, errEnv("err.run.start_failed", map[string]any{"exec": p.Exec}, err)
 	}
+	_ = writeRunPhase(lock, "running")
 	started = true
 	pgid := cmd.Process.Pid
 	pgidCh <- pgid // 早到的 SIGTERM 在这里拿到目标，整组终止

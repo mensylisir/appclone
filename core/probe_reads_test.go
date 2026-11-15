@@ -2,6 +2,7 @@ package core
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -9,6 +10,61 @@ import (
 	"testing"
 	"time"
 )
+
+// Creation/rename spelling is insufficient to identify a whiteout's lifetime:
+// aliases and partial traces can hide a later recreation. Keep these candidates.
+func TestProbeKeepsLowercaseWhiteouts(t *testing.T) {
+	for _, layout := range []string{"plain", "config-link", "side-link"} {
+		for _, partial := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/partial=%v", layout, partial), func(t *testing.T) {
+				e := probeEnv(t)
+				cfg := e.Resolver.XDG["CONFIG_HOME"]
+				physical, alias := cfg, cfg
+				if layout == "config-link" {
+					physical = filepath.Join(e.Resolver.Home, "cfg")
+					if err := os.Rename(cfg, physical); err != nil {
+						t.Fatal(err)
+					}
+					if err := os.Symlink(physical, cfg); err != nil {
+						t.Fatal(err)
+					}
+				} else if layout == "side-link" {
+					alias = filepath.Join(e.Resolver.Home, "alias")
+					if err := os.Symlink(cfg, alias); err != nil {
+						t.Fatal(err)
+					}
+				}
+				rel, err := filepath.Rel(e.Resolver.Home, physical)
+				if err != nil {
+					t.Fatal(err)
+				}
+				m := &fakeMounter{entries: []string{filepath.Join(rel, "a.conf"), filepath.Join(rel, ".wh.a.conf.abcdef"), filepath.Join(rel, ".wh.a.conf.backup")}}
+				r := &fifoRunner{res: SessionResult{Started: true, ManualFinish: partial}, lines: []string{
+					`execve("/synthetic/testapp", ["testapp"], 0x0) = 0`,
+					fmt.Sprintf(`open("%s/a.conf.abcdef", O_RDWR|O_CREAT|O_EXCL, 0600) = 3`, physical),
+					fmt.Sprintf(`rename("%s/a.conf.abcdef", "%s/a.conf") = 0`, physical, physical),
+					fmt.Sprintf(`open("%s/a.conf.abcdef", O_WRONLY|O_CREAT, 0600) = 3`, alias),
+					fmt.Sprintf(`unlink("%s/a.conf.abcdef") = 0`, alias),
+				}}
+				res, err := e.probeSession(context.Background(), "testapp", ProbeOptions{Command: []string{"/synthetic/testapp"}, Rounds: 1, Mounter: m, Runner: r}, m, r)
+				if err != nil {
+					t.Fatal(err)
+				}
+				for _, suffix := range []string{"abcdef", "backup"} {
+					if !containsString(res.Whiteouts, filepath.Join(physical, "a.conf."+suffix)) {
+						t.Fatalf("lost whiteout %s: %+v", suffix, res.Whiteouts)
+					}
+				}
+				if candByPath(res.Candidates, filepath.Join(physical, "a.conf.abcdef")) == nil {
+					t.Fatalf("lost read candidate: %+v", res.Candidates)
+				}
+				if partial && res.ReadTrace != ReadTracePartial {
+					t.Fatalf("state=%s", res.ReadTrace)
+				}
+			})
+		}
+	}
+}
 
 // fifoRunner 模拟 strace：把预置的日志行写进命令里的 `-o <fifo>`，再返回
 // 预设的会话结果。这样 probeSession 的 FIFO/reader/解析链路是真实跑通的，
@@ -127,19 +183,6 @@ func TestProbeSessionPreflightFailed(t *testing.T) {
 	}
 	if res.Writes == 0 {
 		t.Fatalf("写证据应照常：%d", res.Writes)
-	}
-}
-
-// 兜底路径写能力不可用：必须报环境错误，不能静默生成零写入档案。
-func TestProbeStraceWriteUnavailable(t *testing.T) {
-	e := probeEnv(t)
-	e.ProbeCapsOverride = &ProbeCaps{Read: true, Write: false, Y: true}
-	r := &fakeRunner{}
-	_, err := e.probeStrace(context.Background(), "testapp", ProbeOptions{
-		Command: []string{"/usr/bin/testapp"}, Runner: r,
-	}, r)
-	if errKey(err) != "err.probe.strace_unavailable" {
-		t.Fatalf("写能力不可用应报 strace_unavailable，得到 %v", err)
 	}
 }
 
@@ -367,18 +410,17 @@ func TestProbeReadStateUnverifiedSuppressesNoHomeReads(t *testing.T) {
 	}
 }
 
-// 兜底路径读能力不可用：只报 unavailable，不叠加 openat2/-y 告警
-// （用户应被引向"读追踪不可用"，而不是去查 strace 的 openat2 支持）。
-func TestProbeReadStateFallbackReadUnavailableWarns(t *testing.T) {
+// 读能力不可用时只报预检失败，不叠加未行使的 openat2/-y 告警。
+func TestProbeReadStateReadUnavailableWarns(t *testing.T) {
 	e := probeEnv(t)
 	e.ProbeCapsOverride = &ProbeCaps{Read: false, Write: true, Openat2: false, Y: true}
-	st, err := e.newProbeReadState(context.Background(), t.TempDir(), ProbeOptions{}, true)
+	st, err := e.newProbeReadState(context.Background(), t.TempDir(), ProbeOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer st.stop()
-	if got := st.warnsList(); len(got) != 1 || got[0] != "unavailable" {
-		t.Fatalf("兜底读不可用只应报 unavailable：%v", got)
+	if got := st.warnsList(); len(got) != 1 || got[0] != "preflight_failed" {
+		t.Fatalf("读不可用只应报 preflight_failed：%v", got)
 	}
 	if st.readTrace() != ReadTraceUnavailable {
 		t.Fatalf("应为 unavailable：%q", st.readTrace())

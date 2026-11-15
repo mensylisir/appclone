@@ -3,11 +3,9 @@ package core
 import (
 	"bytes"
 	"fmt"
-	"io/fs"
 	"os"
 	"path/filepath"
 	"sort"
-	"strings"
 	"time"
 
 	"github.com/BurntSushi/toml"
@@ -90,26 +88,6 @@ func (e *Env) AuditWorkDir(app, id string) string {
 	return filepath.Join(e.tmpRoot(), "appclone", fmt.Sprintf("audit.%d", e.UID), app+"."+id)
 }
 
-// upperDir 定位要读的 upper：优先新写层根，其次旧根 /var/tmp（ADR-033
-// 升级路径），最后回退到实例内的 `audit/upper`（写入器落地前，手工排障与
-// 测试把证据放这里）。
-func (e *Env) upperDir(app, id string) string {
-	work := filepath.Join(e.AuditWorkDir(app, id), "upper")
-	if _, err := os.Stat(work); err == nil {
-		return work
-	}
-	// 升级路径（ADR-033）：旧版本的审计写层在 /var/tmp。若那边还留着已跑完、
-	// 尚未 verify 的证据，必须能继续消费——否则 verify 会判"证据不完整"，
-	// 用户以为审计结论丢了。新根优先，旧根只在新根没有时作为回退。
-	if e.TmpRoot == "" {
-		legacy := filepath.Join(legacyTmpRoot, "appclone", fmt.Sprintf("audit.%d", e.UID), app+"."+id, "upper")
-		if _, err := os.Stat(legacy); err == nil {
-			return legacy
-		}
-	}
-	return filepath.Join(e.AuditDir(app, id), "upper")
-}
-
 // Verify 判定"这个分身有没有写到实例目录之外"（§6.5）。
 //
 // 证据生产者是 `run --audit`（探针写层）；没有审计过的实例读不到 upper，
@@ -159,7 +137,12 @@ func (e *Env) Verify(app, id string) (Verdict, error) {
 	}
 
 	audit := e.AuditDir(app, id)
-	entries, present, err := readUpperTree(e.upperDir(app, id))
+	evidence, err := e.openAuditEvidence(app, id)
+	if err != nil {
+		return Verdict{}, err
+	}
+	defer evidence.close()
+	entries, present, err := evidence.read()
 	if err != nil {
 		return Verdict{}, err
 	}
@@ -235,7 +218,11 @@ func (e *Env) Verify(app, id string) (Verdict, error) {
 		// 也可能是审计层没挂上——两种都不足以证明隔离有效（§6.5 表格第 5 行）。
 		return unverified("no_writes", false), nil
 	}
-	return e.finalize(app, id, p, e.judge(p, entries, &rec))
+	v := e.judge(p, entries, &rec)
+	if auditEvidenceTestHook != nil {
+		auditEvidenceTestHook("after-judge")
+	}
+	return e.finalizeEvidence(app, id, p, v, evidence)
 }
 
 // Judge 是 judge 的无凭证版本：没有 run.toml 时按档案推断"本该被 bind"的集合。
@@ -244,7 +231,7 @@ func (e *Env) Judge(p Profile, entries []UpperEntry) Verdict {
 	return e.judge(p, entries, nil)
 }
 
-// finalize 把结论落账，并按结论处置证据（§6.5 留存策略）。**判**与**处置**分开：
+// finalizeEvidence 把结论落账，并按结论处置证据（§6.5 留存策略）。**判**与**处置**分开：
 // 判定错会误导用户，处置错会毁掉用户的文件。
 //
 //   - verified      → 写 summary.toml，删 upper 与 run.toml（证据已消费）
@@ -254,9 +241,12 @@ func (e *Env) Judge(p Profile, entries []UpperEntry) Verdict {
 //     新审计不会覆盖它，所以不必再把"有 retained 证据"当成不许开新审计的理由
 //     ——那会让用户取回文件后永远无法再审计（旧实现正是如此）。
 //   - 其余 unverified（无证据/证据不完整/空 upper）→ 不写摘要、不动现场
-func (e *Env) finalize(app, id string, p Profile, v Verdict) (Verdict, error) {
+func (e *Env) finalizeEvidence(app, id string, p Profile, v Verdict, evidence *auditEvidence) (Verdict, error) {
 	if v.Conclusion == VerdictUnverified && v.Reason != "extract_failed" {
 		return v, nil
+	}
+	if err := evidence.check(); err != nil {
+		return Verdict{}, err
 	}
 	audit := e.AuditDir(app, id)
 	if err := os.MkdirAll(audit, 0o700); err != nil {
@@ -272,21 +262,35 @@ func (e *Env) finalize(app, id string, p Profile, v Verdict) (Verdict, error) {
 	switch {
 	case v.Conclusion == VerdictLeak || v.Reason == "extract_failed":
 		q := filepath.Join(audit, "quarantine-"+time.Now().UTC().Format("20060102T150405")+"-"+randSuffix())
-		if err := moveDir(e.upperDir(app, id), q); err != nil && !dstComplete(err) {
+		if err := moveSceneDir(evidence.scene, evidence.source, q); err != nil && !dstComplete(err) {
 			// 副本完整、只是源删不干净时按成功处理：证据在 q，别报失败把
 			// 用户引向残缺的另一份；残留由下次清扫收拾。
 			return Verdict{}, errEnv("err.probe.quarantine_failed", map[string]any{"path": q}, err)
 		}
-		e.removeAuditWork(app, id)
+		if err := evidence.removeWork(); err != nil {
+			return Verdict{}, err
+		}
 		v.Retained = true
 		v.Quarantine = q
 	case v.Conclusion == VerdictVerified:
 		// upper 里只有声明范围内的写入，删掉是对的；但应用可能把某个子目录
 		// 改成 0555，裸 RemoveAll 会让一个已验证的结论无法收尾。
-		if err := makeWritableAndRemove(e.upperDir(app, id)); err != nil {
-			return Verdict{}, errEnv("err.env.write", map[string]any{"path": e.upperDir(app, id)}, err)
+		err := makeSceneWritableAndRemove(evidence.scene, evidence.source)
+		if err != nil {
+			return Verdict{}, err
 		}
-		e.removeAuditWork(app, id)
+		if err := evidence.removeWork(); err != nil {
+			return Verdict{}, err
+		}
+	}
+
+	if auditEvidenceTestHook != nil {
+		auditEvidenceTestHook("after-dispose")
+	}
+	if err := evidence.check(); err != nil {
+		return Verdict{}, err
+	}
+	if v.Conclusion == VerdictVerified {
 		_ = os.Remove(filepath.Join(audit, "run.toml"))
 	}
 
@@ -589,63 +593,6 @@ func ancestorOfAny(abs string, entries []UpperEntry, home string) bool {
 		}
 	}
 	return false
-}
-
-// readUpperTree 把 upper 读成条目列表。present=false 表示"没有证据"，
-// 它与"读了但为空"是两件事：后者意味着审计跑过且**什么都没写**，前者意味着
-// 根本没审计。**两者都是 unverified**（空集不算通过，§6.5），但原因不同
-// （`audit_not_enabled` vs `no_writes`），下一步也不同，所以不能合并。
-func readUpperTree(dir string) (entries []UpperEntry, present bool, err error) {
-	fi, err := os.Stat(dir)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil, false, nil
-		}
-		return nil, false, errEnv("err.env.read_dir", map[string]any{"path": dir}, err)
-	}
-	if !fi.IsDir() {
-		return nil, false, errEnv("err.env.read_dir", map[string]any{"path": dir}, nil)
-	}
-	err = filepath.WalkDir(dir, func(path string, d fs.DirEntry, werr error) error {
-		if werr != nil {
-			return werr
-		}
-		if path == dir {
-			return nil
-		}
-		rel, rerr := filepath.Rel(dir, path)
-		if rerr != nil {
-			return nil
-		}
-		// overlayfs 的 opaque 标记（`.wh..wh..opq`）不是删除，也不是用户文件：
-		// 它只表示"这个目录被整体替换过"。按 `.wh.` 前缀去前缀会变成不存在
-		// 的 `.wh..opq`，再作为"缺失文件"展示给用户，把人引向一个假路径。
-		if d.Name() == ".wh..wh..opq" {
-			return nil
-		}
-		kind := EntryFile
-		switch {
-		case d.IsDir():
-			kind = EntryDir
-		case strings.HasPrefix(d.Name(), ".wh."):
-			kind = EntryWhiteout
-			// `.wh.foo` 指的是 `foo` 被删了：去掉前缀再记录，否则对账会把
-			// 一个叫 `.wh.foo` 的"路径"报成越界，恢复提示也会指向不存在的文件。
-			rel = filepath.Join(filepath.Dir(rel), strings.TrimPrefix(d.Name(), ".wh."))
-		case d.Type()&fs.ModeDevice != 0 && d.Type()&fs.ModeCharDevice != 0:
-			kind = EntryWhiteout // overlayfs 的 whiteout：字符设备 0,0
-		}
-		var size int64
-		if info, ierr := d.Info(); ierr == nil {
-			size = info.Size()
-		}
-		entries = append(entries, UpperEntry{Path: filepath.ToSlash(rel), Kind: kind, Size: size})
-		return nil
-	})
-	if err != nil {
-		return nil, false, errEnv("err.env.read_dir", map[string]any{"path": dir}, err)
-	}
-	return entries, true, nil
 }
 
 // 便于视图层拼一句话：结论 + 覆盖范围。人类文案在视图里组装，这里只给事实。

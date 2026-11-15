@@ -19,6 +19,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"image"
+	"image/color"
+	"image/png"
 	"os"
 	"path/filepath"
 	"strings"
@@ -36,10 +39,8 @@ import (
 )
 
 // noFuseMounter：闸门只验页面生命周期，不该在 $TMPDIR 做一次真实
-// fuse-overlay 冒烟挂载（checkEnv 会调 Available）。报**后端缺失**这一
-// 精确原因（真实实现缺二进制时也是这个键），界面才会走 strace 降级分支；
-// 随便一个 error 现在按"挂载被拒"处理（ADR-032），不会降级。
-// 降级判定还要求 PATH 里有 strace——闸门环境（本机与 CI）都装。
+// fuse-overlay 冒烟挂载（checkEnv 会调 Available）。
+// 缺二进制和挂载拒绝都阻止新探测，错误键决定界面给出的处置提示。
 type noFuseMounter struct{}
 
 func (noFuseMounter) Available() error {
@@ -205,7 +206,7 @@ func TestGtkScreensLifecycle(t *testing.T) {
 			switch step {
 			case 0:
 				// 首屏扫描是异步的：等它落到界面上再判定。
-				if !u.loaded {
+				if !u.loaded || !u.listSettled() {
 					return true
 				}
 				// 视图栈必须真的画出来：GtkWidget:visible 是局部属性，祖先隐藏时
@@ -477,7 +478,7 @@ func TestGtkLandsOnClonesView(t *testing.T) {
 				fail("等首轮扫描超时")
 				return false
 			}
-			if !u.loaded {
+			if !u.loaded || !u.listSettled() {
 				return true
 			}
 			if !u.stack.GetMapped() {
@@ -563,7 +564,7 @@ func TestGtkEmptyStateMapped(t *testing.T) {
 				fail("等首轮扫描/映射超时")
 				return false
 			}
-			if !u.loaded || !u.stack.GetMapped() {
+			if !u.loaded || !u.listSettled() || !u.stack.GetMapped() {
 				return true
 			}
 			if !switched {
@@ -617,7 +618,7 @@ func TestGtkEmptyStateMapped(t *testing.T) {
 	}
 }
 
-// TestGtkSetupStates 覆盖配置页的「探测中」态与列表页降级横幅的显现/「了解」消失。
+// TestGtkSetupStates 覆盖配置页的「探测中」态与列表页配置不可用横幅的显现/「了解」消失。
 //
 // 为什么需要它：生命周期用例走的是 open 入口（不探测），只证明了 confirm →
 // creating 两态；探测中没有自动断言，而 ADR-027 的退场条件是「闸门走遍三屏四态」。
@@ -667,17 +668,17 @@ func TestGtkSetupStates(t *testing.T) {
 			}
 			switch step {
 			case 0:
-				if !u.loaded || !u.envChecked || !u.stack.GetMapped() {
+				if !u.loaded || !u.listSettled() || !u.envChecked || !u.stack.GetMapped() {
 					return true
 				}
-				// noFuseMounter 让自检走降级分支：横幅必须真的挂出来，
+				// noFuseMounter 让自检报告探测不可用：横幅必须真的挂出来，
 				// 而不是只置了内部标志。
 				if !u.softBanner.GetRevealed() {
-					fail("缺 fuse 时降级横幅没有显示")
+					fail("缺 fuse 时配置不可用横幅没有显示")
 					return false
 				}
 				if !u.search.GetSensitive() {
-					fail("降级（非致命）时搜索不该被禁用")
+					fail("仅探测不可用时搜索不该被禁用")
 					return false
 				}
 				// 「了解」是用户处理降级提示的唯一动作。这里发真实的
@@ -686,12 +687,12 @@ func TestGtkSetupStates(t *testing.T) {
 				gobject.SignalEmitByName(&u.softBanner.Widget.Object, "button-clicked")
 				bannerDismissed = u.softDismissed && !u.softBanner.GetRevealed()
 				if !bannerDismissed {
-					fail("点「了解」后降级横幅仍然显示（按钮信号没有接到处理器？）")
+					fail("点「了解」后配置不可用横幅仍然显示（按钮信号没有接到处理器？）")
 					return false
 				}
 				u.applyEnvBanners()
 				if u.softBanner.GetRevealed() {
-					fail("降级横幅被后续刷新弹回来了（softDismissed 失效）")
+					fail("配置不可用横幅被后续刷新弹回来了（softDismissed 失效）")
 					return false
 				}
 				if !u.pushSetup("demo", "setup", func(bool) { probeClosed = true }) {
@@ -780,7 +781,7 @@ func TestGtkSetupStates(t *testing.T) {
 		t.Fatalf("配置页状态用例没有跑完：activated=%t step=%d", activated, step)
 	}
 	if !bannerDismissed {
-		t.Fatal("降级横幅的「了解」路径没有执行")
+		t.Fatal("配置不可用横幅的「了解」路径没有执行")
 	}
 }
 
@@ -798,10 +799,10 @@ func TestGtkErrorState(t *testing.T) {
 		t.Fatal(err)
 	}
 	// 版本超前：LoadProfile 必须拒绝，且这不是重试能解决的问题。
-	if err := env.SaveProfile(core.Profile{
-		App: "bad", Version: core.ProfileVersion + 1, Exec: "/usr/bin/true",
-		ProbeMethod: "overlay", Ignored: core.DefaultIgnored(), Env: map[string]string{},
-	}); err != nil {
+	if err := os.MkdirAll(filepath.Dir(env.ProfilePath("bad")), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(env.ProfilePath("bad"), []byte(fmt.Sprintf("version = %d\nexec = \"/usr/bin/true\"\n", core.MaxProfileVersion+1)), 0o600); err != nil {
 		t.Fatal(err)
 	}
 
@@ -835,7 +836,7 @@ func TestGtkErrorState(t *testing.T) {
 				return false
 			}
 			if v == nil {
-				if !u.loaded {
+				if !u.loaded || !u.listSettled() {
 					return true
 				}
 				if !u.pushSetup("bad", "open", func(ok bool) { closed = true; closedOK = ok }) {
@@ -954,7 +955,7 @@ func TestGtkRetryableError(t *testing.T) {
 			}
 			switch step {
 			case 0:
-				if !u.loaded {
+				if !u.loaded || !u.listSettled() {
 					return true
 				}
 				// open 入口复用档案，直接进确认态，不跑探测。
@@ -1060,7 +1061,7 @@ func TestGtkRapidRepush(t *testing.T) {
 			}
 			switch step {
 			case 0:
-				if !u.loaded {
+				if !u.loaded || !u.listSettled() {
 					return true
 				}
 				u.pushSetup("demo", "setup", func(bool) { closed++ })
@@ -1172,7 +1173,7 @@ func TestGtkFatalBanner(t *testing.T) {
 				fail("等环境自检超时")
 				return false
 			}
-			if !u.envChecked || !u.loaded {
+			if !u.envChecked || !u.loaded || !u.listSettled() {
 				return true
 			}
 			if !u.fatal {
@@ -1184,7 +1185,7 @@ func TestGtkFatalBanner(t *testing.T) {
 				return false
 			}
 			if u.softBanner.GetRevealed() {
-				fail("致命态不该同时显示降级横幅")
+				fail("致命态不该同时显示配置不可用横幅")
 				return false
 			}
 			if u.search.GetSensitive() {
@@ -1271,7 +1272,7 @@ func TestGtkEnglishStrings(t *testing.T) {
 				fail("等首轮扫描超时")
 				return false
 			}
-			if !u.loaded {
+			if !u.loaded || !u.listSettled() {
 				return true
 			}
 			if got := u.win.GetTitle(); got != "App Clones" {
@@ -1283,8 +1284,8 @@ func TestGtkEnglishStrings(t *testing.T) {
 				return false
 			}
 			// 用字面量前缀而不是查表：查表比对会把"消息表本身写错"也放过。
-			if got := u.softBanner.GetTitle(); !strings.HasPrefix(got, "Probing will run in compatible mode") {
-				fail("en 界面降级横幅不是英文文案：%q", got)
+			if got := u.softBanner.GetTitle(); !strings.HasPrefix(got, "New apps cannot be configured safely") {
+				fail("en 界面配置不可用横幅不是英文文案：%q", got)
 				return false
 			}
 			// 缺键的界面表现是原始键名（ui.xxx）——这里一并堵住。
@@ -1350,12 +1351,15 @@ func findListRow(g *adw.PreferencesGroup, title string) *gtk.Widget {
 	if len(boxes) == 0 {
 		return nil
 	}
-	for c := boxes[0].GetFirstChild(); c != nil; c = c.GetNextSibling() {
+	for c := boxes[0].GetFirstChild(); c != nil; {
 		if stringProp(c, "title") == title {
 			// GetFirstChild 的包装已 IncreaseRef，与旧 GetRow 的语义相同；
 			// 不要再 Ref，调用方的 Unref 正好抵消这一份。
 			return c
 		}
+		next := c.GetNextSibling()
+		c.Unref()
+		c = next
 	}
 	return nil
 }
@@ -1394,7 +1398,8 @@ func visibleIsPage(u *ui, page *adw.NavigationPage) bool {
 
 // findWidgets 深度优先遍历控件树。按钮没有稳定 id，回归靠 tooltip 认出
 // "启动/停止"——tooltip 是产品给用户看的文案，改了它本来就该触发断言。
-// GetFirstChild/GetNextSibling 都是 transfer none，不 Unref。
+// 绑定为 GetFirstChild/GetNextSibling 增加了引用，遍历中逐个归还。
+// 返回包装借用存活树的引用，只可在主线程同步使用，不跨树重建。
 func findWidgets(root *gtk.Widget, pred func(*gtk.Widget) bool) []*gtk.Widget {
 	var out []*gtk.Widget
 	var walk func(*gtk.Widget)
@@ -1405,8 +1410,11 @@ func findWidgets(root *gtk.Widget, pred func(*gtk.Widget) bool) []*gtk.Widget {
 		if pred(w) {
 			out = append(out, w)
 		}
-		for c := w.GetFirstChild(); c != nil; c = c.GetNextSibling() {
+		for c := w.GetFirstChild(); c != nil; {
 			walk(c)
+			next := c.GetNextSibling()
+			c.Unref()
+			c = next
 		}
 	}
 	walk(root)
@@ -1436,6 +1444,9 @@ func TestGtkDetailShowsStopWhenRunning(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer lock.Close()
+	if _, err := lock.WriteAt([]byte("preparing\n"), 0); err != nil {
+		t.Fatal(err)
+	}
 
 	app := adw.NewApplication("io.github.mensylisir.Appclone.GtkStop",
 		gio.GApplicationNonUniqueValue)
@@ -1451,6 +1462,7 @@ func TestGtkDetailShowsStopWhenRunning(t *testing.T) {
 		app.Quit()
 	}
 	pushed := false
+	prepared := false
 	actcb := func(_ gio.Application) {
 		if u.win != nil {
 			return
@@ -1464,7 +1476,7 @@ func TestGtkDetailShowsStopWhenRunning(t *testing.T) {
 				fail("等详情页运行态超时")
 				return false
 			}
-			if !u.loaded {
+			if !u.loaded || !u.listSettled() {
 				return true
 			}
 			if !pushed {
@@ -1475,6 +1487,20 @@ func TestGtkDetailShowsStopWhenRunning(t *testing.T) {
 			v := u.activeDetail
 			if v == nil || !v.loaded {
 				return true
+			}
+			if prepared && v.preparing["main"] {
+				return true
+			}
+			wantState := u.tr("ui.instance.preparing", nil)
+			if prepared {
+				wantState = u.tr("ui.instance.running", nil)
+			}
+			states := findWidgets(&v.content.Widget, func(w *gtk.Widget) bool {
+				return typeNameOf(w) == "AdwActionRow" && strings.Contains(stringProp(w, "subtitle"), wantState)
+			})
+			if len(states) != 1 {
+				fail("实例状态应显示 %q，得到 %d 行", wantState, len(states))
+				return false
 			}
 			stops := findWidgets(&v.content.Widget, func(w *gtk.Widget) bool {
 				return w.GetTooltipText() == u.tr("ui.instance.stop.tooltip", nil)
@@ -1493,6 +1519,15 @@ func TestGtkDetailShowsStopWhenRunning(t *testing.T) {
 			if len(starts) != 0 {
 				fail("运行中不应同时显示「启动」按钮，得到 %d", len(starts))
 				return false
+			}
+			if !prepared {
+				prepared = true
+				if _, err := lock.WriteAt([]byte("running\n  "), 0); err != nil {
+					fail("更新运行状态: %v", err)
+					return false
+				}
+				v.refresh()
+				return true
 			}
 			app.Quit()
 			return false
@@ -1573,7 +1608,7 @@ func TestGtkForkTogglePersists(t *testing.T) {
 				fail("等克隆起步开关/实例落盘超时（loaded=%v setupState=%s desc=%q）", u.loaded, state, desc)
 				return false
 			}
-			if !u.loaded {
+			if !u.loaded || !u.listSettled() {
 				return true
 			}
 			if !opened {
@@ -1656,11 +1691,8 @@ func TestGtkForkTogglePersists(t *testing.T) {
 	}
 }
 
-// TestGtkForkDisabledWhenFuseUnavailable：fuse 不可用（后端缺失走 strace 降级，
-// 或挂载被拒）时「数据来源」开关必须
-// 禁用。允许拨动等于让用户相信克隆已生效，而 run 期每个路径都会降级跳过，
-// 最终得到一个空实例。判据是自检结果（noFuseMounter → degraded），不是渲染
-// 时刻的巧合；用例等 envChecked 再判定。
+// TestGtkForkDisabledWhenFuseUnavailable：缺少 FUSE 或挂载被拒时，
+// 数据来源开关必须禁用。等待 envChecked，避免只检查异步自检前的默认值。
 func TestGtkForkDisabledWhenFuseUnavailable(t *testing.T) {
 	env, appsDir := gtkTestEnv(t, "forkdegraded")
 	env.Mounter = noFuseMounter{}
@@ -1703,11 +1735,11 @@ func TestGtkForkDisabledWhenFuseUnavailable(t *testing.T) {
 				fail("等待降级自检/确认页超时（loaded=%v envChecked=%v）", u.loaded, u.envChecked)
 				return false
 			}
-			if !u.loaded || !u.envChecked {
+			if !u.loaded || !u.listSettled() || !u.envChecked {
 				return true
 			}
-			if !u.degraded || !u.fuseBlocked {
-				fail("后端缺失且 PATH 有 strace 时应判成降级（degraded=%v blocked=%v）", u.degraded, u.fuseBlocked)
+			if !u.fuseBlocked || u.softReasonNow() != "backend_missing" {
+				fail("缺少安全写层必须提示不可用（reason=%s blocked=%v）", u.softReasonNow(), u.fuseBlocked)
 				return false
 			}
 			if !opened {
@@ -1794,14 +1826,14 @@ func TestGtkFuseDeniedIsAnErrorNotADegrade(t *testing.T) {
 				fail("等环境自检/确认页超时（loaded=%v envChecked=%v）", u.loaded, u.envChecked)
 				return false
 			}
-			if !u.loaded || !u.envChecked {
+			if !u.loaded || !u.listSettled() || !u.envChecked {
 				return true
 			}
 			if u.fatal {
 				fail("bwrap 可用时不该判成致命态")
 				return false
 			}
-			if u.degraded {
+			if u.softReasonNow() == "degraded" {
 				fail("挂载被拒不得判成 strace 降级（ADR-032）")
 				return false
 			}
@@ -1879,6 +1911,36 @@ func TestGtkAppIconFallback(t *testing.T) {
 		t.Fatal(err)
 	}
 	missing := filepath.Join(dir, "not-there.png")
+	validPNG := filepath.Join(dir, "valid.png")
+	bitmap := image.NewRGBA(image.Rect(0, 0, 32, 16))
+	bitmap.Set(0, 0, color.RGBA{R: 255, A: 255})
+	var encoded bytes.Buffer
+	if err := png.Encode(&encoded, bitmap); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(validPNG, encoded.Bytes(), 0600); err != nil {
+		t.Fatal(err)
+	}
+	bad := filepath.Join(dir, "corrupt.png")
+	if err := os.WriteFile(bad, []byte("not an image"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	truncated := filepath.Join(dir, "truncated.png")
+	if err := os.WriteFile(truncated, encoded.Bytes()[:16], 0600); err != nil {
+		t.Fatal(err)
+	}
+	oversized := filepath.Join(dir, "oversized.png")
+	f, err := os.Create(oversized)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Truncate(maxIconFileBytes + 1); err != nil {
+		f.Close()
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
 	for _, tc := range []struct {
 		icon      string
 		wantFallb bool
@@ -1887,7 +1949,12 @@ func TestGtkAppIconFallback(t *testing.T) {
 		{missing, true},                // 绝对路径但文件没了
 		{"ac-test-no-such-icon", true}, // 主题里没有这个名字
 		{real, false},                  // 存在的绝对路径
-		{"folder", false},              // 系统主题中的真实图标
+		{validPNG, false},
+		{bad, true},
+		{truncated, true},
+		{dir, true},
+		{oversized, true},
+		{"folder", false}, // 系统主题中的真实图标
 	} {
 		w, fallback := u.appIcon(tc.icon, "微信", 32)
 		if w == nil {
@@ -2105,7 +2172,7 @@ func TestGtkConfirmReuseEvidence(t *testing.T) {
 			}
 			switch step {
 			case 0:
-				if !u.loaded {
+				if !u.loaded || !u.listSettled() {
 					return true
 				}
 				if !u.pushSetup("cred", "open", func(bool) {}) {
@@ -2169,13 +2236,17 @@ func TestGtkConfirmReuseEvidence(t *testing.T) {
 					fail("公共候选不能成为可勾选行：%d 行", len(v2.rows))
 					return false
 				}
-				if findListRowByTitle(v2.confirmPage, u.allocText(pub)) == nil {
+				if row := findListRowByTitle(v2.confirmPage, u.allocText(pub)); row == nil {
 					fail("公共目录必须渲染成只读行（现有行：%v）", listRowTitles(v2.confirmPage))
 					return false
+				} else {
+					row.Unref()
 				}
-				if findListRowByTitle(v2.confirmPage, u.tr("ui.setup.confirm.empty", nil)) == nil {
+				if row := findListRowByTitle(v2.confirmPage, u.tr("ui.setup.confirm.empty", nil)); row == nil {
 					fail("读证据不可用时必须显示 confirm-empty 提示行")
 					return false
+				} else {
+					row.Unref()
 				}
 				// 登录状态组始终出现：探测到使用证据时默认开启，副标题点名证据。
 				// 没有它，用户就只剩下手写档案这一条路（违反零门槛红线）。
@@ -2184,11 +2255,13 @@ func TestGtkConfirmReuseEvidence(t *testing.T) {
 					fail("确认页缺少「独立密钥环」行（现有行：%v）", listRowTitles(v2.confirmPage))
 					return false
 				}
+				keyringSubtitle := stringProp(krRow, "subtitle")
+				krRow.Unref()
 				if v2.keyringRow == nil || !v2.keyringRow.GetActive() {
 					fail("观测到使用证据时应默认开启独立密钥环")
 					return false
 				}
-				if sub := stringProp(krRow, "subtitle"); !strings.Contains(sub, u.tr("ui.setup.row.keyring.observed", nil)) {
+				if sub := keyringSubtitle; !strings.Contains(sub, u.tr("ui.setup.row.keyring.observed", nil)) {
 					fail("独立密钥环行必须说明证据来源：%q", sub)
 					return false
 				}
@@ -2214,26 +2287,107 @@ func TestGtkConfirmReuseEvidence(t *testing.T) {
 }
 
 func listRowTitles(page *adw.PreferencesPage) []string {
+	// Rows in a group hidden by a still-draining generation are not on screen and
+	// must not count: a mid-rebuild assertion would otherwise read stale titles.
+	onScreen := func(w *gtk.Widget) bool {
+		for p := w; p != nil; p = p.GetParent() {
+			if !p.GetVisible() {
+				return false
+			}
+			if p.GoPointer() == page.Widget.GoPointer() {
+				return true
+			}
+		}
+		return true
+	}
 	var out []string
 	for _, box := range findWidgets(&page.Widget, func(w *gtk.Widget) bool {
 		return typeNameOf(w) == "GtkListBox"
 	}) {
-		for c := box.GetFirstChild(); c != nil; c = c.GetNextSibling() {
+		if !onScreen(box) {
+			continue
+		}
+		for c := box.GetFirstChild(); c != nil; {
 			out = append(out, stringProp(c, "title"))
+			next := c.GetNextSibling()
+			c.Unref()
+			c = next
 		}
 	}
 	return out
 }
 
-// findListRowByTitle 在确认页里按 title 找行（SwitchRow/ActionRow 都适用）。
+// Shared certificate warnings follow the adopted scope, independent of Secret Service.
+func TestGtkSharedCertificates(t *testing.T) {
+	env, _ := gtkTestEnv(t, "shared-certificates")
+	gtk.Init()
+	env.KeyringCapsOverride = &core.KeyringCaps{Available: true, Daemon: "/usr/bin/gnome-keyring-daemon", DbusSend: "/usr/bin/dbus-send"}
+	for _, lang := range []string{"zh_CN", "en"} {
+		t.Run(lang, func(t *testing.T) {
+			u := &ui{env: env, lang: lang, cb: newCallbacks()}
+			v := &setupView{u: u, appKey: "demo", mode: "setup", onClose: func(bool) {}}
+			v.build()
+			defer func() { v.scope.close(); v.fixed.close(); v.page.Unref() }()
+			d := &detailView{u: u, appKey: "demo", content: adw.NewPreferencesPage()}
+			defer func() { d.reset(); d.scope.close(); d.content.Unref() }()
+			cfg := filepath.Join(env.Resolver.XDG["CONFIG_HOME"], "Demo")
+			cert := filepath.Join(env.Resolver.Home, ".pki")
+			common := filepath.Join(env.Resolver.XDG["DATA_HOME"], "applications")
+			for _, shared := range []bool{true, false} {
+				v.profile = core.Profile{App: "demo", Version: core.ProfileVersion, Exec: "/usr/bin/true", Paths: []string{cfg}, SharedWrites: []string{common}}
+				v.cands = []core.Candidate{{Path: cfg, Class: core.ClassConfig, Checked: true}, {Path: common, Class: core.ClassShared}}
+				if shared {
+					v.profile.SharedWrites = append(v.profile.SharedWrites, cert)
+					v.cands = append(v.cands, core.Candidate{Path: cert, Class: core.ClassShared})
+				} else {
+					// A reused explicit private path must not acquire a shared warning.
+					v.profile.Paths = append(v.profile.Paths, cert)
+					v.cands = append(v.cands, core.Candidate{Path: cert, Class: core.ClassConfig, Checked: true})
+				}
+				v.renderConfirm()
+				for _, keyring := range []bool{false, true, false} {
+					v.keyringRow.SetActive(keyring)
+					found := false
+					for _, w := range findWidgets(&v.confirmPage.Widget, func(w *gtk.Widget) bool { return typeNameOf(w) == "AdwPreferencesGroup" }) {
+						if stringProp(w, "title") == u.tr("ui.setup.group.shared", nil) {
+							found = true
+							if got := strings.Contains(stringProp(w, "description"), u.tr("ui.shared.certificates", nil)); got != shared {
+								t.Fatalf("confirmation shared=%v keyring=%v warning=%v", shared, keyring, got)
+							}
+						}
+					}
+					if !found {
+						t.Fatal("shared confirmation group missing")
+					}
+					d.profile = v.buildProfile()
+					d.build()
+					row := findListRowByTitle(d.content, u.tr("ui.detail.shared", nil))
+					if row == nil {
+						t.Fatal("shared detail row missing")
+					}
+					subtitle := stringProp(row, "subtitle")
+					row.Unref()
+					if got := strings.Contains(subtitle, u.tr("ui.shared.certificates", nil)); got != shared {
+						t.Fatalf("detail shared=%v keyring=%v warning=%v", shared, keyring, got)
+					}
+				}
+			}
+		})
+	}
+}
+
+// findListRowByTitle 返回带引用的命中行；调用方同步用完必须 Unref。
 func findListRowByTitle(page *adw.PreferencesPage, title string) *gtk.Widget {
 	for _, box := range findWidgets(&page.Widget, func(w *gtk.Widget) bool {
 		return typeNameOf(w) == "GtkListBox"
 	}) {
-		for c := box.GetFirstChild(); c != nil; c = c.GetNextSibling() {
+		for c := box.GetFirstChild(); c != nil; {
 			if stringProp(c, "title") == title {
 				return c
 			}
+			next := c.GetNextSibling()
+			c.Unref()
+			c = next
 		}
 	}
 	return nil

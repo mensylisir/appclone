@@ -154,7 +154,7 @@ jobs:
           done
 
   html:
-    name: GUI 设计稿交互回归（62 项）
+    name: GUI 设计稿交互回归（88 项）
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -183,7 +183,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            libgtk-4-1 libadwaita-1-0 bubblewrap fuse-overlayfs xvfb libglib2.0-bin apparmor dbus strace
+            libgtk-4-1 libadwaita-1-0 bubblewrap fuse-overlayfs xvfb libglib2.0-bin librsvg2-common apparmor dbus strace
       - name: 放行 bwrap 的 user namespace（Ubuntu 24.04 的 AppArmor 限制）
         run: |
           if [ "$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns 2>/dev/null || echo 0)" = "1" ]; then
@@ -212,7 +212,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            libgtk-4-1 libadwaita-1-0 bubblewrap fuse-overlayfs xvfb libglib2.0-bin apparmor dbus strace
+            libgtk-4-1 libadwaita-1-0 bubblewrap fuse-overlayfs xvfb libglib2.0-bin librsvg2-common apparmor dbus strace
       - name: 放行 bwrap 的 user namespace（Ubuntu 24.04 的 AppArmor 限制）
         run: |
           if [ "$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns 2>/dev/null || echo 0)" = "1" ]; then

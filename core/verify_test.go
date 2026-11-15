@@ -336,10 +336,16 @@ func TestJudgeUsesActualAuditBinds(t *testing.T) {
 
 // overlay 的 opaque 标记不是用户文件，也不能被去前缀成不存在的 `.wh..opq`。
 func TestReadUpperTreeSkipsOpaqueMarker(t *testing.T) {
-	dir := t.TempDir()
+	work := t.TempDir()
+	dir := filepath.Join(work, "upper")
 	writeTree(t, filepath.Join(dir, ".config", ".wh..wh..opq"))
 	writeTree(t, filepath.Join(dir, ".config", ".wh.deleted-file"))
-	entries, present, err := readUpperTree(dir)
+	scene, err := openOverlayScene(work)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer scene.close()
+	entries, present, err := scene.readUpper()
 	if err != nil || !present {
 		t.Fatalf("readUpperTree: %v / present=%v", err, present)
 	}
@@ -581,11 +587,8 @@ func TestVerifyAuditIncompletePointsToQuarantine(t *testing.T) {
 // ADR-033 升级路径：新根没有证据时，verify 必须还能读到旧根 /var/tmp 下
 // 已完成、未消费的审计写层，否则升级后结论会退化成"证据不完整"。
 func TestUpperDirFallsBackToLegacyRoot(t *testing.T) {
-	old := legacyTmpRoot
-	legacyTmpRoot = t.TempDir()
-	t.Cleanup(func() { legacyTmpRoot = old })
-
 	e := probeEnv(t)
+	legacyAuditFixture(t, e)
 	legacy := filepath.Join(legacyTmpRoot, "appclone",
 		fmt.Sprintf("audit.%d", e.UID), "demo.main", "upper")
 	if err := os.MkdirAll(legacy, 0o700); err != nil {
@@ -593,16 +596,26 @@ func TestUpperDirFallsBackToLegacyRoot(t *testing.T) {
 	}
 	// 生产形态：TmpRoot 为空才会去看旧根。
 	e.TmpRoot = ""
-	if got := e.upperDir("demo", "main"); got != legacy {
-		t.Fatalf("应回退到旧根 %s，得到 %s", legacy, got)
+	evidence, err := e.openAuditEvidence("demo", "main")
+	if err != nil {
+		t.Fatal(err)
 	}
+	if evidence.upper != legacy {
+		t.Fatalf("应回退到旧根 %s，得到 %s", legacy, evidence.upper)
+	}
+	evidence.close()
 	// 新根一旦有 upper，旧根不得再被选中（新证据优先）。
 	e.TmpRoot = t.TempDir()
 	fresh := filepath.Join(e.AuditWorkDir("demo", "main"), "upper")
 	if err := os.MkdirAll(fresh, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if got := e.upperDir("demo", "main"); got != fresh {
-		t.Fatalf("新根有证据时应优先新根，得到 %s", got)
+	evidence, err = e.openAuditEvidence("demo", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer evidence.close()
+	if evidence.upper != fresh {
+		t.Fatalf("注入新根时不读取真实旧根，得到 %s", evidence.upper)
 	}
 }

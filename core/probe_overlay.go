@@ -1,6 +1,7 @@
 package core
 
 import (
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -70,42 +71,82 @@ func fuseSmokeCheck() error {
 	}
 	// 与探测同一个写层根（ADR-033）：在 /var/tmp 下冒烟必然失败，
 	// 而用 MkdirTemp("") 又会跟着 $TMPDIR 漂移，结论与探测不一致。
-	sweepStaleSmoke(DefaultTmpRoot())
-	dir, err := os.MkdirTemp(DefaultTmpRoot(), "appclone-fusesmoke-")
-	if err != nil {
-		// 写层根建不出来不是"缺 /dev/fuse"：把它归进后端缺失会让 Probe 去
-		// 降级 strace、让 doctor 叫用户装 fuse3，全错方向。
-		return errEnv("err.probe.workroot_unavailable", map[string]any{"path": DefaultTmpRoot()}, err)
+	if err := sweepStaleSmoke(DefaultTmpRoot()); err != nil {
+		return err
 	}
-	defer os.RemoveAll(dir)
+	return fuseSmokeAt(DefaultTmpRoot(), fuseOverlayMounter{})
+}
+
+func fuseSmokeAt(root string, mounter OverlayMounter) (retErr error) {
+	dir, err := os.MkdirTemp(root, "appclone-fusesmoke-")
+	if err != nil {
+		// 写层根建不出来不是"缺 /dev/fuse"，应提示修复目录权限，不能误导用户装包。
+		return errEnv("err.probe.workroot_unavailable", map[string]any{"path": root}, err)
+	}
+	scene, err := openOverlayScene(dir)
+	if err != nil {
+		return err
+	}
+	defer scene.close()
+	keep := false
+	defer func() {
+		if !keep {
+			if err := scene.remove("."); err != nil {
+				retErr = err
+			}
+		}
+	}()
 	for _, sub := range []string{"lower", "upper", "work", "merged"} {
 		if err := os.Mkdir(filepath.Join(dir, sub), 0o700); err != nil {
 			return errEnv("err.env.mkdir", map[string]any{"path": sub}, err)
 		}
 	}
-	unmount, err := fuseOverlayMounter{}.Mount(
+	unmount, err := mounter.Mount(
 		filepath.Join(dir, "lower"), filepath.Join(dir, "upper"), filepath.Join(dir, "work"), filepath.Join(dir, "merged"))
 	if err != nil {
 		return err
 	}
-	return unmount()
+	if err := scene.checkIdle(); err != nil {
+		keep = true
+		return err
+	}
+	if err := unmount(); err != nil {
+		keep = true
+		return sceneError(dir, err)
+	}
+	return nil
 }
 
 // sweepStaleSmoke 清掉异常退出（panic/SIGKILL）留下的冒烟目录：它们只有
 // 空目录骨架，但写层根是用户可见区。只碰本 uid 且 10 分钟没动过的——
 // 另一个进程正在冒烟时删它的目录会把结论变成假失败。
-func sweepStaleSmoke(root string) {
+func sweepStaleSmoke(root string) error {
+	if _, err := checkedOrdinaryPath(root, true); err != nil {
+		return err
+	}
 	dirs, _ := filepath.Glob(filepath.Join(root, "appclone-fusesmoke-*"))
 	for _, d := range dirs {
-		if !dirOwnedBy(d, os.Getuid()) {
+		scene, err := ownedOverlayScene(d)
+		if err != nil {
+			return err
+		}
+		if scene == nil {
 			continue
 		}
-		fi, err := os.Stat(d)
-		if err != nil || time.Since(fi.ModTime()) < 10*time.Minute {
+		if time.Since(scene.info.ModTime()) < 10*time.Minute {
+			scene.close()
 			continue
 		}
-		_ = os.RemoveAll(d)
+		err = scene.detachStale()
+		if err == nil {
+			err = scene.remove(".")
+		}
+		scene.close()
+		if err != nil {
+			return err
+		}
 	}
+	return nil
 }
 
 func (fuseOverlayMounter) Mount(lower, upper, work, merged string) (func() error, error) {
@@ -113,68 +154,139 @@ func (fuseOverlayMounter) Mount(lower, upper, work, merged string) (func() error
 	if err != nil {
 		return nil, errEnv("err.probe.no_fuse_overlayfs", nil, err)
 	}
-	// `-o auto_unmount`：期望 core 被 SIGKILL 时挂载点自动卸载，否则会变成
-	// `Transport endpoint is not connected`、下次挂载 EBUSY（§3.2.3）。
-	// **实测本机 fuse-overlayfs 1.18 + libfuse 3.18 会忽略它**（stderr 打印
-	// "unknown argument ignored: auto_unmount"，SIGKILL 后 mountinfo 里仍有条目），
-	// 所以不能把它当保证：保留参数作尽力而为，真正的兜底是下次探测前的
-	// sweepStaleProbes（先 `-uz` 再判污染）。`-o noatime`：只读访问也会因 atime
-	// 触发 copy-up，制造大量伪写入（§3.4）。
-	// `-f` 前台运行：只有前台我们才拿得到进程句柄，退出时才能确定它真的没了。
+	scene, err := openOverlayScene(filepath.Dir(merged))
+	if err != nil {
+		return nil, err
+	}
+	merged = filepath.Join(scene.path, filepath.Base(merged))
+	transferred := false
+	defer func() {
+		if !transferred {
+			scene.close()
+		}
+	}()
+	if err := scene.checkUnmounted(); err != nil {
+		return nil, err
+	}
+	starting, err := beginFuseStarting(scene)
+	if err != nil {
+		return nil, sceneError(scene.path, err)
+	}
+	// Foreground + a dedicated group keep mount helpers accountable. Do not use
+	// auto_unmount: libfuse's background helper can setsid out of this group.
 	cmd := exec.Command(bin,
 		"-f",
 		"-o", "lowerdir="+lower,
 		"-o", "upperdir="+upper,
 		"-o", "workdir="+work,
-		"-o", "auto_unmount",
 		"-o", "noatime",
 		merged)
 	var errBuf syncBuffer
 	cmd.Stderr = &errBuf
 	// Pdeathsig 兜底：core 被 SIGKILL 时 fuse-overlayfs 一起走。
-	cmd.SysProcAttr = &syscall.SysProcAttr{Pdeathsig: syscall.SIGKILL}
+	cmd.SysProcAttr = &syscall.SysProcAttr{Pdeathsig: syscall.SIGKILL, Setsid: true}
 	if err := cmd.Start(); err != nil {
+		if cerr := starting.complete(); cerr != nil {
+			return nil, sceneError(scene.path, cerr)
+		}
 		return nil, errEnv("err.probe.mount_failed", map[string]any{"output": strings.TrimSpace(errBuf.String())}, err)
 	}
 	waited := make(chan struct{})
 	go func() { _ = cmd.Wait(); close(waited) }()
+	// Direct-child exit does not prove fusermount has stopped. Never signal an
+	// unconfirmed group; an unknown group instead leaves the persistent marker.
+	reap := func() error {
+		_ = cmd.Process.Kill()
+		select {
+		case <-waited:
+		case <-time.After(2 * time.Second):
+			return errEnv("err.probe.mount_unreaped", nil, nil)
+		}
+		if !sessionGroupGone(cmd.Process.Pid) {
+			return errEnv("err.probe.mount_unreaped", nil, nil)
+		}
+		return nil
+	}
+	fail := func(cause error) (func() error, error) {
+		if err := reap(); err != nil {
+			return nil, sceneError(scene.path, err)
+		}
+		if err := starting.complete(); err != nil {
+			return nil, sceneError(scene.path, err)
+		}
+		return nil, cause
+	}
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
-		if mountLive(merged) {
+		table, err := scene.checkStructure()
+		if err != nil {
+			return fail(err)
+		}
+		select {
+		case <-waited:
+			return fail(errEnv("err.probe.mount_failed", map[string]any{"output": strings.TrimSpace(errBuf.String())}, nil))
+		default:
+		}
+		if record := table[merged]; record != "" {
+			current, err := scene.checkStructure()
+			if err != nil || current[merged] != record {
+				return fail(sceneError(scene.path, errors.New("mount changed while completing startup")))
+			}
+			select {
+			case <-waited:
+				return fail(sceneError(scene.path, errors.New("mount driver exited during startup")))
+			default:
+			}
+			if err := starting.complete(); err != nil {
+				_ = reap()
+				return nil, sceneError(scene.path, err)
+			}
+			var once sync.Once
+			var stopErr error
+			transferred = true
 			return func() error {
-				err := umount(merged)
-				_ = cmd.Process.Kill()
-				select {
-				case <-waited:
-				case <-time.After(2 * time.Second):
-				}
-				return err
+				once.Do(func() {
+					defer scene.close()
+					current, err := scene.checkStructure()
+					if err != nil {
+						stopErr = err
+						return
+					}
+					if current[merged] != record {
+						stopErr = sceneError(scene.path, errors.New("mount identity changed"))
+						return
+					}
+					stopping, err := beginFuseStarting(scene)
+					if err != nil {
+						stopErr = sceneError(scene.path, err)
+						return
+					}
+					unmountErr := umount(merged)
+					reapErr := reap()
+					if unmountErr != nil || reapErr != nil {
+						stopErr = sceneError(scene.path, errors.Join(unmountErr, reapErr))
+						return
+					}
+					if err := stopping.complete(); err != nil {
+						stopErr = sceneError(scene.path, err)
+					}
+				})
+				return stopErr
 			}, nil
 		}
 		select {
 		case <-waited:
-			return nil, errEnv("err.probe.mount_failed", map[string]any{
+			return fail(errEnv("err.probe.mount_failed", map[string]any{
 				"output": strings.TrimSpace(errBuf.String()),
-			}, nil)
+			}, nil))
 		case <-time.After(50 * time.Millisecond):
 		}
 	}
-	_ = cmd.Process.Kill()
-	// 等 fuse 进程真的退出，并补一次卸载：最后一次轮询与超时判定之间它可能
-	// 刚好把挂载挂上。不处理的话，调用方会在"以为没挂载"的情况下删工作目录，
-	// 穿过 merged 制造 whiteout。
-	select {
-	case <-waited:
-	case <-time.After(2 * time.Second):
-	}
-	if mounted(merged) {
-		_ = umount(merged)
-	}
 	// 超时是产品判定，不是 fuse 的输出：前缀进消息表，{output} 只放外部
 	// 命令自己的 stderr（可能是英文），不把中文塞进 en 界面。
-	return nil, errEnv("err.probe.mount_timeout", map[string]any{
+	return fail(errEnv("err.probe.mount_timeout", map[string]any{
 		"output": strings.TrimSpace(errBuf.String()),
-	}, nil)
+	}, nil))
 }
 
 // umount 先试正常卸载，失败退 -uz（懒卸载）：正常卸载在 EBUSY 时只有这一条路。
@@ -194,24 +306,6 @@ func umount(merged string) error {
 		return nil
 	}
 	return errEnv("err.probe.no_fusermount", nil, nil)
-}
-
-// mounted 判挂载点是否已经生效（不是"目录存在"，而是它真的在 mountinfo 里）。
-// mounted 只认 mountinfo，不做 os.Stat：fuse daemon 已死时 stat 返回
-// ENOTCONN，会把仍在 mountinfo 里的挂载判成"没挂载"；而 mountinfo 对
-// 空格等字符做八进制转义，路径必须解码后整串比对（mountInfoHas），否则
-// HOME/AC_BASE 带空格时永远判不中。清理路径（stale 回收）用这个语义。
-func mounted(path string) bool { return mountPointIn(path) }
-
-// mountLive 要求挂载既在 mountinfo 里、又能访问（stat 成功）。挂载轮询必须
-// 用它：fuse-overlayfs 挂上后立刻 crash 时 mountinfo 仍有条目，mounted 会
-// 把死挂载判成成功，应用随后在数据目录上直接 ENOTCONN 退出。
-func mountLive(path string) bool {
-	if !mounted(path) {
-		return false
-	}
-	_, err := os.Stat(path)
-	return err == nil
 }
 
 // syncBuffer 是并发安全的 stderr 收集器（进程 stderr 在另一个 goroutine 里写）。

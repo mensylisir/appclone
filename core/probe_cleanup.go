@@ -51,28 +51,43 @@ func (e *Env) ProbeContaminated(entries []UpperEntry, publicBinds []BindPair) []
 // overlay 的 upper 落在它自己的 lower 下会让视图递归：`ls merged/<更深层>` 直接
 // ELOOP，而且删不掉（§3.2 的实测记录）。work/upper 在同一个 MkdirTemp 下，
 // 同文件系统这一条是隐含成立的。
-func (e *Env) newProbeWorkDir(app string) (string, error) {
+func (e *Env) newProbeWorkScene(app string) (*overlayScene, error) {
+	if _, err := checkedOrdinaryPath(e.tmpRoot(), true); err != nil {
+		return nil, err
+	}
 	root, err := os.MkdirTemp(e.tmpRoot(), fmt.Sprintf("appclone-probe-%d-", e.UID))
 	if err != nil {
-		return "", errEnv("err.env.mkdir", map[string]any{"path": e.tmpRoot()}, err)
+		return nil, errEnv("err.env.mkdir", map[string]any{"path": e.tmpRoot()}, err)
 	}
-	if err := os.Chmod(root, 0o700); err != nil {
-		os.RemoveAll(root)
-		return "", errEnv("err.env.chmod", map[string]any{"path": root}, err)
+	scene, err := openOverlayScene(root)
+	if err != nil {
+		return nil, err
+	}
+	scene.activeKnown = true // This newly created scene must have no marker yet.
+	fail := func(cause error) (*overlayScene, error) {
+		defer scene.close()
+		if err := scene.remove("."); err != nil {
+			return nil, err
+		}
+		return nil, cause
 	}
 	for _, sub := range []string{"upper", "work", "merged", "runtime", "dbus", "trace"} {
-		if err := os.Mkdir(filepath.Join(root, sub), 0o700); err != nil {
-			os.RemoveAll(root)
-			return "", errEnv("err.env.mkdir", map[string]any{"path": filepath.Join(root, sub)}, err)
+		if err := scene.root.Mkdir(sub, 0o700); err != nil {
+			return fail(errEnv("err.env.mkdir", map[string]any{"path": filepath.Join(root, sub)}, err))
 		}
 	}
-	up := Real(filepath.Join(root, "upper"))
-	lower := Real(e.Resolver.Home)
-	if IsUnder(lower, up) || up == lower {
-		os.RemoveAll(root)
-		return "", errEnv("err.probe.workdir_in_home", map[string]any{"path": up, "home": lower}, nil)
+	if err := scene.captureUpper(); err != nil {
+		return fail(err)
 	}
-	return root, nil
+	up := filepath.Join(scene.path, "upper")
+	lower := Real(e.Resolver.Home)
+	if IsUnder(lower, up) {
+		return fail(errEnv("err.probe.workdir_in_home", map[string]any{"path": up, "home": lower}, nil))
+	}
+	if err := writeProbeActive(scene, false, nil); err != nil {
+		return fail(errEnv("err.probe.session_state", nil, err))
+	}
+	return scene, nil
 }
 
 // sweepStaleProbes 清掉上一轮残留（§3.2.3）：仍挂载的先 `fusermount -uz`，
@@ -93,6 +108,9 @@ func (e *Env) sweepStaleProbes() error {
 }
 
 func (e *Env) sweepProbeRoot(root string) error {
+	if _, err := checkedOrdinaryPath(root, true); err != nil {
+		return err
+	}
 	dirs, err := filepath.Glob(filepath.Join(root, fmt.Sprintf("appclone-probe-%d-*", e.UID)))
 	if err != nil {
 		return nil
@@ -104,28 +122,41 @@ func (e *Env) sweepProbeRoot(root string) error {
 		// 这里必须用 os.Getuid() 而不是 e.UID：e.UID 是可注入的配置值（单测
 		// 固定成 1000），属主判断只能信进程真实身份，否则 uid 非 1000 的机器
 		// （CI runner）会把本进程的残留全当成别人的残留跳过。
-		if !dirOwnedBy(d, os.Getuid()) {
+		scene, err := ownedOverlayScene(d)
+		if err != nil {
+			return err
+		}
+		if scene == nil {
 			continue
 		}
-		merged := filepath.Join(d, "merged")
-		if mounted(merged) {
-			if err := umount(merged); err != nil {
-				return errEnv("err.probe.stale_mount", map[string]any{"path": merged}, err)
-			}
+		if scene.probeActive() {
+			scene.close()
+			return errEnv("err.probe.session_unreaped", map[string]any{"path": d}, nil)
 		}
-		upper := filepath.Join(d, "upper")
-		entries, present, rerr := readUpperTree(upper)
+		if err := scene.detachStale(); err != nil {
+			scene.close()
+			return err
+		}
+		entries, present, rerr := scene.readUpper()
 		// 读失败不能当"空"：看不见内容恰恰说明里面可能有用户文件
 		// （与 sweepOneAudit 同一口径）。只有确认存在且为空才删。
 		if rerr == nil && present && len(entries) == 0 {
-			if err := os.RemoveAll(d); err != nil {
-				return errEnv("err.env.write", map[string]any{"path": d}, err)
+			err := scene.remove(".")
+			scene.close()
+			if err != nil {
+				return err
 			}
 			continue
 		}
-		if _, err := e.quarantineDir(d); err != nil {
+		if err := scene.checkUnmounted(); err != nil {
+			scene.close()
+			return err
+		}
+		if _, err := e.quarantineScene(scene); err != nil {
+			scene.close()
 			return errEnv("err.probe.quarantine_failed", map[string]any{"path": d}, err)
 		}
+		scene.close()
 	}
 	return nil
 }
@@ -140,15 +171,30 @@ func (e *Env) sweepProbeRoot(root string) error {
 // 注意"拷贝成功、删源失败"（子目录 0555 且含文件）：那**不是**搬迁失败，
 // 完整副本就在 q，必须把 q 交给用户；再拿残缺的源去 rename 只会指向副本。
 func (e *Env) quarantineDir(src string) (string, error) {
+	scene, err := openOverlayScene(src)
+	if err != nil {
+		return "", err
+	}
+	defer scene.close()
+	return e.quarantineScene(scene)
+}
+
+func (e *Env) quarantineScene(scene *overlayScene) (string, error) {
 	name := fmt.Sprintf("appclone-quarantine-%d-%s", e.UID,
 		time.Now().UTC().Format("20060102T150405")+"-"+randSuffix())
 	q := filepath.Join(e.quarantineRoot(), name)
-	err := moveDir(src, q)
+	err := moveSceneDir(scene, scene, q)
 	if err == nil || dstComplete(err) {
 		return q, nil
 	}
+	if errKey(err) == "err.probe.scene_unsafe" {
+		return "", err
+	}
+	if checkErr := scene.checkUnmounted(); checkErr != nil {
+		return "", checkErr
+	}
 	fallback := filepath.Join(e.tmpRoot(), name)
-	if ferr := moveDir(src, fallback); ferr != nil && !dstComplete(ferr) {
+	if ferr := moveSceneDir(scene, scene, fallback); ferr != nil && !dstComplete(ferr) {
 		// 两个都失败：源必须原样留着（moveDir 保证拷贝未完成时不动源）。
 		return "", err
 	}
@@ -163,7 +209,11 @@ var legacyTmpRoot = "/var/tmp"
 // 同名条目可能是别的用户放的，不能当成自己的残留处理。
 func dirOwnedBy(path string, uid int) bool {
 	fi, err := os.Lstat(path)
-	if err != nil || !fi.IsDir() {
+	return err == nil && fileOwnedBy(fi, uid)
+}
+
+func fileOwnedBy(fi os.FileInfo, uid int) bool {
+	if !fi.IsDir() {
 		return false
 	}
 	st, ok := fi.Sys().(*syscall.Stat_t)

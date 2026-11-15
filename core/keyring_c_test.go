@@ -181,7 +181,7 @@ func TestValidateProfileRejectsKeyringPath(t *testing.T) {
 // fork 不克隆 keyring：即使档案被手改成包含 keyring 路径（ValidateProfile
 // 会拒绝，但 forkMounts 是第二道防线），也不得对它建 overlay。
 func TestForkSkipsKeyringPaths(t *testing.T) {
-	e := testEnv(t)
+	e, p, in, _ := snapshotFixture(t)
 	keyrings := filepath.Join(e.Resolver.XDG["DATA_HOME"], "keyrings")
 	if err := os.MkdirAll(keyrings, 0o700); err != nil {
 		t.Fatal(err)
@@ -189,20 +189,19 @@ func TestForkSkipsKeyringPaths(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(keyrings, "login.keyring"), []byte("x"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	fm := &recordingMounter{}
+	fm := newRecordingMounter(t)
 	e.Mounter = fm
-	p := Profile{Paths: []string{keyrings}}
-	in := Instance{App: "app", ID: "work", Root: filepath.Join(t.TempDir(), "root"), Fork: true}
-	if err := os.MkdirAll(in.Root, 0o700); err != nil {
-		t.Fatal(err)
+	p.Paths = []string{keyrings}
+	sources, cleanup, _, ferr := e.forkMounts(p, in, nil, func(string) {})
+	if ferr != nil {
+		t.Fatal(ferr)
 	}
-	sources, cleanup := e.forkMounts(p, in, nil, func(string) {})
 	defer cleanup()
 	if len(fm.calls) != 0 {
 		t.Fatalf("keyring 路径不该建 overlay：%+v", fm.calls)
 	}
-	if len(sources) != 0 {
-		t.Fatalf("keyring 路径不该产生 bind 源：%v", sources)
+	if len(sources) != 1 || !IsUnder(in.Root, sources[keyrings]) {
+		t.Fatalf("keyring 只能显式使用私有upper：%v", sources)
 	}
 }
 
@@ -379,19 +378,17 @@ func TestTraceReaderKeyringWhenPathEntriesFull(t *testing.T) {
 	}
 }
 
-// 读列表与兜底列表都必须带 sendmsg；probeCapsReadList 的 golden 不受影响。
+// 会话命令必须带 sendmsg；读能力预检列表不受影响。
 func TestStraceCommandIncludesSendmsg(t *testing.T) {
 	e := testEnv(t)
 	st := &probeReadState{
 		e: e, readOK: true, reader: &traceReader{fifo: filepath.Join(t.TempDir(), "reads.fifo")},
 		caps: ProbeCaps{Read: true, Y: true, Openat2: true},
 	}
-	for _, fallback := range []bool{false, true} {
-		argv := st.command([]string{"true"}, fallback)
-		joined := strings.Join(argv, " ")
-		if !strings.Contains(joined, "sendmsg") {
-			t.Fatalf("fallback=%v 的命令缺少 sendmsg：%s", fallback, joined)
-		}
+	argv := st.command([]string{"true"})
+	joined := strings.Join(argv, " ")
+	if !strings.Contains(joined, "sendmsg") {
+		t.Fatalf("命令缺少 sendmsg：%s", joined)
 	}
 	if slices.Contains(probeCapsReadList(), "sendmsg") {
 		t.Fatal("sendmsg 不得混进 probeCapsReadList（golden 与读能力预检依赖原列表）")

@@ -23,8 +23,8 @@ type ProbeSpec struct {
 	SharedWrite  []string          // 共享可写文件（输入法/书签），尽量 bind 回真实
 	LockBinds    []BindPair        // 锁文件：Src = 探测期空文件，Dst = 宿主锁路径
 	Env          map[string]string // 额外注入的环境变量（字典序输出）
-	// NoOverlay 是 strace 降级模式：不罩 overlay（HOME 就是真实的），
-	// 因此也没有"把公共目录绑回去"这回事——那句话的前提是 overlay 罩住了它们。
+	// NoOverlay 仅供无目标应用的能力预检；不罩 overlay，也不重绑公共目录。
+	// 产品探测必须使用私有写层（ADR-039）。
 	NoOverlay bool
 	// TraceDir 是会话 FIFO 所在目录；非空时在 --bind / / 之后用 --tmpfs 遮蔽，
 	// 防止沙箱内看到宿主 strace 的 FIFO/日志（ADR-034）。

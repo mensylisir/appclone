@@ -26,6 +26,7 @@ func MergeNonPathFields(p, base Profile) Profile {
 // lock_files 也以 base 为准（非空时）：维护者校对过的单例线索比本次 L0 静态
 // 线索完整，用探测结果整体替换会丢掉一条锁文件，单例检测随之退化。
 func MergeNonPathFieldsWith(r *PathResolver, p, base Profile) Profile {
+	p.Version = max(p.Version, base.Version)
 	// exec 的三态（ADR-036）：
 	//   1. 探测没给出 exec → 旧档案是唯一来源；
 	//   2. 本次探测有 execve 证据 → 证据参数优先，不能被旧档案盖回去；

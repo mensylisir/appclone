@@ -75,7 +75,7 @@ func TestAddRefusesVersionAheadProfile(t *testing.T) {
 		t.Fatal(err)
 	}
 	path := filepath.Join(base, "profiles.d", "demo.toml")
-	orig := "version = 2\nexec = \"/usr/bin/true\"\npaths = [\"~/.config/Demo\"]\nfuture_only = \"keep-me\"\n"
+	orig := "version = 3\nexec = \"/usr/bin/true\"\npaths = [\"~/.config/Demo\"]\nfuture_only = \"keep-me\"\n"
 	if err := os.WriteFile(path, []byte(orig), 0o600); err != nil {
 		t.Fatal(err)
 	}

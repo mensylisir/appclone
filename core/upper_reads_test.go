@@ -111,7 +111,7 @@ func TestMergeUpperWithReadsWeakAndAppHome(t *testing.T) {
 	}
 }
 
-// 噪声例外只给"强凭据且不在共享凭据库"的路径；.pki/keyrings 仍被排除。
+// 噪声例外只给应用凭据；.pki 保持共享，keyrings 保持服务级提示，二者不升级为私有凭据。
 func TestMergeUpperWithReadsNoiseException(t *testing.T) {
 	e, r := testHomeXDG(t)
 	cands, _, _, _ := r.MergeUpperWithReads(nil, []string{
@@ -123,8 +123,9 @@ func TestMergeUpperWithReadsNoiseException(t *testing.T) {
 	if gnome == nil || !gnome.ContainsCredential || !gnome.Checked {
 		t.Fatalf("gnome 目录下的强凭据应保留：%+v", gnome)
 	}
-	if candByPath(cands, filepath.Join(r.Home, ".pki")) != nil {
-		t.Fatal(".pki 是共享凭据库，不能被噪声例外救回来")
+	pki := candByPath(cands, filepath.Join(r.Home, ".pki"))
+	if pki == nil || pki.Class != ClassShared || pki.Checked || pki.Credential != CredentialNone || pki.ContainsCredential {
+		t.Fatalf(".pki 必须保持共享而不提升私有凭据：%+v", pki)
 	}
 	kr := candByPath(cands, filepath.Join(r.XDG["DATA_HOME"], "keyrings", "default.keyring"))
 	if kr == nil || kr.Class != ClassKeyring || kr.Checked {

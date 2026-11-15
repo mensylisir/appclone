@@ -17,6 +17,7 @@ const (
 	EntryDir EntryKind = iota
 	EntryFile
 	EntryWhiteout
+	EntryOther // symlink, FIFO, socket, or another non-regular node
 )
 
 // UpperEntry 是 upper 层的一条。Path **相对 $HOME**：探测会话把 merger 挂在
@@ -38,6 +39,10 @@ type UpperEntry struct {
 // 判"零写入"看的是**归并后的候选数**，不是 upper 条目数：一个应用可能写 300 个
 // 文件全落在 `~/.cache` 里，那在语义上仍然是"没有值得隔离的写入"。
 func (r *PathResolver) MergeUpper(entries []UpperEntry) ([]Candidate, []string) {
+	r = r.withSharedMIME()
+	if r.sharedMIME.err != nil {
+		return nil, nil
+	}
 	counts := map[string]int{}         // 应用目录 → 非目录条目数
 	dirSeen := map[string]bool{}       // 应用目录 → 至少出现过一个目录条目
 	escalate := map[string]PathClass{} // 应用目录 → 必须升级成的类别（共享可写）
@@ -47,10 +52,27 @@ func (r *PathResolver) MergeUpper(entries []UpperEntry) ([]Candidate, []string) 
 	var whiteouts []string
 	// upperSet 让"前缀文件只在写层里"的原子写临时文件也能被识别。
 	upperSet := make(map[string]bool, len(entries))
+	sharedParents := map[string]bool{}
 	for _, en := range entries {
 		if strings.TrimSpace(en.Path) != "" {
-			upperSet[filepath.Clean(filepath.Join(r.Home, filepath.FromSlash(en.Path)))] = true
+			abs := filepath.Clean(filepath.Join(r.Home, filepath.FromSlash(en.Path)))
+			upperSet[abs] = true
+			if en.Kind != EntryWhiteout && IsUnder(r.Home, abs) {
+				if en.Kind != EntryFile {
+					if _, ok := r.preciseSharedMIMEBoundary(abs); ok && r.sharedMIME.err == nil {
+						r.sharedMIME.err = errEnv("err.probe.shared_mime", map[string]any{"path": abs}, nil)
+					}
+				}
+				if boundary, ok := r.preciseSharedBoundary(abs); ok {
+					for parent := filepath.Dir(boundary); parent != filepath.Dir(parent); parent = filepath.Dir(parent) {
+						sharedParents[parent] = true
+					}
+				}
+			}
 		}
+	}
+	if r.sharedMIME.err != nil {
+		return nil, nil
 	}
 
 	for _, en := range entries {
@@ -73,7 +95,14 @@ func (r *PathResolver) MergeUpper(entries []UpperEntry) ([]Candidate, []string) 
 			// 只会困惑，隔离它更是毫无意义。
 			continue
 		}
-		owner, ok := r.ownerOf(abs)
+		if en.Kind == EntryDir && sharedParents[Real(abs)] {
+			continue // copy-up ancestor of a precise shared item, not app data
+		}
+		owner, precise := r.preciseSharedBoundary(abs)
+		ok := precise
+		if !precise {
+			owner, ok = r.ownerOf(abs)
+		}
 		if !ok {
 			continue
 		}
@@ -133,6 +162,9 @@ func (r *PathResolver) MergeUpper(entries []UpperEntry) ([]Candidate, []string) 
 	}
 	sort.Slice(cands, func(i, j int) bool { return cands[i].Path < cands[j].Path })
 	sort.Strings(whiteouts)
+	if r.sharedMIME.err != nil {
+		return nil, nil
+	}
 	return cands, whiteouts
 }
 
@@ -246,6 +278,10 @@ func credentialNameStrength(base string) CredentialStrength {
 // reads 是相对 $HOME 的路径（strace 解析产物）。acBase 是 AC_BASE，
 // 读它只是工具自己在工作，绝不能变成"用户应用要隔离的目录"。
 func (r *PathResolver) MergeUpperWithReads(entries []UpperEntry, reads, flagsHidden []string, acBase, app string) ([]Candidate, []string, int, []string) {
+	r = r.withSharedMIME()
+	if r.sharedMIME.err != nil {
+		return nil, nil, 0, nil
+	}
 	cands, whiteouts := r.MergeUpper(entries)
 	// 读证据也可能指向"前缀只在写层"的原子写临时文件（本次探测新建），
 	// 必须和写候选共用同一份 upper 集合。
@@ -321,7 +357,10 @@ func (r *PathResolver) MergeUpperWithReads(entries []UpperEntry, reads, flagsHid
 			continue
 		case ClassPublic, ClassShared:
 			// 公共/共享只生成"不勾选"的行，owner 类别不升级（§7.1）。
-			owner, ok := r.ownerOf(abs)
+			owner, ok := r.preciseSharedBoundary(abs)
+			if cls != ClassShared || !ok {
+				owner, ok = r.ownerOf(abs)
+			}
 			if !ok {
 				continue
 			}
@@ -504,6 +543,9 @@ func (r *PathResolver) MergeUpperWithReads(entries []UpperEntry, reads, flagsHid
 	var warns []string
 	for w := range warnSet {
 		warns = append(warns, w)
+	}
+	if r.sharedMIME.err != nil {
+		return nil, nil, 0, nil
 	}
 	return out, whiteouts, hidden, sortCredentialWarns(warns)
 }

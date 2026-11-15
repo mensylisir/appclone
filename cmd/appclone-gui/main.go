@@ -46,6 +46,9 @@ func main() {
 	// 此时只把已有窗口提到前台，绝不能再建一个窗口（两份列表/探测状态机
 	// 会各自写同一份档案目录）。
 	actcb := func(_ gio.Application) {
+		if u.closed {
+			return
+		}
 		if u.win != nil {
 			u.win.Present()
 			return

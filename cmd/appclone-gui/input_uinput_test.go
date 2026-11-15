@@ -277,7 +277,7 @@ func TestGtkRealInputUinput(t *testing.T) {
 				fail("第 %d 步没有等到预期状态（注入未生效？）", step)
 				return false
 			}
-			if !u.loaded || !u.envChecked || !u.stack.GetMapped() || !u.win.GetMapped() {
+			if !u.loaded || !u.listSettled() || !u.envChecked || !u.stack.GetMapped() || !u.win.GetMapped() {
 				return true
 			}
 			if !fullscreenRequested {
@@ -727,7 +727,7 @@ func TestGtkRealInputStartStop(t *testing.T) {
 					sawLaunch, sawStop, stopped, calibrated, pushCount, lastBranch, state)
 				return false
 			}
-			if !u.loaded || !u.envChecked || !u.win.GetMapped() {
+			if !u.loaded || !u.listSettled() || !u.envChecked || !u.win.GetMapped() {
 				lastBranch = "wait-loaded"
 				return true
 			}

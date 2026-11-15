@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -18,7 +17,9 @@ import (
 //
 // Entries 是**写入条目数**，不是次数（overlay 拿不到次数，§6.1 文案红线）。
 type ProbeProgress struct {
-	Stage         string // round_running | round_stopped | round_done | fallback
+	SessionToken  uint64 // identifies a successfully started round
+	CanFinish     bool
+	Stage         string // round_running | round_stopped | round_done
 	Round         int
 	Rounds        int
 	Entries       int
@@ -29,6 +30,9 @@ type ProbeProgress struct {
 
 // ProbeOptions 是探测的全部可调项。
 type ProbeOptions struct {
+	Control  *ProbeControl
+	work     string // private scene guard, never a caller-selected path
+	scene    *overlayScene
 	Command  []string  // 应用命令（Exec + 参数）
 	LockFile []string  // L0 预填的锁文件（可空）
 	Stderr   io.Writer // 会话的 stderr（GUI 无 stderr，可为 nil）
@@ -128,6 +132,9 @@ func (e *Env) Probe(ctx context.Context, app string, opt ProbeOptions) (ProbeRes
 	if err := CheckNotRoot(); err != nil {
 		return ProbeResult{}, err
 	}
+	if probeSessionsBlocked() {
+		return ProbeResult{}, errEnv("err.probe.session_unreaped", nil, nil)
+	}
 	if e.probeReaderBlocked() {
 		// 上一次探测的采集线程还活着（2 秒 join 超时）。它仍持有旧 FIFO，
 		// 再开一次探测只会叠加泄漏；先让用户重跑/重启（§5.2）。
@@ -155,38 +162,14 @@ func (e *Env) Probe(ctx context.Context, app string, opt ProbeOptions) (ProbeRes
 	if runner == nil {
 		runner = setsidRunner{}
 	}
-	// 降级判据（§3.4 + ADR-032）：**只有后端确实不存在**时，才在 strace 可用
-	// 的前提下降级。fuse-overlayfs 在、但挂载被系统拒绝（权限/沙盒/超时）是
-	// 可修复的环境问题：静默走 strace 会把权限问题藏起来，还会给用户一份低
-	// 置信度档案。这类错误必须原样交给界面/CLI。
+	// A writable private layer is required before starting any target application.
+	// Tracing alone cannot prevent writes to the primary application data.
 	if err := mounter.Available(); err != nil {
-		if !ProbeBackendMissing(err) {
-			return ProbeResult{}, err
-		}
-		if _, serr := exec.LookPath("strace"); serr != nil {
-			// fuse 与 strace 都缺：报"读追踪不可用"的环境错误，而不是把 fuse
-			// 的原始错误抛给界面——后者无法归类，用户也不知道该装哪个包。
-			return ProbeResult{}, errEnv("err.probe.strace_unavailable", nil, serr)
-		}
-		if opt.Stderr != nil {
-			fmt.Fprintln(opt.Stderr, "appclone: fuse-overlayfs 不可用，改用 strace 跟踪（结果置信度较低，且需要多开几次应用）")
-		}
-		// 降级事件由 probeStrace 在闸门之后发（见那里的注释）：还没确认能真的
-		// 开跑就告诉界面"已降级"，紧接着又报 app_running，横幅会和错误文案打架。
-		return e.probeStrace(ctx, app, opt, runner)
+		return ProbeResult{}, err
 	}
 	return e.probeSession(ctx, app, opt, mounter, runner)
 }
 
-// probeStrace 是 §3.4 的降级路径：不罩 overlay（HOME 就是真实的），
-// 靠 strace 抓"带写入意图的 open/rename/unlink"。
-//
-// 与 overlay 路径的差别必须写在档案里（`probe_method = "strace"`），
-// 界面要按低置信展示——两套结果看起来一样，但一套是"确定写过"、
-// 一套是"可能写过"。
-// ProbeBackendMissing 区分"探测后端根本不存在"与"后端存在但挂载失败"。
-// 前者可以降级 strace；后者（Permission denied、EPERM、超时）是权限/沙盒
-// 问题，自动降级只会掩盖它——ADR-032。
 // ProbeErrorKey 取 core 错误键；不是 *Error 时返回空串。界面按它区分
 // "组件缺失 / 写层不可写 / 挂载被拒"（三者的处置完全不同），不解析文案。
 func ProbeErrorKey(err error) string {
@@ -237,208 +220,6 @@ func (e *Env) startProbeBus(work string, opt ProbeOptions) (string, func()) {
 	return sess.Addr(), stop
 }
 
-func (e *Env) probeStrace(ctx context.Context, app string, opt ProbeOptions, runner SessionRunner) (ProbeResult, error) {
-	if running, err := e.AppRunning(opt.Command[0]); err != nil {
-		return ProbeResult{}, err
-	} else if running {
-		return ProbeResult{}, errBusy("err.probe.app_running", map[string]any{"exec": filepath.Base(opt.Command[0])})
-	}
-	// 闸门过了、strace 会话确定要跑，才把"本次降级"告诉界面：GUI 会在探测页
-	// 起一条常驻横幅，切到确认态也不消失。提前发就等于给一个不会发生的
-	// 会话挂横幅（闸门失败时用户看到的应是 app_running，不是 fuse 提示）。
-	if opt.Progress != nil {
-		opt.Progress(ProbeProgress{Stage: "fallback"})
-	}
-	work, err := os.MkdirTemp(e.tmpRoot(), fmt.Sprintf("appclone-strace-%d-", e.UID))
-	if err != nil {
-		return ProbeResult{}, errEnv("err.env.mkdir", map[string]any{"path": e.tmpRoot()}, err)
-	}
-	keepWork := false
-	var trace *probeReadState
-	defer func() {
-		// reader 必须先于 work 清理停止：它仍持有 FIFO fd，先删目录会让它
-		// 读到已删除的 inode，join 超时还会把进程级泄漏标记置位（§5.2/§12）。
-		if trace != nil {
-			trace.stop()
-			if trace.traceErr != nil {
-				keepWork = true
-			}
-		}
-		if !keepWork {
-			os.RemoveAll(work)
-		}
-	}()
-	runtimeDir := filepath.Join(work, "runtime")
-	if err := os.MkdirAll(runtimeDir, 0o700); err != nil {
-		return ProbeResult{}, errEnv("err.env.mkdir", map[string]any{"path": runtimeDir}, err)
-	}
-	traceDir := filepath.Join(work, "trace")
-	if err := os.MkdirAll(traceDir, 0o700); err != nil {
-		return ProbeResult{}, errEnv("err.env.mkdir", map[string]any{"path": traceDir}, err)
-	}
-	bus, stopBus := e.startProbeBus(work, opt)
-	if stopBus != nil {
-		// 用闭包而不是 defer stopBus()：重跑会换 work 并重启总线，
-		// defer 必须在返回时停**当前**那一个。
-		defer func() {
-			if stopBus != nil {
-				stopBus()
-			}
-		}()
-	}
-	locks, _, err := e.probeLockBinds(work, opt.LockFile)
-	if err != nil {
-		return ProbeResult{}, err
-	}
-	rounds := opt.Rounds
-	if rounds <= 0 {
-		rounds = 2
-	}
-	timeout := opt.Timeout
-	if timeout == 0 {
-		timeout = probeTimeoutDefault
-	}
-	// 兜底的写证据完全来自 strace：FIFO/写列表不可用就没有可信结果，
-	// 必须报环境错误而不是静默返回零写入（§11.2）。
-	trace, err = e.newProbeReadState(ctx, traceDir, opt, true)
-	if err != nil {
-		return ProbeResult{}, err
-	}
-	if !trace.caps.Write {
-		return ProbeResult{}, errEnv("err.probe.strace_unavailable", nil, nil)
-	}
-	var last SessionResult
-	for round := 0; round < rounds; round++ {
-		inner, aerr := ProbeBwrapArgs(ProbeSpec{
-			Home:         e.Resolver.Home,
-			Base:         Real(e.Base), // 软链 Base 不能作为 bwrap 挂载目标
-			AuditRoot:    e.auditRoot(),
-			RuntimeDir:   runtimeDir,
-			RuntimeSock:  probeRuntimeSocks(e.Resolver.XDG["RUNTIME_DIR"], runtimeDir),
-			DBusAddress:  bus,
-			HostBusPaths: e.hostBusPaths(),
-			SharedWrite:  e.probeSharedWrites(),
-			LockBinds:    locks,
-			TraceDir:     traceDir,
-			Command:      opt.Command,
-			NoOverlay:    true,
-		})
-		if aerr != nil {
-			return ProbeResult{}, aerr
-		}
-		if opt.Stderr != nil && rounds > 1 {
-			fmt.Fprintf(opt.Stderr, "appclone: 第 %d/%d 轮 —— 请打开应用用一下，然后把它关掉\n", round+1, rounds)
-		}
-		sctx, cancel := context.WithTimeout(ctx, timeout)
-		trace.markRound(round)
-		res, runErr := runProbeRound(sctx, runner, trace.command(inner, true), trace.stderrWriter(), opt, trace, round, rounds)
-		cancel()
-		if runErr != nil {
-			if errors.Is(runErr, context.Canceled) {
-				return ProbeResult{}, ErrCanceled
-			}
-			if errors.Is(runErr, context.DeadlineExceeded) {
-				// strace 路径没有 overlay 现场可保留（work 是普通临时目录）：
-				// 用单独一条不提"保留现场"、也没有 {quarantine} 的文案。
-				return ProbeResult{}, newErr(CodeProbe, "err.probe.timeout_strace", map[string]any{
-					"app": app, "round": round + 1, "rounds": rounds,
-				}, runErr)
-			}
-			return ProbeResult{}, newErr(CodeEnv, "err.probe.session", map[string]any{
-				"app": app, "message": runErr.Error(),
-			}, runErr)
-		}
-		last = res
-		trace.checkRound(res)
-		reportProbeProgress(opt, e, round, rounds, trace.writesSoFar(), trace.readsSoFar())
-	}
-	trace.stop()
-	if trace.traceErr != nil {
-		// reader 卡住时保留现场（它仍持 FIFO fd）。
-		keepWork = true
-		return ProbeResult{}, trace.traceErr
-	}
-	entries := trace.writesSoFar()
-	writes := e.countProbeWrites(entries)
-	activity := last.Started || len(entries) > 0 || len(trace.reads) > 0 || trace.execSeen
-	if last.ExitCode != 0 && !activity {
-		return ProbeResult{}, newErr(CodeEnv, "err.probe.session_failed", map[string]any{
-			"app": app, "code": last.ExitCode,
-		}, nil)
-	}
-	if last.Started && !trace.execSeen && last.ExitCode != 0 && trace.readOK {
-		return ProbeResult{}, newErr(CodeEnv, "err.probe.session_not_started", map[string]any{
-			"code": last.ExitCode,
-		}, nil)
-	}
-	trace.finalize(writes, activity)
-	cands, whiteouts, readsHidden, credWarns := e.Resolver.MergeUpperWithReads(
-		entries, trace.reads, trace.flagsHidden, e.Base, app)
-	cands = e.Resolver.AppendStaticCandidates(cands, opt.StaticPaths)
-
-	evidence := e.keyringEvidence(opt.Command[0], cands, trace.reads, trace.keyringHits)
-	probe := Profile{
-		App:       app,
-		Exec:      opt.Command[0],
-		ExecArgs:  append([]string{}, opt.Command[1:]...),
-		Ignored:   DefaultIgnored(),
-		LockFiles: e.lockHostPaths(locks),
-	}
-	// 自重启识别（ADR-036）：必须在 probe 构造之后、DeriveProfile 之前。
-	minRounds := 1
-	if rounds >= 2 {
-		minRounds = 2
-	}
-	sr := DetectSelfRelaunchArgs(opt.Command[0], opt.Command[1:], trace.execCalls, minRounds)
-	var selfRelaunchArgs []string
-	selfRelaunchAmbiguous := sr.Ambiguous
-	if sr.OK {
-		selfRelaunchArgs = append([]string(nil), sr.Delta...)
-		// unknown 证据只做诊断：不落盘、不覆盖旧参数、不驱动重探。
-		if sr.Known {
-			probe.ExecArgs = sr.Args
-			probe.execArgsFromEvidence = true
-		}
-	}
-	selfRelaunchUnknown := sr.OK && !sr.Known
-	// 默认策略（方案 §6）：只有 observed 且能力可用才默认开启。KeyringSet
-	// 保持 false——这是"探测默认"，不是用户显式选择，合并时既有档案优先。
-	if on, _ := e.keyringDefault(evidence); on {
-		probe.IsolateKeyring = true
-	}
-	probe.Unsupported = append(probe.Unsupported, probeUnsupported(e)...)
-	sort.Slice(probe.Unsupported, func(i, j int) bool { return probe.Unsupported[i].Path < probe.Unsupported[j].Path })
-	p := e.Resolver.DeriveProfile(probe, nil, "strace", trace.readTrace(), cands)
-	p.Warnings = append(p.Warnings, credWarns...)
-	if _, warn := e.keyringDefault(evidence); warn != "" {
-		p.Warnings = append(p.Warnings, warn)
-	}
-	return ProbeResult{
-		Profile:               p,
-		Candidates:            cands,
-		Whiteouts:             whiteouts,
-		ExitCode:              last.ExitCode,
-		Writes:                writes,
-		HomeReads:             len(trace.reads),
-		HomeReadsNoise:        trace.homeReadsNoise(),
-		Started:               last.Started,
-		ExecSeen:              trace.execSeen,
-		Activity:              activity,
-		ReadsDropped:          trace.stats.ReadsDropped,
-		ParseErrors:           trace.stats.ParseErrors,
-		SizeExceeded:          trace.stats.SizeExceeded,
-		ReadsHidden:           readsHidden,
-		ReadsWarns:            trace.warnsList(),
-		ReadTrace:             trace.readTrace(),
-		KeyringEvidence:       evidence,
-		KeyringTraceDropped:   trace.keyringDropped,
-		SelfRelaunchUnknown:   selfRelaunchUnknown,
-		SelfRelaunchArgs:      selfRelaunchArgs,
-		SelfRelaunchAmbiguous: selfRelaunchAmbiguous,
-		RoundMarkerDropped:    trace.stats.RoundMarkerDropped,
-	}, nil
-}
-
 // probeRoundFailed 把"某一轮没跑起来"翻译成退出码。工作目录的处置（停止
 // 会话进程 → 卸载 → 删除/保留现场）由调用方用 teardown 完成：顺序错了会
 // 穿过 merged 挂载点删到 upper 里的内容（见 discard 的注释）。
@@ -473,7 +254,7 @@ func (e *Env) probeRoundFailed(app string, round, rounds int, runErr error, quar
 
 // probeSession 是去掉"非 root"闸门之后的探测本体：root 检查与它无关，
 // 而单测必然以 root 跑（沙箱里没有别的用户），所以拆开才能测到编排逻辑。
-func (e *Env) probeSession(ctx context.Context, app string, opt ProbeOptions, mounter OverlayMounter, runner SessionRunner) (ProbeResult, error) {
+func (e *Env) probeSession(ctx context.Context, app string, opt ProbeOptions, mounter OverlayMounter, runner SessionRunner) (result ProbeResult, retErr error) {
 	// 闸门 1：目标应用不能正在跑。主实例在跑时应用会把参数转发给它然后自己退出，
 	// 探测结果是"零写入"——与"应用真的不写盘"无法区分（§3.2.2）。
 	if running, err := e.AppRunning(opt.Command[0]); err != nil {
@@ -497,10 +278,11 @@ func (e *Env) probeSession(ctx context.Context, app string, opt ProbeOptions, mo
 		return ProbeResult{}, err
 	}
 
-	work, err := e.newProbeWorkDir(app)
+	scene, err := e.newProbeWorkScene(app)
 	if err != nil {
 		return ProbeResult{}, err
 	}
+	work := scene.lexical
 	// removed 标记"work 已经被处理过"，避免重复删/quarantine。
 	// isMounted 是硬护栏：merged 还挂着时 os.RemoveAll(work) 会**穿过挂载点**
 	// 遍历整个 $HOME 视图——upper 里探测期写下的文件会被 unlink 掉，而
@@ -509,16 +291,35 @@ func (e *Env) probeSession(ctx context.Context, app string, opt ProbeOptions, mo
 	isMounted := false
 	// reader 卡住时 work 是唯一还能找到现场的地方：删/搬之前必须知道。
 	keepWork := false
+	sessionUnreaped := false
+	defer func() {
+		if !sessionUnreaped {
+			scene.close()
+		}
+	}()
+	defer func() {
+		if !sessionUnreaped && !removed {
+			if err := scene.clearActive(); err != nil {
+				retErr = err
+			}
+		}
+	}()
 	// stopTrace 在 trace 创建后赋值；discard/quarantine/teardown 都先调用它，
 	// 保证"停 reader → 卸载 → 处置 work"的顺序在所有异常路径一致（§5.2）。
 	stopTrace := func() {}
-	discard := func() {
+	discard := func() error {
 		stopTrace()
-		if keepWork || removed || isMounted {
-			return
+		if removed {
+			return nil
+		}
+		if keepWork || isMounted {
+			return sceneError(work, errors.New("scene is still in use"))
+		}
+		if err := scene.remove("."); err != nil {
+			return err
 		}
 		removed = true
-		os.RemoveAll(work)
+		return nil
 	}
 	quarantine := func() (string, error) {
 		stopTrace()
@@ -531,10 +332,13 @@ func (e *Env) probeSession(ctx context.Context, app string, opt ProbeOptions, mo
 			// reader 仍可能持 FIFO fd：现场不能搬，原路径就是用户能找到的位置。
 			return work, nil
 		}
+		if err := scene.checkUnmounted(); err != nil {
+			return work, err
+		}
 		// 写层根可能在 tmpfs（/tmp、$XDG_RUNTIME_DIR），quarantine 优先落磁盘；
 		// quarantineDir 负责 EXDEV 拷贝 + fsync，拷贝不动（子树不可读）时退回
 		// 同 fs rename，任何失败都不删源（§3.2.1）。
-		q, qerr := e.quarantineDir(work)
+		q, qerr := e.quarantineScene(scene)
 		if qerr != nil {
 			// **绝不回退到 RemoveAll**：这里面可能就是用户刚存的文件（§3.2.1）。
 			// 留着、把真实路径告诉用户，让人自己决定。
@@ -546,14 +350,18 @@ func (e *Env) probeSession(ctx context.Context, app string, opt ProbeOptions, mo
 
 	traceDir := filepath.Join(work, "trace")
 	if err := os.MkdirAll(traceDir, 0o700); err != nil {
-		discard()
+		if derr := discard(); derr != nil {
+			return ProbeResult{}, derr
+		}
 		return ProbeResult{}, errEnv("err.env.mkdir", map[string]any{"path": traceDir}, err)
 	}
 	// reader 必须在会话开始前就绪：strace 打开 FIFO 写端时没有读端会阻塞。
 	// 预检也在挂 overlay 之前跑完——bwrap 硬错误不该先付出一次挂载。
-	trace, err := e.newProbeReadState(ctx, traceDir, opt, false)
+	trace, err := e.newProbeReadState(ctx, traceDir, opt)
 	if err != nil {
-		discard()
+		if derr := discard(); derr != nil {
+			return ProbeResult{}, derr
+		}
 		return ProbeResult{}, err
 	}
 	stopTrace = func() {
@@ -565,7 +373,11 @@ func (e *Env) probeSession(ctx context.Context, app string, opt ProbeOptions, mo
 		}
 	}
 	// 任何错误路径都要停 reader（它持有 FIFO fd）；正常路径会在卸载前显式 stop。
-	defer stopTrace()
+	defer func() {
+		if !sessionUnreaped {
+			stopTrace()
+		}
+	}()
 
 	upper := filepath.Join(work, "upper")
 	merged := filepath.Join(work, "merged")
@@ -574,18 +386,28 @@ func (e *Env) probeSession(ctx context.Context, app string, opt ProbeOptions, mo
 		// 极窄的竞态：Mount 已返回错误（典型是超时），但挂载点刚好在不该在
 		// 的时刻生效了。这时删 work 会穿过 merged；宁可把目录留给下次
 		// sweepStaleProbes（它会先卸载、再判污染）。
-		if mounted(merged) {
-			return ProbeResult{}, err
+		if derr := discard(); derr != nil {
+			return ProbeResult{}, derr
 		}
-		discard()
 		return ProbeResult{}, err
+	}
+	guardedUnmount := func() error {
+		if err := scene.checkIdle(); err != nil {
+			return err
+		}
+		if err := unmount(); err != nil {
+			return sceneError(work, err)
+		}
+		return scene.checkUnmounted()
 	}
 	// 卸载顺序与"先杀进程再卸载"（§3.2.3）：这里注册的 defer 是兜底，
 	// 正常路径在下面显式调用并检查错误。
 	isMounted = true
 	defer func() {
-		if isMounted {
-			_ = unmount()
+		if isMounted && !sessionUnreaped {
+			if err := guardedUnmount(); err != nil {
+				retErr = err
+			}
 		}
 	}()
 
@@ -594,7 +416,7 @@ func (e *Env) probeSession(ctx context.Context, app string, opt ProbeOptions, mo
 		// 用闭包而不是 defer stopBus()：重跑会换 work 并重启总线，
 		// defer 必须在返回时停**当前**那一个。
 		defer func() {
-			if stopBus != nil {
+			if stopBus != nil && !sessionUnreaped {
 				stopBus()
 			}
 		}()
@@ -610,28 +432,34 @@ func (e *Env) probeSession(ctx context.Context, app string, opt ProbeOptions, mo
 			stopBus()
 		}
 		if isMounted {
-			if uerr := unmount(); uerr != nil {
+			if uerr := guardedUnmount(); uerr != nil {
 				// 挂载点没卸掉：什么都不删，留给启动前的残留扫描。
 				return "", uerr
 			}
 			isMounted = false
 		}
 		if preserve {
-			ents, present, rerr := readUpperTree(upper)
+			ents, present, rerr := scene.readUpper()
 			switch {
 			case rerr != nil:
 				return quarantine()
 			case !present || len(ents) == 0:
-				discard()
+				if derr := discard(); derr != nil {
+					return "", derr
+				}
 				return "", nil
 			case len(e.ProbeContaminated(ents, pubBinds)) > 0:
 				return quarantine()
 			default:
-				discard()
+				if derr := discard(); derr != nil {
+					return "", derr
+				}
 				return "", nil
 			}
 		}
-		discard()
+		if derr := discard(); derr != nil {
+			return "", derr
+		}
 		return "", nil
 	}
 	locks, lockCleanup, err := e.probeLockBinds(work, opt.LockFile)
@@ -642,7 +470,11 @@ func (e *Env) probeSession(ctx context.Context, app string, opt ProbeOptions, mo
 		return ProbeResult{}, err
 	}
 	// 重跑会为新 work 重新算锁绑定；defer 必须调用当前那一份。
-	defer func() { lockCleanup() }()
+	defer func() {
+		if !sessionUnreaped {
+			lockCleanup()
+		}
+	}()
 
 	spec := ProbeSpec{
 		Home:         e.Resolver.Home,
@@ -676,20 +508,40 @@ func (e *Env) probeSession(ctx context.Context, app string, opt ProbeOptions, mo
 	if rounds <= 0 {
 		rounds = 2
 	}
+	holdSession := func(r SessionResult) {
+		sessionUnreaped, keepWork = true, true
+		retainUnreapedProbe(scene, r, func() error {
+			trace.stop()
+			if trace.traceErr != nil {
+				return trace.traceErr
+			}
+			if stopBus != nil {
+				stopBus()
+			}
+			lockCleanup()
+			return guardedUnmount()
+		})
+	}
 	var res SessionResult
 	for round := 0; round < rounds; round++ {
 		sctx, cancel := context.WithTimeout(ctx, timeout)
 		if opt.Stderr != nil && rounds > 1 {
 			fmt.Fprintf(opt.Stderr, "appclone: 第 %d/%d 轮 —— 请打开应用用一下，然后把它关掉\n", round+1, rounds)
 		}
+		opt.work = work
+		opt.scene = scene
 		trace.markRound(round)
-		r, runErr := runProbeRound(sctx, runner, trace.command(argv, false), trace.stderrWriter(), opt, trace, round, rounds)
+		r, runErr := runProbeRound(sctx, runner, trace.command(argv), trace.stderrWriter(), opt, trace, round, rounds)
 		cancel()
+		if r.Unreaped {
+			holdSession(r)
+			return ProbeResult{}, runErr
+		}
 		if runErr != nil {
 			// 没有可信证据。第 0 轮 Start 失败时应用还没 exec、写层安全；
 			// 取消/超时与后续轮次的失败都可能已经有写入，必须先卸载再判断
 			// 是否保留，绝不直接删写层。
-			preserve := round > 0 || errors.Is(runErr, context.Canceled) ||
+			preserve := r.Started || round > 0 || errors.Is(runErr, context.Canceled) ||
 				errors.Is(runErr, context.DeadlineExceeded)
 			q, terr := teardown(preserve)
 			if terr != nil {
@@ -717,10 +569,13 @@ func (e *Env) probeSession(ctx context.Context, app string, opt ProbeOptions, mo
 		// 后续轮次沿用最后一轮的结果；前面轮次只要没报错就继续——
 		// "第二轮才写 token" 正是要覆盖的情形。
 		res = r
+		if r.ManualFinish {
+			trace.addWarn("manual_finish")
+		}
 		trace.checkRound(r)
 		// 中途读一次 upper 只为进度展示；读失败不影响主流程（结束时还有一次
 		// 权威读取，错误会在那里上报）。
-		if ents, present, rerr := readUpperTree(upper); rerr == nil && present {
+		if ents, present, rerr := scene.readUpper(); rerr == nil && present {
 			reportProbeProgress(opt, e, round, rounds, ents, trace.readsSoFar())
 		}
 	}
@@ -733,7 +588,9 @@ func (e *Env) probeSession(ctx context.Context, app string, opt ProbeOptions, mo
 			stopBus()
 		}
 		if isMounted {
-			_ = unmount()
+			if uerr := guardedUnmount(); uerr != nil {
+				return ProbeResult{}, uerr
+			}
 			isMounted = false
 		}
 		// 现场保留：reader 可能仍持 fd，删 work 会让它读到已删除的 inode。
@@ -744,8 +601,8 @@ func (e *Env) probeSession(ctx context.Context, app string, opt ProbeOptions, mo
 	// （丢弃安全）时才做。去掉 strace、保留 overlay 重跑一次，拿到写证据即可；
 	// 第一次已解析的读路径保留并合并，但重跑本身没有读追踪 → unavailable。
 	rerun := false
-	if trace.readOK && ctx.Err() == nil {
-		if ents, present, rerr := readUpperTree(upper); rerr == nil && (!present || len(ents) == 0) {
+	if trace.readOK && ctx.Err() == nil && !res.ManualFinish {
+		if ents, present, rerr := scene.readUpper(); rerr == nil && (!present || len(ents) == 0) {
 			rerun = res.ExitCode != 0 ||
 				(len(trace.reads) == 0 && trace.warns["strace_failed"])
 		}
@@ -754,7 +611,7 @@ func (e *Env) probeSession(ctx context.Context, app string, opt ProbeOptions, mo
 	present := false
 	var readErr error
 	if rerun {
-		if uerr := unmount(); uerr != nil {
+		if uerr := guardedUnmount(); uerr != nil {
 			return ProbeResult{}, uerr
 		}
 		isMounted = false
@@ -767,11 +624,15 @@ func (e *Env) probeSession(ctx context.Context, app string, opt ProbeOptions, mo
 		}
 		lockCleanup()
 		lockCleanup = func() {}
-		discard()
-		work, err = e.newProbeWorkDir(app)
+		if derr := discard(); derr != nil {
+			return ProbeResult{}, derr
+		}
+		scene.close()
+		scene, err = e.newProbeWorkScene(app)
 		if err != nil {
 			return ProbeResult{}, err
 		}
+		work = scene.lexical
 		removed = false
 		bus, stopBus = e.startProbeBus(work, opt)
 		locks, lockCleanup, err = e.probeLockBinds(work, opt.LockFile)
@@ -785,10 +646,9 @@ func (e *Env) probeSession(ctx context.Context, app string, opt ProbeOptions, mo
 		merged = filepath.Join(work, "merged")
 		unmount2, merr := mounter.Mount(e.Resolver.Home, upper, filepath.Join(work, "work"), merged)
 		if merr != nil {
-			if mounted(merged) {
-				return ProbeResult{}, merr
+			if derr := discard(); derr != nil {
+				return ProbeResult{}, derr
 			}
-			discard()
 			return ProbeResult{}, merr
 		}
 		unmount = unmount2
@@ -822,21 +682,30 @@ func (e *Env) probeSession(ctx context.Context, app string, opt ProbeOptions, mo
 		var runErr error
 		// This recovery has one round and no read tracing. Keep its elapsed
 		// time live instead of leaving the GUI on the preceding collection.
+		opt.work = work
+		opt.scene = scene
 		res, runErr = runProbeRound(sctx, runner, argv2, opt.Stderr, opt, nil, 0, 1)
 		cancel()
+		if res.Unreaped {
+			holdSession(res)
+			return ProbeResult{}, runErr
+		}
+		if res.ManualFinish {
+			trace.addWarn("manual_finish")
+		}
 		if runErr != nil {
-			preserve := errors.Is(runErr, context.Canceled) || errors.Is(runErr, context.DeadlineExceeded)
+			preserve := res.Started || errors.Is(runErr, context.Canceled) || errors.Is(runErr, context.DeadlineExceeded)
 			q, terr := teardown(preserve)
 			if terr != nil {
 				return ProbeResult{}, terr
 			}
 			return e.probeRoundFailed(app, 0, 1, runErr, q)
 		}
-		if uerr := unmount(); uerr != nil {
+		if uerr := guardedUnmount(); uerr != nil {
 			return ProbeResult{}, uerr
 		}
 		isMounted = false
-		entries, present, readErr = readUpperTree(upper)
+		entries, present, readErr = scene.readUpper()
 		// 重跑没有读追踪：三态明确降为 unavailable（不是 partial）。
 		// 第一轮的 unclean 只描述"strace 会话退出码非零"，重跑是刻意不套
 		// strace 的，不能再把它翻译成 strace_failed。
@@ -847,7 +716,7 @@ func (e *Env) probeSession(ctx context.Context, app string, opt ProbeOptions, mo
 		if stopBus != nil {
 			stopBus()
 		}
-		unmountErr := unmount()
+		unmountErr := guardedUnmount()
 		isMounted = false
 		if unmountErr != nil {
 			// 挂载点还在：这时删工作目录会遍历用户家目录视图并制造 whiteout，
@@ -855,7 +724,7 @@ func (e *Env) probeSession(ctx context.Context, app string, opt ProbeOptions, mo
 			return ProbeResult{}, unmountErr
 		}
 		// 收集：先读，再判，最后才谈删（§3.2.3 末条）。
-		entries, present, readErr = readUpperTree(upper)
+		entries, present, readErr = scene.readUpper()
 	}
 	if rerun && stopBus != nil {
 		stopBus()
@@ -869,7 +738,9 @@ func (e *Env) probeSession(ctx context.Context, app string, opt ProbeOptions, mo
 		return ProbeResult{}, readErr
 	}
 	if !present {
-		discard()
+		if derr := discard(); derr != nil {
+			return ProbeResult{}, derr
+		}
 		return ProbeResult{}, errEnv("err.probe.no_upper", map[string]any{"path": upper}, nil)
 	}
 	// 会话内的正向断言失败：公共目录仍落在 overlay 里（bind 没生效）。
@@ -885,17 +756,20 @@ func (e *Env) probeSession(ctx context.Context, app string, opt ProbeOptions, mo
 				"path": publicTargets(pubBinds), "quarantine": q,
 			})
 		}
-		discard()
+		if derr := discard(); derr != nil {
+			return ProbeResult{}, derr
+		}
 		return ProbeResult{}, errProbe("err.probe.bind_verify_failed", map[string]any{
 			"path": publicTargets(pubBinds),
 		})
 	}
 	// 会话"跑起来了但立刻失败"（bwrap 建 namespace 失败、Exec 不存在）与
 	// "应用正常退出但没写"必须分开：前者是环境/输入问题（3），后者才是 4。
-	writes := e.countProbeWrites(entries)
 	activity := res.Started || len(entries) > 0 || len(trace.reads) > 0 || trace.execSeen
 	if res.ExitCode != 0 && !activity {
-		discard()
+		if derr := discard(); derr != nil {
+			return ProbeResult{}, derr
+		}
 		return ProbeResult{}, newErr(CodeEnv, "err.probe.session_failed", map[string]any{
 			"app": app, "code": res.ExitCode,
 		}, nil)
@@ -903,7 +777,9 @@ func (e *Env) probeSession(ctx context.Context, app string, opt ProbeOptions, mo
 	if res.Started && !trace.execSeen && res.ExitCode != 0 && trace.readOK {
 		// 会话起来了、但没观察到应用执行：按"应用未启动/立即退出"报，
 		// 不能把 bwrap 启动成功当成应用已运行（§11.3）。
-		discard()
+		if derr := discard(); derr != nil {
+			return ProbeResult{}, derr
+		}
 		return ProbeResult{}, newErr(CodeEnv, "err.probe.session_not_started", map[string]any{
 			"code": res.ExitCode,
 		}, nil)
@@ -922,10 +798,24 @@ func (e *Env) probeSession(ctx context.Context, app string, opt ProbeOptions, mo
 		})
 	}
 
+	writes := e.countProbeWrites(entries)
 	trace.finalize(writes, activity)
-	cands, whiteouts, readsHidden, credWarns := e.Resolver.MergeUpperWithReads(
+	classificationFailed := func(err error) (ProbeResult, error) {
+		if derr := discard(); derr != nil {
+			return ProbeResult{}, derr
+		}
+		return ProbeResult{}, err
+	}
+	resolver := e.Resolver.withSharedMIME()
+	if resolver.sharedMIME.err != nil {
+		return classificationFailed(resolver.sharedMIME.err)
+	}
+	cands, whiteouts, readsHidden, credWarns := resolver.MergeUpperWithReads(
 		entries, trace.reads, trace.flagsHidden, e.Base, app)
-	cands = e.Resolver.AppendStaticCandidates(cands, opt.StaticPaths)
+	if resolver.sharedMIME.err != nil {
+		return classificationFailed(resolver.sharedMIME.err)
+	}
+	cands = resolver.AppendStaticCandidates(cands, opt.StaticPaths)
 
 	// 非路径字段先装进 probe，再经 DeriveProfile 落成档案：Probe 不再直接
 	// 调 ProfileFromCandidates（§8.1 要求凭据派生与告警走同一条路径）。
@@ -942,7 +832,10 @@ func (e *Env) probeSession(ctx context.Context, app string, opt ProbeOptions, mo
 	if rounds >= 2 {
 		minRounds = 2
 	}
-	sr := DetectSelfRelaunchArgs(opt.Command[0], opt.Command[1:], trace.execCalls, minRounds)
+	sr := SelfRelaunch{}
+	if trace.stats.RoundMarkerDropped == 0 {
+		sr = DetectSelfRelaunchArgs(opt.Command[0], opt.Command[1:], trace.execCalls, minRounds)
+	}
 	var selfRelaunchArgs []string
 	selfRelaunchAmbiguous := sr.Ambiguous
 	if sr.OK {
@@ -961,13 +854,21 @@ func (e *Env) probeSession(ctx context.Context, app string, opt ProbeOptions, mo
 	}
 	probe.Unsupported = append(probe.Unsupported, probeUnsupported(e)...)
 	sort.Slice(probe.Unsupported, func(i, j int) bool { return probe.Unsupported[i].Path < probe.Unsupported[j].Path })
-	p := e.Resolver.DeriveProfile(probe, nil, "overlay", trace.readTrace(), cands)
+	if resolver.sharedMIME.err != nil {
+		return classificationFailed(resolver.sharedMIME.err)
+	}
+	p := resolver.DeriveProfile(probe, nil, "overlay", trace.readTrace(), cands)
+	if resolver.sharedMIME.err != nil {
+		return classificationFailed(resolver.sharedMIME.err)
+	}
 	p.Warnings = append(p.Warnings, credWarns...)
 	if _, warn := e.keyringDefault(evidence); warn != "" {
 		p.Warnings = append(p.Warnings, warn)
 	}
 
-	discard()
+	if derr := discard(); derr != nil {
+		return ProbeResult{}, derr
+	}
 	return ProbeResult{
 		Profile:               p,
 		Candidates:            cands,

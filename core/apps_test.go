@@ -86,6 +86,26 @@ func TestScanAppsFiltersAndNormalizes(t *testing.T) {
 	}
 }
 
+func TestDesktopEnglishSearchName(t *testing.T) {
+	t.Setenv("LANG", "zh_CN.UTF-8")
+	t.Setenv("LC_ALL", "zh_CN.UTF-8")
+	for _, tc := range []struct{ names, want string }{
+		{"Name=Original Editor\n", "Original Editor"},
+		{"Name=默认名称\nName[en_US]=American Editor\n", "American Editor"},
+		{"Name=默认名称\nName[en_US]=American Editor\nName[en]=English Editor\n", "English Editor"},
+		{"Name[en]= \n", ""},
+	} {
+		path := writeDesktop(t, t.TempDir(), "opaque-id.desktop", "[Desktop Entry]\nType=Application\nExec=/bin/true\nName[zh_CN]=中文编辑器\n"+tc.names)
+		a, err := parseDesktopFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if a.Name != "中文编辑器" || a.EnglishName != tc.want || a.Key != "opaque-id" {
+			t.Fatalf("display/search metadata: %+v", a)
+		}
+	}
+}
+
 func TestSanitizeAppKey(t *testing.T) {
 	// 真实机器上就有 "CC Switch.desktop"：直接拒绝会让这类应用从列表里消失。
 	cases := map[string]string{

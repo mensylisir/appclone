@@ -294,11 +294,7 @@ func unverifiedWhy(reason string) string {
 	return "未开启运行期审计，无法判定"
 }
 
-// required 区分"没有它产品起不来"和"没有它只是降级"。
-// fuse 本身不是必需（缺了可走 strace），但 fuse 与 strace 两者都不可用时
-// 该检查是 fail——那意味着**无法探测新应用**，--strict 应当红。只缺 fuse
-// 且 strace 在时是 warn，不触发退出码 3；"装了但挂载被拒"同样是 fail
-// （ADR-032：此时不会降级，用户必须修环境）。
+// FUSE 不可用时无法安全探测新应用，doctor --strict 必须失败（ADR-039）。
 // applyKeyringRequired：档案要求独立密钥环时，能力不足必须判 fail。运行时
 // 对 keyring-only 是硬失败（err.env.keyring_requires_bus / no_keyring_daemon），
 // doctor 若只给 warn，--strict 会放过一个必定起不来的分身。
@@ -410,14 +406,7 @@ func runChecks(a *app) []check {
 				// 写层根建不出来不是 fuse 的问题：别叫用户去装 fuse3。
 				add("fuse", "fail", "写层根目录不可写（/tmp 或 XDG_RUNTIME_DIR）：探测与审计都无法开始。请检查磁盘空间与目录权限")
 			case core.ProbeBackendKeyMissing(key):
-				// 静态检查漏看的那一半：fuse-overlayfs 与 /dev/fuse 都在，
-				// 但没有 fusermount3/fusermount。判据必须与 Probe 一致——
-				// 有 strace 时探测会降级，doctor 不能说"不可用"。
-				if core.ProbeFallsBackToStrace(mountErr) {
-					add("fuse", "warn", "fuse-overlayfs 在，但找不到 fusermount3/fusermount：探测将降级到 strace（覆盖不完整），装 fuse3 更稳妥")
-				} else {
-					add("fuse", "fail", "fuse-overlayfs 在，但找不到 fusermount3/fusermount，且缺少 strace：无法探测新应用")
-				}
+				add("fuse", "fail", "缺少 FUSE 挂载组件：无法安全探测新应用。请安装完整软件包并在普通桌面会话重试")
 			default:
 				// ADR-032：挂载被拒不是"降级"，探测根本无法开始。这里必须 fail
 				// （--strict 要红），并给出可操作指引，而不是说"可用"。
@@ -650,19 +639,14 @@ func orDefault(s, def string) string {
 
 var _ = context.Background
 
-// probeBackend 判定探测管线还能不能跑：有 fuse 走 overlay，没有则只能 strace 兜底。
-// 两者都没有时必须报 fail——此时 Probe 会直接报错，只报 warn 会让用户以为还能用。
-func probeBackend(fuseOK, devFuseOK, straceOK bool) (status, detail string) {
+// probeBackend requires an overlay even when strace is installed.
+func probeBackend(fuseOK, devFuseOK, _ bool) (status, detail string) {
 	switch {
 	case fuseOK && devFuseOK:
 		return "ok", ""
-	case fuseOK && straceOK:
-		return "warn", "fuse-overlayfs 在，但 /dev/fuse 打不开；探测将降级到 strace（克隆起步也会降级）"
 	case fuseOK:
-		return "fail", "fuse-overlayfs 在，但 /dev/fuse 打不开，且缺少 strace：无法探测新应用（已有档案仍可建普通分身；克隆起步会降级）"
-	case straceOK:
-		return "warn", "缺少 fuse-overlayfs：探测将降级到 strace，结果可能不完整（普通分身仍可运行；克隆起步不可用）"
+		return "fail", "打不开 /dev/fuse，无法安全探测新应用。请从普通桌面会话启动并检查 FUSE 权限；已有普通分身仍可运行"
 	default:
-		return "fail", "缺少 fuse-overlayfs 与 strace：无法探测新应用（已有档案仍可建普通分身；安装 strace 最稳妥，fuse-overlayfs 还需 /dev/fuse 可读写）"
+		return "fail", "缺少 fuse-overlayfs，无法安全探测新应用。请安装完整软件包；已有普通分身仍可运行"
 	}
 }

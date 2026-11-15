@@ -42,12 +42,19 @@ type ProbeFinalize struct {
 // 不变量）。调用方手工拼 ProbeResult 时两者若不一致，"零写入判定"与返回档案
 // 会各说各话。零写入时返回的 Profile 是零值，调用方在 err != nil 时不得使用它。
 func (e *Env) FinalizeProbe(app string, res ProbeResult, opt ProbeFinalize) (Profile, []Candidate, int, error) {
+	r := e.Resolver.withSharedMIME()
+	if r.sharedMIME.err != nil {
+		return Profile{}, nil, 0, r.sharedMIME.err
+	}
 	cands := res.Candidates
 	prefilled := 0
 	if opt.HasBundled {
-		extra := e.Resolver.PrefillCandidates(opt.Bundled, cands)
+		extra := r.PrefillCandidates(opt.Bundled, cands)
 		cands = append(cands, extra...)
 		prefilled = len(extra)
+	}
+	if r.sharedMIME.err != nil {
+		return Profile{}, nil, 0, r.sharedMIME.err
 	}
 
 	probe := res.Profile
@@ -65,7 +72,13 @@ func (e *Env) FinalizeProbe(app string, res ProbeResult, opt ProbeFinalize) (Pro
 	case opt.HasBundled:
 		base = &opt.Bundled
 	}
-	p := e.Resolver.DeriveProfile(probe, base, method, res.ReadTrace, cands)
+	p := r.DeriveProfile(probe, base, method, res.ReadTrace, cands)
+	if r.sharedMIME.err != nil {
+		return Profile{}, nil, 0, r.sharedMIME.err
+	}
+	if err := validateSharedPathConflicts(p, e.BuildOptions()); err != nil {
+		return Profile{}, cands, prefilled, err
+	}
 	// 重探没有拿到新的 exec 证据时，exec_args 只能沿用旧档案；来源不可区分，
 	// 必须告警让用户知道“这次没有重新识别启动参数”（ADR-036）。
 	if opt.HasExisting && sameExecPath(opt.Existing.Exec, p.Exec) &&

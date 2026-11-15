@@ -74,9 +74,9 @@ func TestProbeBackend(t *testing.T) {
 	}{
 		{true, true, false, "ok"},
 		{true, true, true, "ok"},
-		{true, false, true, "warn"},
-		{false, false, true, "warn"},
-		{false, true, true, "warn"},
+		{true, false, true, "fail"},
+		{false, false, true, "fail"},
+		{false, true, true, "fail"},
 		{false, true, false, "fail"},
 		{true, false, false, "fail"},
 		{false, false, false, "fail"},

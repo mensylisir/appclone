@@ -12,9 +12,10 @@ import (
 	"github.com/BurntSushi/toml"
 )
 
-// ProfileVersion 是当前档案 schema 版本（§5.5）。读到更大的版本必须拒绝，
-// 猜新字段语义 = 用旧代码解释新数据，最坏情况是把该隔离的路径漏掉。
+// ProfileVersion remains the default for ordinary profiles. Schema 2 requires
+// fixed fork snapshots; older binaries must refuse these profiles.
 const ProfileVersion = 1
+const MaxProfileVersion = 2
 
 // ReadTrace 的四种状态（ADR-034 §4.5）。"" 是旧档案（本版本之前生成）。
 const (
@@ -90,7 +91,7 @@ type Instance struct {
 	LastUsedAt  *time.Time
 	ProbeMethod string
 	Root        string // instances/<app>/<id>/root 的绝对路径
-	// Fork 表示这个分身"克隆起步"：run 时把主实例的真实数据目录作为只读
+	// Fork 表示这个分身"克隆起步"：首次 run 准备实例私有的固定副本作为只读
 	// lower，实例 root 作为持久 upper（§8.1）。创建后不可切换——它描述的是
 	// 数据层从哪来，不是每次运行的开关。
 	Fork bool
@@ -202,6 +203,9 @@ func (e *Env) ProfilePath(app string) string {
 
 // InstancePath 返回某个实例目录。
 func (e *Env) InstancePath(app, id string) string {
+	if e.forkRun != nil && app == e.forkRun.app && id == e.forkRun.id {
+		return e.forkRun.instance.canonical
+	}
 	return filepath.Join(e.Base, "instances", app, id)
 }
 
@@ -249,9 +253,9 @@ func parseProfile(app, path string, data []byte) (Profile, error) {
 	if err := decodeKnown(md, prims, &w); err != nil {
 		return p, newErr(CodeInput, "err.profile.parse", map[string]any{"path": path}, err)
 	}
-	if w.Version > ProfileVersion {
+	if w.Version > MaxProfileVersion {
 		return p, errInput("err.profile.version_ahead", map[string]any{
-			"app": app, "version": w.Version, "current": ProfileVersion,
+			"app": app, "version": w.Version, "current": MaxProfileVersion,
 		})
 	}
 	if w.Version < ProfileVersion {
@@ -308,37 +312,7 @@ func parseProfile(app, path string, data []byte) (Profile, error) {
 // 顺序：同目录 tmp → Sync → Rename（§4.2）。中途崩溃只留一个 tmp 文件，
 // 不会出现"半份档案"让下次解析失败。
 func (e *Env) SaveProfile(p Profile) error {
-	if p.Version == 0 {
-		p.Version = ProfileVersion
-	}
-	e.normalizeKeyring(&p)
-	w := profileWire{
-		Version:         p.Version,
-		Exec:            p.Exec,
-		ExecArgs:        p.ExecArgs,
-		Paths:           p.Paths,
-		SharedWrites:    p.SharedWrites,
-		LockFiles:       p.LockFiles,
-		Sockets:         p.Sockets,
-		IsolateDBus:     p.IsolateDBus,
-		IsolateRuntime:  p.IsolateRuntime,
-		IsolateKeyring:  keyringWire(p),
-		Env:             p.Env,
-		Cwd:             p.Cwd,
-		ProbeMethod:     p.ProbeMethod,
-		ReadTrace:       p.ReadTrace,
-		CredentialPaths: p.CredentialPaths,
-		Audit:           p.Audit,
-		Ignored:         ignoredWire(p.Ignored),
-	}
-	for _, b := range p.ExtraBinds {
-		w.ExtraBinds = append(w.ExtraBinds, b.Src+"|"+b.Dst)
-	}
-	for _, u := range p.Unsupported {
-		w.Unsupported = append(w.Unsupported, unsupportedWire(u))
-	}
-
-	data, err := encodeProfileOf(w, p.Unknown)
+	data, err := e.encodeProfile(p)
 	if err != nil {
 		return err
 	}
@@ -412,6 +386,9 @@ func (e *Env) normalizeKeyring(p *Profile) {
 // encodeProfile 是 CreateInstance 事务的前半段：它要拿到字节写进临时文件，
 // 由提交点的 rename 决定是否真的落盘，所以不能直接调 SaveProfile。
 func (e *Env) encodeProfile(p Profile) ([]byte, error) {
+	if err := e.preserveProfileVersion(&p); err != nil {
+		return nil, err
+	}
 	e.normalizeKeyring(&p)
 	w := profileWire{
 		Version:         p.Version,

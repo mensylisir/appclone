@@ -16,6 +16,8 @@ type PathResolver struct {
 	Home     string            // 有效 HOME：AC_HOME 或 RealHome
 	XDG      map[string]string // 已补默认值的 XDG 变量（键名不带 XDG_ 前缀的大写形式，如 "CONFIG_HOME"）
 	UID      int
+	// Only synchronous classification operations own this copy-local state.
+	sharedMIME *sharedMIMEPaths
 }
 
 // xdgKeys 是允许在路径里出现的变量名。只认这些键是刻意的：

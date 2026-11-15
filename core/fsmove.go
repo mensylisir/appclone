@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"maps"
 	"os"
 	"path/filepath"
 	"syscall"
@@ -12,72 +13,254 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// moveRename 是 os.Rename 的间接层：单测无法真的制造 EXDEV，只能替换它
-// 来走跨设备回退。生产路径永远指向 os.Rename。
-var moveRename = os.Rename
+// Hooks inject faults in synthetic tests; production uses confined I/O.
+var moveRename func(string, string) error
+var removeChmod func(string, os.FileMode) error
+var moveTestHook func(string)
 
-// moveDir 把整个目录搬到 dst。同文件系统用 rename；跨文件系统（EXDEV）退化为
-// 拷贝 + 删除源。
-//
-// 为什么不能只写 os.Rename：审计写层在 /tmp（ADR-033），实例目录在 $HOME，
-// 而 /home 独立分区是普通桌面配置。rename 跨设备直接 EXDEV，leak 结论就永远
-// 落不了地——证据还在，但每次 verify 都报错。
-//
-// **拷贝完成前绝不动源**：搬的是可能属于用户的文件。拷贝中途失败时只回收
-// dst 这个刚写出的半成品，源原样留着。拷贝 + fsync 都成功后才会删源；删源
-// 失败（子目录 0555 之类）不代表证据丢了——dst 已是完整副本，返回
-// *dstCompleteError 让调用方按"已搬走"处理，别把用户引向残缺的另一份。
-// dst 已存在直接失败：绝不先删一个我们没建过的目录——那可能是别人正在用的证据。
+func renameDirNoReplace(source *overlayScene, dst *copyDestination) error {
+	if err := source.checkUnmounted(); err != nil {
+		return err
+	}
+	if err := dst.check(); err != nil {
+		return err
+	}
+	if moveRename != nil {
+		return moveRename(source.path, dst.path)
+	}
+	af, err := source.parent.Open(".")
+	if err != nil {
+		return err
+	}
+	defer af.Close()
+	bf, err := dst.parent.Open(".")
+	if err != nil {
+		return err
+	}
+	defer bf.Close()
+	return unix.Renameat2(int(af.Fd()), source.name, int(bf.Fd()), dst.name, unix.RENAME_NOREPLACE)
+}
+
+type copyDestination struct {
+	lexical, path, parentPath, name string
+	parent                          *os.Root
+	ancestors                       map[string]string
+}
+
+func openCopyDestination(path string) (*copyDestination, error) {
+	table, err := checkedMountTable()
+	if err != nil {
+		return nil, sceneError(path, err)
+	}
+	canonical, err := ordinaryPath(table, path, false)
+	if err != nil || table[path] != "" || table[canonical] != "" {
+		return nil, sceneError(path, errors.New("invalid evidence destination"))
+	}
+	d := &copyDestination{lexical: path, path: canonical, parentPath: filepath.Dir(canonical), name: filepath.Base(canonical)}
+	d.ancestors = mountAncestry(table, path, canonical)
+	d.parent, err = openForkRoot(d.parentPath)
+	if err != nil {
+		return nil, err
+	}
+	if err := d.check(); err != nil {
+		d.parent.Close()
+		return nil, err
+	}
+	return d, nil
+}
+
+func (d *copyDestination) check() error {
+	table, err := checkedMountTable()
+	if err != nil {
+		return sceneError(d.lexical, err)
+	}
+	if !maps.Equal(d.ancestors, mountAncestry(table, d.lexical, d.path)) {
+		return sceneError(d.lexical, errors.New("destination ancestor mount changed"))
+	}
+	for point := range table {
+		if IsUnder(d.path, point) {
+			return sceneError(d.lexical, errors.New("destination contains a mount"))
+		}
+	}
+	canonical, err := ordinaryPath(table, d.lexical, false)
+	if err != nil || canonical != d.path {
+		return sceneError(d.lexical, errors.New("destination alias changed"))
+	}
+	if err := checkedRootPath(d.parent, d.parentPath); err != nil {
+		return sceneError(d.lexical, err)
+	}
+	return nil
+}
+
+func (d *copyDestination) create() (*overlayScene, error) {
+	if err := d.check(); err != nil {
+		return nil, err
+	}
+	if err := d.parent.Mkdir(d.name, 0o700); err != nil {
+		return nil, err
+	}
+	created, err := d.parent.Lstat(d.name)
+	if err != nil {
+		return nil, err
+	}
+	if err := d.check(); err != nil {
+		return nil, err
+	}
+	scene, err := openOverlayScene(d.lexical)
+	if err != nil {
+		return nil, err
+	}
+	if scene.info == nil || !os.SameFile(created, scene.info) {
+		scene.close()
+		return nil, sceneError(d.lexical, errors.New("new destination changed"))
+	}
+	return scene, nil
+}
+
 func moveDir(src, dst string) error {
-	if _, err := os.Lstat(dst); err == nil {
+	scene, err := openOverlayScene(src)
+	if err != nil {
+		return err
+	}
+	defer scene.close()
+	return moveSceneDir(scene, scene, dst)
+}
+
+// scene covers the entire overlay tree even when only upper is moved.
+// Safety failures cannot be turned into a successful evidence move.
+func moveSceneDir(scene, source *overlayScene, dst string) error {
+	if err := scene.checkUnmounted(); err != nil {
+		return err
+	}
+	if source.absent {
+		return os.ErrNotExist
+	}
+	if !IsUnder(scene.path, source.path) {
+		return sceneError(source.lexical, errors.New("source is outside its scene"))
+	}
+	if err := source.checkUnmounted(); err != nil {
+		return err
+	}
+	destination, err := openCopyDestination(dst)
+	if err != nil {
+		return err
+	}
+	defer destination.parent.Close()
+	if _, err := destination.parent.Lstat(destination.name); err == nil {
 		return fmt.Errorf("moveDir: destination exists: %s", dst)
 	} else if !os.IsNotExist(err) {
 		return err
 	}
-	if err := moveRename(src, dst); err == nil {
+	if err := scene.checkUnmounted(); err != nil {
+		return err
+	}
+	if err := renameDirNoReplace(source, destination); err == nil {
+		source.absent = true
 		return nil
 	} else if !errors.Is(err, syscall.EXDEV) {
 		return err
 	}
-	if err := copyTree(src, dst); err != nil {
-		_ = os.RemoveAll(dst)
+	if err := scene.checkUnmounted(); err != nil {
 		return err
 	}
-	// 目录项也要落盘：只 fsync 文件内容时，断电窗口里可能出现"源已删、
-	// 目标目录项还没写下去"——那是真的丢证据。sync 失败时源仍在，回收 dst 重试。
-	if err := syncTree(dst); err != nil {
-		_ = os.RemoveAll(dst)
+	if err := source.checkUnmounted(); err != nil {
 		return err
 	}
-	if err := os.RemoveAll(src); err != nil {
-		// 常见原因是应用自己把子目录改成 0555：我们对副本有完整控制权，
-		// 先在源树上补写权限再删一次。仍删不掉才交给调用方按"已搬走"处理。
-		if werr := makeWritableAndRemove(src); werr == nil {
+	target, err := destination.create()
+	if err != nil {
+		return err
+	}
+	defer target.close()
+	check := func() error {
+		if err := scene.checkUnmounted(); err != nil {
+			return err
+		}
+		if err := source.checkUnmounted(); err != nil {
+			return err
+		}
+		return target.checkUnmounted()
+	}
+	discardTarget := func(cause error) error {
+		if err := check(); err != nil {
+			return err
+		}
+		if err := target.remove("."); err != nil {
+			return err
+		}
+		return cause
+	}
+	if err := check(); err != nil {
+		return discardTarget(err)
+	}
+	if err := copyRootTree(source.root, target.root); err != nil {
+		if moveTestHook != nil {
+			moveTestHook("copy-failed")
+		}
+		return discardTarget(err)
+	}
+	if err := syncRootTree(target.root); err != nil {
+		return discardTarget(err)
+	}
+	if moveTestHook != nil {
+		moveTestHook("after-copy")
+	}
+	if err := check(); err != nil {
+		return err
+	}
+	if err := source.remove("."); err != nil {
+		if checkErr := check(); checkErr != nil {
+			return checkErr
+		}
+		if werr := makeSceneWritableAndRemove(scene, source); werr == nil {
 			return nil
+		}
+		if checkErr := check(); checkErr != nil {
+			return checkErr
 		}
 		return &dstCompleteError{dst: dst, err: err}
 	}
 	return nil
 }
 
-// removeChmod 只为单测替换：制造"连 chmod 都不允许"的源，验证 dstComplete 分支。
-var removeChmod = os.Chmod
+func createCopyScene(dst string) (*overlayScene, error) {
+	destination, err := openCopyDestination(dst)
+	if err != nil {
+		return nil, err
+	}
+	defer destination.parent.Close()
+	return destination.create()
+}
 
-func makeWritableAndRemove(root string) error {
-	_ = filepath.WalkDir(root, func(p string, d fs.DirEntry, werr error) error {
-		if werr != nil {
-			return nil // 读不到的条目照样尝试 chmod：父目录先放权就可能读到
+func makeSceneWritableAndRemove(scene, source *overlayScene) error {
+	if err := scene.checkUnmounted(); err != nil {
+		return err
+	}
+	if err := source.checkUnmounted(); err != nil {
+		return err
+	}
+	if source.absent {
+		return nil
+	}
+	_ = fs.WalkDir(source.root.FS(), ".", func(path string, d fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return nil
 		}
 		if d.IsDir() {
-			_ = removeChmod(p, 0o700)
+			if removeChmod != nil {
+				if err := removeChmod(filepath.Join(source.path, path), 0o700); err != nil {
+					return nil
+				}
+			}
+			_ = source.root.Chmod(path, 0o700)
 		}
 		return nil
 	})
-	return os.RemoveAll(root)
+	if err := scene.checkUnmounted(); err != nil {
+		return err
+	}
+	return source.remove(".")
 }
 
-// dstCompleteError 表示"副本已完整落盘，只是源没删干净"。它不是搬迁失败：
-// 调用方必须按成功处理（证据在 dst），残留的源交给下一次 sweep。
 type dstCompleteError struct {
 	dst string
 	err error
@@ -86,103 +269,112 @@ type dstCompleteError struct {
 func (e *dstCompleteError) Error() string {
 	return fmt.Sprintf("moveDir: destination complete (%s), source not fully removed: %v", e.dst, e.err)
 }
-
 func (e *dstCompleteError) Unwrap() error { return e.err }
+func dstComplete(err error) bool          { var dc *dstCompleteError; return errors.As(err, &dc) }
 
-// dstComplete 判断 moveDir 的返回值是否只是"源删不干净"。
-func dstComplete(err error) bool {
-	var dc *dstCompleteError
-	return errors.As(err, &dc)
+// Standalone copy leaves source removal to its caller.
+func copyTree(src, dst string) error {
+	source, err := openOverlayScene(src)
+	if err != nil {
+		return err
+	}
+	defer source.close()
+	if source.absent {
+		return os.ErrNotExist
+	}
+	if err := source.checkUnmounted(); err != nil {
+		return err
+	}
+	target, err := createCopyScene(dst)
+	if err != nil {
+		return err
+	}
+	defer target.close()
+	if err := target.checkUnmounted(); err != nil {
+		return err
+	}
+	return copyRootTree(source.root, target.root)
 }
 
-// copyTree 递归拷贝目录，保留普通文件内容与权限、保留软链。
-//
-// overlay 的 whiteout 标记（字符设备 0,0）无法在非特权下重建，也不是用户数据：
-// 直接跳过。它们只表示"某个路径被删过"，不承载任何可恢复内容。
-func copyTree(src, dst string) error {
-	return filepath.WalkDir(src, func(path string, d fs.DirEntry, werr error) error {
-		if werr != nil {
-			return werr
+func copyRootTree(src, dst *os.Root) error {
+	return fs.WalkDir(src.FS(), ".", func(path string, d fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
 		}
-		rel, err := filepath.Rel(src, path)
-		if err != nil {
+		if err := forkNoSymlinks(src, filepath.Dir(path)); err != nil {
 			return err
 		}
-		target := filepath.Join(dst, rel)
 		switch {
 		case d.IsDir():
-			return os.MkdirAll(target, 0o700)
+			return forkMkdirAll(dst, path)
 		case d.Type()&fs.ModeSymlink != 0:
-			link, lerr := os.Readlink(path)
-			if lerr != nil {
-				return lerr
+			link, err := src.Readlink(path)
+			if err != nil {
+				return err
 			}
-			return os.Symlink(link, target)
+			return dst.Symlink(link, path)
 		case d.Type().IsRegular():
-			return copyFile(path, target)
+			return copyRootFile(src, dst, path)
 		default:
-			// 设备/管道/socket：不是用户文件，跳过。
-			return nil
+			return nil // Whiteouts/devices/FIFOs/socket entries carry no file content.
 		}
 	})
 }
 
-func copyFile(src, dst string) error {
-	info, err := os.Stat(src)
-	if err != nil {
-		return err
-	}
-	// O_NOFOLLOW/O_NONBLOCK：WalkDir 判定普通文件与真正打开之间有窗口，
-	// 同 uid 进程把它换成 FIFO 时，裸 Open 会永久阻塞（"禁止死等"）。
-	in, err := os.OpenFile(src, os.O_RDONLY|unix.O_NOFOLLOW|unix.O_NONBLOCK, 0)
+func copyRootFile(src, dst *os.Root, path string) error {
+	in, err := src.OpenFile(path, os.O_RDONLY|unix.O_NOFOLLOW|unix.O_NONBLOCK, 0)
 	if err != nil {
 		return err
 	}
 	defer in.Close()
-	out, err := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_EXCL, info.Mode().Perm())
+	info, err := in.Stat()
 	if err != nil {
 		return err
 	}
-	if _, err := io.Copy(out, in); err != nil {
-		out.Close()
+	if !info.Mode().IsRegular() {
+		return errors.New("evidence file changed type")
+	}
+	out, err := dst.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY|unix.O_NOFOLLOW, info.Mode().Perm())
+	if err != nil {
 		return err
 	}
-	// 证据要能挺过断电：先落盘再删源，否则崩溃窗口里两边都没有。
+	defer out.Close()
+	if _, err := io.Copy(out, in); err != nil {
+		return err
+	}
 	if err := out.Sync(); err != nil {
-		out.Close()
 		return err
 	}
 	return out.Close()
 }
 
-// syncTree 把目录树里每个目录项本身落盘（文件内容在 copyFile 里已 fsync）。
-func syncTree(root string) error {
-	return filepath.WalkDir(root, func(path string, d fs.DirEntry, werr error) error {
-		if werr != nil {
-			return werr
+func syncRootTree(root *os.Root) error {
+	return fs.WalkDir(root.FS(), ".", func(path string, d fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
 		}
 		if !d.IsDir() {
 			return nil
 		}
-		f, err := os.Open(path)
-		if err != nil {
+		if err := forkNoSymlinks(root, path); err != nil {
 			return err
 		}
-		ferr := f.Sync()
-		cerr := f.Close()
-		if ferr != nil {
-			return ferr
-		}
-		return cerr
+		return forkSyncDir(root, path)
 	})
 }
 
-// removeAuditWork 清掉审计的临时层（work/merged）。upper 还在就不动：
-// 那是证据，删不删由 verify 的结论决定。
-func (e *Env) removeAuditWork(app, id string) {
-	work := e.AuditWorkDir(app, id)
-	if _, err := os.Stat(filepath.Join(work, "upper")); err == nil {
-		return
+// Permission/read errors do not establish that upper is absent.
+func removeAuditScene(scene *overlayScene) error {
+	if err := scene.checkUnmounted(); err != nil {
+		return err
 	}
-	_ = os.RemoveAll(work)
+	if scene.absent {
+		return nil
+	}
+	if _, err := scene.root.Lstat("upper"); err == nil {
+		return nil
+	} else if !os.IsNotExist(err) {
+		return sceneError(scene.path, err)
+	}
+	return scene.remove(".")
 }

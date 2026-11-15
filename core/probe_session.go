@@ -2,6 +2,7 @@ package core
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"os"
 	"os/exec"
@@ -18,10 +19,14 @@ type SessionRunner interface {
 
 // SessionResult 是一次会话的结束方式。
 type SessionResult struct {
-	ExitCode int
-	Signaled bool
-	Started  bool // cmd.Start 成功即 true，与读追踪能力无关
-	Elapsed  time.Duration
+	ExitCode     int
+	Signaled     bool
+	Started      bool // cmd.Start 成功即 true，与读追踪能力无关
+	Elapsed      time.Duration
+	ManualFinish bool
+	Unreaped     bool // caller must retain the mounted scene
+	Process      SessionProcess
+	Reaped       <-chan struct{}
 }
 
 // probeRuntimeSocks 把宿主 socket 重新指向私有 runtime 里的同名路径。
@@ -53,63 +58,132 @@ func probeRuntimeSocks(hostRuntime, probeRuntime string) []BindPair {
 // 同一份实现（同样的最小 busconfig、同样的生命周期），避免两份实现分叉后
 // 探测能跑、运行跑不起来。
 
-// setsidRunner 起独立会话并跑会话命令；退出时对**整个进程组**发信号。
-//
-// `--die-with-parent` 只管直接子进程：应用自己 fork+setsid 出去的后代不继承
-// death signal（bwrap 0.13.1 实测），所以主保证是 pgid kill，flag 只是兜底。
-type setsidRunner struct{}
+// StartAwareSessionRunner calls started only after cmd.Start and group ownership
+// checks succeed. An observer error aborts and reaps the session before return.
+type StartAwareSessionRunner interface {
+	RunWithStart(context.Context, []string, io.Writer, func(SessionProcess) error) (SessionResult, error)
+}
 
-func (setsidRunner) Run(ctx context.Context, argv []string, stderr io.Writer) (SessionResult, error) {
+type setsidRunner struct {
+	grace, waitLimit time.Duration
+	identify         func(int, int) (SessionProcess, error) // fault injection for ownership checks
+}
+
+func (r setsidRunner) Run(ctx context.Context, argv []string, stderr io.Writer) (SessionResult, error) {
+	return r.RunWithStart(ctx, argv, stderr, nil)
+}
+
+func (r setsidRunner) RunWithStart(ctx context.Context, argv []string, stderr io.Writer, started func(SessionProcess) error) (SessionResult, error) {
 	if len(argv) == 0 {
 		return SessionResult{}, errInput("err.probe.no_command", nil)
 	}
 	if err := ctx.Err(); err != nil {
-		// 准备阶段（起 dbus、等锁）期间被取消：不要再把应用拉起来闪一下，
-		// 那既产生意外写入，也要多等一次 kill。
 		return SessionResult{}, err
+	}
+	grace, limit := r.grace, r.waitLimit
+	if grace == 0 {
+		grace = 3 * time.Second
+	}
+	if limit == 0 {
+		limit = 2 * time.Second
 	}
 	start := time.Now()
 	cmd := exec.Command(argv[0], argv[1:]...)
-	cmd.Stdin = nil
-	cmd.Stdout = nil
 	cmd.Stderr = stderr
 	if cmd.Stderr == nil {
 		cmd.Stderr = os.Stderr
 	}
+	cmd.WaitDelay = limit // inherited stderr pipes must not make Wait unbounded
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true, Pdeathsig: syscall.SIGTERM}
 	if err := cmd.Start(); err != nil {
 		return SessionResult{}, errEnv("err.probe.start_failed", map[string]any{"exec": argv[0]}, err)
 	}
-	pgid, err := syscall.Getpgid(cmd.Process.Pid)
-	if err != nil || pgid != cmd.Process.Pid {
-		// setsid 失败或读早了会拿到调用者自己的 pgid，`kill(-pgid)` 会把终端
-		// 整个会话杀掉（灾难级误杀）。断言不过只杀单进程。
-		_ = cmd.Process.Kill()
-		_, _ = cmd.Process.Wait()
-		return SessionResult{}, errEnv("err.probe.setsid_failed", map[string]any{"exec": argv[0]}, err)
+	done, reaped := make(chan error, 1), make(chan struct{})
+
+	res := SessionResult{Started: true, Reaped: reaped}
+	pgid, gerr := syscall.Getpgid(cmd.Process.Pid)
+	identify := r.identify
+	if identify == nil {
+		identify = identifySessionProcess
 	}
-	done := make(chan error, 1)
-	go func() { done <- cmd.Wait() }()
-	select {
-	case <-ctx.Done():
-		terminateGroup(cmd.Process.Pid)
-		<-done
-		return SessionResult{Started: true, Elapsed: time.Since(start)}, ctx.Err()
-	case err := <-done:
-		terminateGroup(cmd.Process.Pid) // 收掉应用 fork 出去的后代
-		res := SessionResult{Started: true, Elapsed: time.Since(start)}
-		if ee, ok := err.(*exec.ExitError); ok {
-			if ws, ok := ee.Sys().(syscall.WaitStatus); ok && ws.Signaled() {
-				res.Signaled = true
-				res.ExitCode = 128 + int(ws.Signal())
-				return res, nil
-			}
-			res.ExitCode = ee.ExitCode()
-			return res, nil
+	process, perr := identify(cmd.Process.Pid, pgid)
+	go func() { err := cmd.Wait(); close(reaped); done <- err }()
+	// A very short process may already have exited. It cannot expose a Finish token.
+	// Wait still owns reaping. Never signal a group whose ownership wasn't checked.
+	if gerr != nil || pgid != cmd.Process.Pid || perr != nil {
+		res.Unreaped = true // the direct child exiting does not prove descendants are gone
+		if perr != nil {
+			gerr = perr
+		} else if gerr == nil {
+			gerr = fmt.Errorf("process group %d does not match session leader %d", pgid, cmd.Process.Pid)
 		}
-		if err != nil {
-			return res, err
+		_ = cmd.Process.Kill()
+		timer := time.NewTimer(limit)
+		defer timer.Stop()
+		select {
+		case <-reaped:
+		case <-timer.C:
+			res.Unreaped = true
+		}
+		res.Elapsed = time.Since(start)
+		return res, errEnv("err.probe.setsid_failed", map[string]any{"exec": argv[0]}, gerr)
+	}
+	res.Process = process
+	var observeErr error
+	if started != nil {
+		observeErr = started(process)
+	}
+	var waitErr error
+	waited := false
+	if observeErr == nil {
+		select {
+		case <-ctx.Done():
+		case waitErr = <-done:
+			waited = true
+		}
+	}
+	// Stop all remaining descendants even when the direct process exited normally.
+	_ = syscall.Kill(-pgid, syscall.SIGTERM)
+	deadline := time.Now().Add(grace)
+	for !sessionGroupGone(pgid) && time.Now().Before(deadline) {
+		time.Sleep(20 * time.Millisecond)
+	}
+	if !sessionGroupGone(pgid) {
+		_ = syscall.Kill(-pgid, syscall.SIGKILL)
+	}
+	deadline = time.Now().Add(limit)
+	for {
+		if !waited {
+			select {
+			case waitErr = <-done:
+				waited = true
+			default:
+			}
+		}
+		if waited && sessionGroupGone(pgid) {
+			break
+		}
+		if time.Now().After(deadline) {
+			res.Unreaped = true
+			res.Elapsed = time.Since(start)
+			return res, errEnv("err.probe.session_unreaped", nil, ctx.Err())
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	res.Elapsed = time.Since(start)
+	if observeErr != nil {
+		return res, observeErr
+	}
+	if ctx.Err() != nil {
+		return res, ctx.Err()
+	}
+	if ee, ok := waitErr.(*exec.ExitError); ok {
+		res.ExitCode = ee.ExitCode()
+		if ws, ok := ee.Sys().(syscall.WaitStatus); ok && ws.Signaled() {
+			res.Signaled = true
+			res.ExitCode = 128 + int(ws.Signal())
 		}
 		return res, nil
 	}
+	return res, waitErr
 }

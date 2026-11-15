@@ -16,12 +16,13 @@ import (
 // detailView 是屏 2：实例列表 + 只读档案信息。运行中的实例禁止启动/删除，
 // 与 CLI `rm` 的退出码 7 同源——界面不能比命令行更宽松。
 type detailView struct {
-	u       *ui
-	appKey  string
-	page    *adw.NavigationPage
-	content *adw.PreferencesPage
-	insts   []core.Instance
-	running map[string]bool
+	u         *ui
+	appKey    string
+	page      *adw.NavigationPage
+	content   *adw.PreferencesPage
+	insts     []core.Instance
+	running   map[string]bool
+	preparing map[string]bool
 	// stopping 记录"用户已经点过停止"的实例：runner 收尾时 launch 的 wait
 	// goroutine 也会回来，此时不该再报一条「已退出」把「已停止」顶掉。
 	stopping map[string]bool
@@ -57,6 +58,7 @@ type detailData struct {
 	profileErr error
 	insts      []core.Instance
 	running    map[string]bool
+	preparing  map[string]bool
 	audits     []auditEntry
 }
 
@@ -103,6 +105,9 @@ func (u *ui) pushDetail(appKey string) {
 // popped 在详情页离开导航栈后收尾：注销处理器、清掉指针。没有这一步，
 // 后台的 rename/remove 结果回来时会往一个已经不在屏幕上的页面写。
 func (v *detailView) popped() {
+	if v.u.closed {
+		return
+	}
 	if v.scope != nil {
 		v.scope.close()
 	}
@@ -113,6 +118,26 @@ func (v *detailView) popped() {
 		v.u.activeDetail = nil
 	}
 	v.u.releasePage(v.page)
+}
+
+// abandon shuts a detail page down when the window is destroyed without a pop:
+// close its scopes and forget the page, but do not releasePage (the window owns
+// the widget tree) and do not touch the navigation view.
+func (v *detailView) abandon() {
+	if v.scope != nil {
+		v.scope.close()
+		v.scope = nil
+	}
+	if v.fixed != nil {
+		v.fixed.close()
+		v.fixed = nil
+	}
+	if v.page != nil {
+		delete(v.u.pages, v.page.GoPointer())
+	}
+	if v.u.activeDetail == v {
+		v.u.activeDetail = nil
+	}
 }
 
 func (u *ui) nameOf(key string) string {
@@ -132,6 +157,9 @@ func (v *detailView) render() { v.load(true) }
 func (v *detailView) refresh() { v.load(false) }
 
 func (v *detailView) load(force bool) {
+	if v.u.closed {
+		return
+	}
 	if v.refreshing {
 		v.pending = true
 		v.pendingForce = v.pendingForce || force
@@ -147,9 +175,11 @@ func (v *detailView) load(force bool) {
 		if d.profileErr == nil {
 			d.insts, _ = v.u.env.ListInstances(key)
 			d.running = map[string]bool{}
+			d.preparing = map[string]bool{}
 			for _, in := range d.insts {
 				if running, _ := v.u.env.IsRunning(key, in.ID); running {
 					d.running[in.ID] = true
+					d.preparing[in.ID] = v.u.env.IsPreparing(key, in.ID)
 				}
 				if c, reason, at, ok := v.u.env.CachedAuditVerdict(key, in.ID); ok {
 					d.audits = append(d.audits, auditEntry{conclusion: c, reason: reason, at: at})
@@ -157,6 +187,9 @@ func (v *detailView) load(force bool) {
 			}
 		}
 		v.u.goIdle(func(uintptr) bool {
+			if v.u.closed {
+				return false
+			}
 			v.refreshing = false
 			force := force || v.pendingForce
 			v.pendingForce = false
@@ -200,6 +233,7 @@ func (v *detailView) apply(d detailData, force bool) {
 	}
 	v.insts = d.insts
 	v.running = d.running
+	v.preparing = d.preparing
 	v.audits = d.audits
 	sig := d.sig()
 	if !force && v.loaded && sig == v.sig {
@@ -213,7 +247,7 @@ func (v *detailView) apply(d detailData, force bool) {
 func (d detailData) sig() string {
 	var b strings.Builder
 	for _, in := range d.insts {
-		fmt.Fprintf(&b, "%s|%s|%t;", in.ID, in.DisplayName, d.running[in.ID])
+		fmt.Fprintf(&b, "%s|%s|%t|%t;", in.ID, in.DisplayName, d.running[in.ID], d.preparing[in.ID])
 	}
 	for _, a := range d.audits {
 		fmt.Fprintf(&b, "%s|%s|%s;", a.conclusion, a.reason, a.at)
@@ -324,6 +358,9 @@ func (v *detailView) build() {
 		state := v.u.tr("ui.instance.stopped", nil)
 		if running {
 			state = v.u.tr("ui.instance.running", nil)
+			if v.preparing[in.ID] {
+				state = v.u.tr("ui.instance.preparing", nil)
+			}
 		}
 		sub := state
 		if in.LastUsedAt != nil {
@@ -526,7 +563,11 @@ func (v *detailView) build() {
 				sl = append(sl, v.u.allocText(abs))
 			}
 		}
-		sh.SetSubtitle(v.u.tr("ui.detail.shared.subtitle", map[string]any{"list": strings.Join(sl, " · ")}))
+		subtitle := v.u.tr("ui.detail.shared.subtitle", map[string]any{"list": strings.Join(sl, " · ")})
+		if v.u.env.Resolver.HasSharedCertificates(p) {
+			subtitle += " " + v.u.tr("ui.shared.certificates", nil)
+		}
+		sh.SetSubtitle(subtitle)
 		sh.SetSubtitleLines(0)
 		v.prefix(sh, "folder-publicshare-symbolic")
 		sh.SetSensitive(false)
@@ -673,28 +714,26 @@ func (v *detailView) launch(in core.Instance) {
 	}
 	v.u.toastMsg(v.u.tr("ui.toast.launching", map[string]any{"name": in.DisplayName}))
 	go func() {
-		start := time.Now()
 		werr := wait()
-		// 2 秒内就退出的 runner 几乎一定是启动失败（bwrap 缺失、实例已在
-		// 运行、档案坏了）；跑起来的应用不会这么快退出，晚退出的报"已退出"。
-		v.notifyRunEnded(in, werr, time.Since(start) < 2*time.Second, logPath, logOffset)
+		// Preparing a large snapshot can fail well after two seconds.
+		v.notifyRunEnded(in, werr, logPath, logOffset)
 	}()
 }
 
 // notifyRunEnded 只在主循环里改界面：runner 的退出可能发生在页面已经
 // pop 掉之后，此时只刷新列表，不往旧页面写。
-func (v *detailView) notifyRunEnded(in core.Instance, werr error, early bool, logPath string, logOffset int64) {
+func (v *detailView) notifyRunEnded(in core.Instance, werr error, logPath string, logOffset int64) {
 	v.u.goIdle(func(uintptr) bool {
 		if v.stopping[in.ID] {
 			// 用户点的停止：结果由 stop() 自己报（成功「已停止」/失败错误），
 			// 这里再报「已退出」既与交互基线不符，也会把真正的通知顶掉。
 			delete(v.stopping, in.ID)
-		} else if werr != nil && early {
+		} else if werr != nil {
 			reason := lastLogLine(logPath, logOffset)
 			if reason == "" {
-				reason = v.u.tr("ui.toast.launch_failed.generic", nil)
+				reason = v.u.tr("ui.toast.run_failed.generic", nil)
 			}
-			v.u.toastMsg(v.u.tr("ui.toast.launch_failed", map[string]any{"reason": reason}))
+			v.u.toastMsg(v.u.tr("ui.toast.run_failed", map[string]any{"reason": reason}))
 		} else {
 			v.u.toastMsg(v.u.tr("ui.toast.instance_exited", map[string]any{"name": in.DisplayName}))
 		}
@@ -723,12 +762,18 @@ func (v *detailView) stop(in core.Instance) {
 		// goroutine 回来时要知道这条「已退出」是用户自己点出来的。
 		v.stopping[in.ID] = true
 		v.u.toastMsg(v.u.tr("ui.toast.stopping", map[string]any{"name": in.DisplayName}))
+		// A close request must not end the process before StopRun finishes.
+		v.u.app.Hold()
 		go func() {
 			// 6 秒的组终止链 + 收尾余量；StopRun 自己也有 6 秒上限。
 			ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
 			defer cancel()
 			err := v.u.env.StopRun(ctx, v.appKey, in.ID)
 			v.u.goIdle(func(uintptr) bool {
+				defer v.u.app.Release()
+				if v.u.closed {
+					return false
+				}
 				if err != nil {
 					// 停止没成功：清掉记账，下一次真正的退出仍要告诉用户。
 					delete(v.stopping, in.ID)
@@ -760,13 +805,14 @@ func (v *detailView) rename(in core.Instance) {
 	d.SetDefaultResponse("cancel")
 	d.SetResponseAppearance("rename", adw.ResponseSuggestedValue)
 	v.u.cb.onDialog(d, func(resp string) {
-		if resp != "rename" {
+		if v.u.closed || resp != "rename" {
 			return
 		}
 		name := strings.TrimSpace(entry.GetText())
 		if name == "" || name == in.DisplayName {
 			return
 		}
+		v.u.app.Hold()
 		go func() {
 			// 重命名写 instance.toml，是命名空间变更：与 CLI 的 add/rm 一样
 			// 必须持全局写锁（ADR-022），否则可能与并发的创建/删除互相覆盖。
@@ -780,6 +826,10 @@ func (v *detailView) rename(in core.Instance) {
 				return v.u.env.RenameInstance(v.appKey, in.ID, name)
 			}()
 			v.u.goIdle(func(uintptr) bool {
+				defer v.u.app.Release()
+				if v.u.closed {
+					return false
+				}
 				if err != nil {
 					v.u.toastMsg(v.u.tr(errorKey(err), errorArgs(err)))
 					return false

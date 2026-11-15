@@ -186,6 +186,10 @@ func (e *Env) CreateInstanceWith(ctx context.Context, app string, p Profile, id 
 // 文件是 **0444**，那个权限会让应用 O_WRONLY 打开失败、也会让主实例
 // 之后打不开同名锁文件（§3.2 第 2 条）。
 func (e *Env) prepareBindTargets(p Profile, in Instance) (created []string, err error) {
+	return e.prepareBindTargetsWith(p, in, false)
+}
+
+func (e *Env) prepareBindTargetsWith(p Profile, in Instance, sourcesReady bool) (created []string, err error) {
 	created = []string{}
 	fail := func(err error) ([]string, error) {
 		removeCreated(created) // 只删本次新建的，且都是空目录/空文件
@@ -212,6 +216,34 @@ func (e *Env) prepareBindTargets(p Profile, in Instance) (created []string, err 
 		// 路径而不是类型（§5 的 paths 是字符串数组），所以"探测时是文件、之后被删"
 		// 这种竞态会退化成旧行为。根治要给档案加 `path_types`，属于 schema 变更。
 		st, statErr := os.Stat(abs)
+		if sourcesReady {
+			// Fork uppers have already been prepared with confined handles.
+			// Only host placeholders remain; no absolute-path upper writes.
+			if os.IsNotExist(statErr) {
+				if source, err := os.Lstat(src); err == nil && source.Mode().IsRegular() {
+					made, err := mkdirAllTracked(filepath.Dir(abs), 0o700)
+					created = append(created, made...)
+					if err != nil {
+						return fail(err)
+					}
+					f, err := os.OpenFile(abs, os.O_CREATE|os.O_EXCL|os.O_WRONLY|unix.O_NOFOLLOW|unix.O_NONBLOCK, 0o600)
+					if err != nil {
+						return fail(err)
+					}
+					f.Close()
+					created = append(created, abs)
+					continue
+				}
+				made, err := mkdirAllTracked(abs, 0o700)
+				created = append(created, made...)
+				if err != nil {
+					return fail(err)
+				}
+			} else if statErr != nil {
+				return fail(statErr)
+			}
+			continue
+		}
 		hostExists := statErr == nil
 		isFile := hostExists && !st.IsDir()
 		// 实例侧占位必须是我们建的那个目录/普通文件。软链会把"工具自己写文件"
@@ -722,14 +754,35 @@ func (e *Env) IsRunning(app, id string) (bool, error) {
 // HoldRunLock 给 run 用：拿到锁就一直持有到进程退出（内核在退出时释放）。
 // 拿不到立刻返回 7，不许阻塞——桌面图标被点两次是常态（§4.3）。
 func (e *Env) HoldRunLock(app, id string) (*os.File, error) {
-	path := filepath.Join(e.InstancePath(app, id), "run.lock")
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
+	if err := e.forkRun.check(); err != nil {
+		return nil, forkPreparationError(err)
+	}
+	parent := Real(e.InstancePath(app, id))
+	path := filepath.Join(parent, "run.lock")
+	root, err := openForkRoot(parent)
 	if err != nil {
+		return nil, errEnv("err.env.open_lock", map[string]any{"path": path}, err)
+	}
+	defer root.Close()
+	f, err := root.OpenFile("run.lock", os.O_CREATE|os.O_RDWR|unix.O_NOFOLLOW|unix.O_NONBLOCK, 0o600)
+	if err != nil {
+		return nil, errEnv("err.env.open_lock", map[string]any{"path": path}, err)
+	}
+	if err := checkedRootPath(root, parent); err != nil {
+		f.Close()
+		return nil, err
+	}
+	if err := checkRunPhaseFile(f); err != nil {
+		f.Close()
 		return nil, errEnv("err.env.open_lock", map[string]any{"path": path}, err)
 	}
 	if err := unix.Flock(int(f.Fd()), unix.LOCK_EX|unix.LOCK_NB); err != nil {
 		f.Close()
 		return nil, errState("err.instance.running", map[string]any{"app": app, "id": id})
+	}
+	if err := e.forkRun.check(); err != nil {
+		f.Close()
+		return nil, forkPreparationError(err)
 	}
 	return f, nil
 }

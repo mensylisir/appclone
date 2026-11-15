@@ -26,7 +26,8 @@ func projectAppList(apps []core.App, query string, expanded bool) appList {
 		if a.InstanceN > 0 {
 			view.on = append(view.on, a)
 		} else if query == "" || strings.Contains(strings.ToLower(a.Name), query) ||
-			strings.Contains(strings.ToLower(a.Key), query) {
+			strings.Contains(strings.ToLower(a.Key), query) ||
+			strings.Contains(strings.ToLower(a.EnglishName), query) {
 			view.total++
 			if len(view.off) < limit {
 				if view.off == nil {
@@ -68,6 +69,9 @@ func sameSearchResults(a, b appList) bool {
 // GTK's search-changed signal already debounces typing. Only a changed visible
 // result needs new widgets; otherwise keep focus, scroll and signal handlers.
 func (u *ui) applySearch() {
+	if u.closed {
+		return
+	}
 	q := strings.ToLower(strings.TrimSpace(u.search.GetText()))
 	if q == u.query {
 		return

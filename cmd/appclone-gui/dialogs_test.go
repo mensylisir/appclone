@@ -82,7 +82,7 @@ func TestGtkDialogResponses(t *testing.T) {
 				fail("对话框回归超时（phase=%d）", phase)
 				return false
 			}
-			if !u.loaded {
+			if !u.loaded || !u.listSettled() {
 				return true
 			}
 			v := u.activeDetail
@@ -254,7 +254,7 @@ func TestGtkCloseSwitchDialog(t *testing.T) {
 				fail("关闭开关对话框回归超时（phase=%d）", phase)
 				return false
 			}
-			if !u.loaded {
+			if !u.loaded || !u.listSettled() {
 				return true
 			}
 			row := adw.NewSwitchRow()

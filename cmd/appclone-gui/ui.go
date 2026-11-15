@@ -3,17 +3,27 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"image"
+	"image/color"
+	"image/gif"
+	"image/jpeg"
+	"image/png"
+	"io"
+	"math"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 	"unicode"
 
 	"codeberg.org/puregotk/puregotk/v4/adw"
 	"codeberg.org/puregotk/puregotk/v4/gdk"
+	"codeberg.org/puregotk/puregotk/v4/gdkpixbuf"
 	"codeberg.org/puregotk/puregotk/v4/glib"
 	"codeberg.org/puregotk/puregotk/v4/gtk"
 
@@ -59,18 +69,18 @@ type ui struct {
 	// Group 只接受 AdwPreferencesRow，StatusPage 放进去会被裁成半截图标
 	// （截图上只剩一个灰色半圆）。它直接挂在 onBox 里，随实例数显隐。
 	emptyPage *adw.StatusPage
+	// emptyPick is the empty state's "choose apps" button. Focus goes here (not
+	// to the page container): it is the only actionable target in that state.
+	emptyPick *gtk.Widget
 
-	// 环境自检（§4.5）：bwrap 缺失 = 致命（整页只读），缺 fuse = 降级
-	// （列表页横幅可「了解」收掉，探测页那条不可收）。
+	// 环境自检（§4.5）：bwrap 缺失使整页只读；缺 FUSE 阻止新探测，
+	// 保留普通实例管理。收起提示不会解除环境限制。
 	fatalBanner *adw.Banner
 	softBanner  *adw.Banner
 	// softDismissFn 是 banner 按钮的唯一回调变量：地址恒定，只连一次。
 	softDismissFn func(adw.Banner)
 	fatal         bool
-	degraded      bool
-	// fuseBlocked：fuse 挂载不可用（缺失或权限/沙盒被拒）。与 degraded 分开：
-	// 只有前者能自动降级 strace（ADR-032）；但两者都会让克隆起步失效，所以
-	// fork 开关看 fuseBlocked，横幅看 degraded。
+	// fuseBlocked prevents probing and clone inheritance; normal instances remain usable.
 	fuseBlocked bool
 	// fuseErrKey 是自检失败的 core 错误键：横幅文案要按"组件缺失 / 写层
 	// 不可写 / 挂载被拒"分流，不能把没装组件说成权限问题。
@@ -83,11 +93,8 @@ type ui struct {
 
 	apps   []core.App
 	groups []*adw.PreferencesGroup
-	// onGroups/offGroups 记录这一轮渲染的组分别挂在哪个视图页，重建时按页
-	// Remove（PreferencesPage.Remove 只认自己页上的组）；groups 仍按
-	// 分身→所有应用的顺序保存全部组，供回归断言索引。
-	onGroups  []*adw.PreferencesGroup
-	offGroups []*adw.PreferencesGroup
+	// groups 按分身→所有应用的顺序保存当前代的组，供回归断言索引。旧组由
+	// listGroup.page 记住所属页，回收结束时自己摘除，不再需要按页维护两张表。
 	query     string
 	expanded  bool
 	reloadNo  int  // 全量扫描代数：只由 reload 推进
@@ -131,7 +138,38 @@ type ui struct {
 	// 会跨多秒，期间列表可能已重建、旧行连同整棵子树被 Unref 释放——
 	// 拿着旧行指针再 SetActive 就是 use-after-free（P1，复审发现）。
 	// 行只在代数未变时才可以直接改；变了就以数据为准（界面已经重建过）。
-	listGen int
+	listGen     int
+	listBuild   *listBuild
+	listRows    []listRow
+	listGroups  []*listGroup
+	retiredRows []listRow
+	// retiredGroups 与 retiredRows 同行：非空旧组在最后一行回收前一直留在这里，
+	// 关窗时据此一次性摘除所有仍挂页的组（包括前几代尚未排空的组）。
+	// 空组从不入表；最后一行移除时无条件出表并 Unref。
+	retiredGroups     []*listGroup
+	retiredGroupCount int
+	// prevRowCount 是 retireList 当次采样的上一代行数，供测试断言退休队列上界。
+	prevRowCount int
+	// listRefocus 标记“旧行持有焦点”，由该代首批创建后消费一次。
+	listRefocus bool
+	// listIdleSpawns counts list idle registrations; tests use it to prove a
+	// burst of queries never queues more than one list task.
+	listIdleSpawns  int
+	listIdlePending bool
+	listCloseHold   bool
+	closed          bool
+	// pollPaused lets the soak cancel-stress phase stop the 1s status poller
+	// without fighting the 30s full-generation guard.
+	pollPaused bool
+	// Only tests install this observer; no additional C callbacks are registered.
+	listObserve func(listMeasurement)
+
+	// iconCache 按“路径+dev+ino+size+mtime”缓存已解码纹理：同一图标在列表里
+	// 会重复出现（同一应用的多行/多代重建），每次 3–35ms 的解码不应落在批次里。
+	// 键含 inode，目录项替换即使 size+mtime 相同也会失效。只存纹理
+	// （约 16KiB/个），128 个封顶，FIFO 淘汰。
+	iconCache map[iconKey]*gdk.Texture
+	iconOrder []iconKey
 
 	// busy 是正在跑的删除事务数。删除要列实例、逐个 gio trash、再刷新列表，
 	// 与 setup 的 creating 同属事务态：进程被关窗带走会留下"删了一半"的
@@ -164,6 +202,9 @@ func (u *ui) tr(key string, args map[string]any) string {
 }
 
 func (u *ui) toastMsg(s string) {
+	if u.closed {
+		return
+	}
 	t := adw.NewToast(s)
 	t.SetTimeout(3)
 	u.toast.AddToast(t)
@@ -233,6 +274,7 @@ func (u *ui) buildWindow() {
 	u.cb = newCallbacks()
 	u.pages = map[uintptr]func(){}
 
+	warmIconLoaders()
 	u.win = adw.NewApplicationWindow(&u.app.Application)
 	u.win.SetTitle(u.tr("ui.window.title", nil))
 	// 与设计稿的 880px 对齐：560 宽在桌面窗口管理器里就是一根竖条，列表行
@@ -257,7 +299,7 @@ func (u *ui) buildWindow() {
 	u.search.SetSearchDelay(searchDebounceMs)
 	// 窗口级回调只建一次（地址恒定），符合 handlers.go 的回调纪律。
 	searchcb := func(_ gtk.SearchEntry) {
-		if u.searchPending {
+		if u.closed || u.searchPending {
 			return
 		}
 		u.searchPending = true
@@ -274,13 +316,11 @@ func (u *ui) buildWindow() {
 	tv := adw.NewToolbarView()
 	tv.AddTopBar(&u.header.Widget)
 
-	// 列表页两条横幅（§4.5）：bwrap 缺失是致命态（整个列表只读），缺 fuse 是
-	// 降级态（探测仍可用，只是覆盖不完整）。两者互斥——bwrap 都没有时谈
-	// "fuse 降级"没有意义。致命横幅没有关闭按钮：环境没好，"知道了"不能
-	// 把状态解除。
+	// 缺 bwrap 时列表只读；缺 FUSE 时仍可管理已有普通实例。
+	// 致命横幅不能关闭，配置不可用提示可收起但不会解除限制。
 	u.fatalBanner = adw.NewBanner(u.tr("ui.banner.fatal", nil))
 	u.fatalBanner.SetRevealed(false)
-	u.softBanner = adw.NewBanner(u.tr("ui.banner.degraded", nil))
+	u.softBanner = adw.NewBanner(u.tr("ui.banner.backend_missing", nil))
 	u.softBanner.SetButtonLabel(u.tr("ui.banner.dismiss", nil))
 	u.softBanner.SetRevealed(false)
 	u.softDismissFn = func(adw.Banner) {
@@ -315,6 +355,7 @@ func (u *ui) buildWindow() {
 	pick.ConnectClicked(&pickcb)
 	u.hold(&pickcb)
 	u.emptyPage.SetChild(&pick.Widget)
+	u.emptyPick = &pick.Widget
 	u.onBox.Append(&u.emptyPage.Widget)
 	// 首轮 renderList 之前先别让空的 PreferencesPage 占位。
 	u.onPage.SetVisible(false)
@@ -405,6 +446,9 @@ func (u *ui) buildWindow() {
 	// 创建/保存是事务态：关窗不能把事务打断在半路（半成品比多等一秒更糟），
 	// 与 Esc、返回手势同一条规则（§6.1）。
 	closecb := func(_ gtk.Window) bool {
+		if u.closed {
+			return false
+		}
 		// 删除事务同样不能在半路被关窗带走（数据目录删一半比多等一秒糟）。
 		if u.busy > 0 {
 			u.toastMsg(u.tr("ui.toast.deleting", nil))
@@ -415,12 +459,18 @@ func (u *ui) buildWindow() {
 				u.toastMsg(u.tr("ui.toast.finishing", nil))
 				return true
 			}
-			v.done = true
-			if v.cancel != nil {
-				v.cancel()
-			}
+			// The window is destroyed without a pop: close the page's scopes and
+			// clear its handlers instead of relying on popped/finish.
+			v.abandon()
 			u.activeSetup = nil
 		}
+		if v := u.activeDetail; v != nil {
+			v.abandon()
+			u.activeDetail = nil
+		}
+		// Dialog handlers never receive a response once the window is gone.
+		u.cb.clearDialogs()
+		u.closeList()
 		return false
 	}
 	u.win.ConnectCloseRequest(&closecb)
@@ -435,6 +485,12 @@ func (u *ui) buildWindow() {
 	// 窗口不可见（最小化/在别的桌面）时整拍跳过：没人看的界面不值得开文件。
 	var tick int
 	pollcb := glib.SourceFunc(func(uintptr) bool {
+		if u.closed {
+			return false
+		}
+		if u.pollPaused {
+			return true
+		}
 		if !u.win.GetVisible() {
 			return true
 		}
@@ -463,6 +519,9 @@ func (u *ui) buildWindow() {
 // 它也能从致命态回到可用态（tech-stack §4.5 第 245 行的要求：只能进不能出
 // 的状态等于卡死）：轮询会周期性重跑，环境恢复后横幅收起、开关重新可用。
 func (u *ui) checkEnv() {
+	if u.closed {
+		return
+	}
 	go func() {
 		bwrapErr := core.CheckBwrap()
 		var fuseErr error
@@ -470,14 +529,15 @@ func (u *ui) checkEnv() {
 			fuseErr = u.env.OverlayAvailable()
 		}
 		u.goIdle(func(uintptr) bool {
+			if u.closed {
+				return false
+			}
 			u.envChecked = true
 			wasFatal := u.fatal
 			u.fatal = bwrapErr != nil
 			u.fuseBlocked = bwrapErr == nil && fuseErr != nil
 			u.fuseErrKey = core.ProbeErrorKey(fuseErr)
-			// 降级横幅只在"真的会改用 strace"时出现；挂载被拒是错误，
-			// 由探测页直接展示可操作提示，不能谎称已降级（ADR-032）。
-			u.degraded = bwrapErr == nil && core.ProbeFallsBackToStrace(fuseErr)
+			// 缺失与挂载被拒都阻止新探测，并按原因展示处置提示。
 			u.applyEnvBanners()
 			// 确认页可能先于自检落地（open/clone 直接进确认态）：开关的
 			// 可用性不能只在渲染那一刻取快照。环境变化时同步一次；降级
@@ -519,8 +579,6 @@ func (u *ui) applyEnvBanners() {
 // tr() 的字面量键，动态拼接既查不到缺翻译，也让键名无法静态核对。
 func (u *ui) bannerTitle(reason string) string {
 	switch reason {
-	case "degraded":
-		return u.tr("ui.banner.degraded", nil)
 	case "workroot_unavailable":
 		return u.tr("ui.banner.workroot_unavailable", nil)
 	case "backend_missing":
@@ -534,8 +592,6 @@ func (u *ui) bannerTitle(reason string) string {
 // 完全不同：装组件 / 修写层目录 / 修挂载权限，不能合并成一句"兼容模式"。
 func (u *ui) softReasonNow() string {
 	switch {
-	case u.degraded:
-		return "degraded"
 	case u.fuseErrKey == "err.probe.workroot_unavailable" || u.fuseErrKey == "err.env.mkdir":
 		return "workroot_unavailable"
 	case u.fuseBlocked && core.ProbeBackendKeyMissing(u.fuseErrKey):
@@ -577,17 +633,90 @@ func (u *ui) appIcon(icon, name string, size int32) (*gtk.Widget, bool) {
 	return &av.Widget, true
 }
 
-// iconImage 只在图标真的能取到时返回 Image：主题名先过 IconTheme.HasIcon，
+const (
+	maxIconFileBytes = 4 << 20
+	iconDecodeSize   = 64
+	iconMaxDim       = 1024
+	iconMaxPixels    = 1 << 20
+	iconCacheLimit   = 128
+)
+
+type iconSizeKind int
+
+const (
+	iconSizeNone   iconSizeKind = iota // 非首次调用或状态缺失：不改尺寸
+	iconSizeScale                      // 按声明尺寸等比缩到 ≤64
+	iconSizeReject                     // 声明尺寸超限：停下并拒绝
+)
+
+// iconScale 把声明尺寸等比缩到 ≤64，永远不放大。整数直接相除会得到 0，
+// 而 SetSize(0,0) 的意思是“不缩放”，所以必须用 float64 并把结果 clamp 到 ≥1。
+func iconScale(w, h int32) (int32, int32) {
+	if w <= 0 || h <= 0 {
+		return iconDecodeSize, iconDecodeSize
+	}
+	scale := math.Min(1, math.Min(float64(iconDecodeSize)/float64(w), float64(iconDecodeSize)/float64(h)))
+	sw := int32(math.Max(1, math.Floor(float64(w)*scale)))
+	sh := int32(math.Max(1, math.Floor(float64(h)*scale)))
+	return sw, sh
+}
+
+// iconTargetSize 是 size-prepared 的纯判定：未知尺寸（≤0，SVG 常见）按 64
+// 请求；声明的像素预算超限则直接拒绝，不喂 loader。
+func iconTargetSize(w, h int32) (iconSizeKind, int32, int32) {
+	if w <= 0 || h <= 0 {
+		return iconSizeScale, iconDecodeSize, iconDecodeSize
+	}
+	if w > iconMaxDim || h > iconMaxDim || int64(w)*int64(h) > iconMaxPixels {
+		return iconSizeReject, 0, 0
+	}
+	sw, sh := iconScale(w, h)
+	return iconSizeScale, sw, sh
+}
+
+// iconFinalOK 是 Close 后的最终门：后端可能只在 Close 内发 size-prepared，
+// 也可能完全不发，所以既要求状态里的 sized 为真，也要求实际像素落在 1..64。
+func iconFinalOK(sized, oversize bool, w, h int32) bool {
+	return sized && !oversize && w >= 1 && h >= 1 && w <= iconDecodeSize && h <= iconDecodeSize
+}
+
+// iconKey 让缓存感知目录项替换：同路径新 inode 即使 size+mtime 相同也失效。
+// 同 inode 原地改写并恢复 mtime 不可检测（已知限制）。
+type iconKey struct {
+	path        string
+	dev, ino    uint64
+	size, mtime int64
+}
+
+func iconKeyOf(path string, info os.FileInfo) (iconKey, bool) {
+	st, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return iconKey{}, false
+	}
+	return iconKey{path: path, dev: uint64(st.Dev), ino: st.Ino,
+		size: info.Size(), mtime: info.ModTime().UnixNano()}, true
+}
+
+// iconImage 只在图标真的能解码时返回 Image：主题名先过 IconTheme.HasIcon，
 // 否则 GTK 会画一个破图，比没有图标更难看。
 func (u *ui) iconImage(icon string) (*gtk.Image, bool) {
 	switch {
 	case icon == "":
 		return nil, false
 	case filepath.IsAbs(icon):
-		if _, err := os.Stat(icon); err != nil {
+		info, err := os.Stat(icon)
+		if err != nil || !info.Mode().IsRegular() || info.Size() <= 0 || info.Size() > maxIconFileBytes {
 			return nil, false
 		}
-		return gtk.NewImageFromFile(icon), true
+		key, ok := iconKeyOf(icon, info)
+		if !ok {
+			return nil, false
+		}
+		if tex, ok := u.iconCache[key]; ok {
+			img := gtk.NewImageFromPaintable(tex)
+			return img, img != nil
+		}
+		return u.loadIconFile(icon, key)
 	default:
 		// DisplayGetDefault / IconThemeGetForDisplay 都给返回的包装 IncreaseRef，
 		// 按本项目所有权纪律用完必须 Unref（它们是 per-display 单例，不 Unref
@@ -607,6 +736,154 @@ func (u *ui) iconImage(icon string) (*gtk.Image, bool) {
 		}
 		return gtk.NewImageFromIconName(icon), true
 	}
+}
+
+// loadIconFile decodes one regular file into a ≤64px texture. The open is
+// O_NONBLOCK so a path swapped for a FIFO after Stat cannot park the main loop;
+// fstat re-checks the type and refreshes the cache key before any read.
+func (u *ui) loadIconFile(path string, key iconKey) (*gtk.Image, bool) {
+	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NONBLOCK|syscall.O_CLOEXEC, 0)
+	if err != nil {
+		return nil, false
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil || !info.Mode().IsRegular() || info.Size() <= 0 || info.Size() > maxIconFileBytes {
+		return nil, false
+	}
+	refreshed, ok := iconKeyOf(path, info)
+	if !ok {
+		return nil, false
+	}
+	if refreshed != key {
+		if tex, ok := u.iconCache[refreshed]; ok {
+			img := gtk.NewImageFromPaintable(tex)
+			return img, img != nil
+		}
+		key = refreshed
+	}
+	data, err := io.ReadAll(io.LimitReader(f, maxIconFileBytes+1))
+	if err != nil || len(data) == 0 || len(data) > maxIconFileBytes {
+		return nil, false
+	}
+	// Header-only precheck: a 4096² bomb is rejected before any pixel buffer is
+	// allocated. Unknown formats and unknown (≤0) dimensions fall through to the
+	// loader and are settled by its size-prepared/Close result.
+	var w, h int32
+	if format := gdkpixbuf.PixbufGetFileInfo(path, &w, &h); format == nil {
+		return nil, false
+	}
+	if w > 0 && h > 0 && (w > iconMaxDim || h > iconMaxDim || int64(w)*int64(h) > iconMaxPixels) {
+		return nil, false
+	}
+	loader := gdkpixbuf.NewPixbufLoader()
+	if loader == nil {
+		return nil, false
+	}
+	defer loader.Unref()
+	if u.cb == nil {
+		// Standalone icon callers (tests) have no window yet; the callback table
+		// is cheap and its stable size-prepare slot is required for bounded decode.
+		u.cb = newCallbacks()
+	}
+	ptr := loader.GoPointer()
+	u.cb.loaderBegin(ptr)
+	defer u.cb.loaderEnd(ptr)
+	loader.ConnectSizePrepared(&u.cb.sizePrepFn)
+	if ok, err := loader.Write(data, uint(len(data))); !ok {
+		freeGlibError(err)
+		return nil, false
+	}
+	if _, err := loader.Close(); err != nil {
+		freeGlibError(err)
+		return nil, false
+	}
+	st := u.cb.loaderEnd(ptr)
+	pixbuf := loader.GetPixbuf()
+	if pixbuf == nil {
+		return nil, false
+	}
+	defer pixbuf.Unref()
+	if st == nil || !iconFinalOK(st.sized, st.oversize, pixbuf.GetWidth(), pixbuf.GetHeight()) {
+		return nil, false
+	}
+	texture := gdk.NewTextureForPixbuf(pixbuf)
+	if texture == nil {
+		return nil, false
+	}
+	img := gtk.NewImageFromPaintable(texture)
+	if img == nil {
+		texture.Unref()
+		return nil, false
+	}
+	u.cacheIcon(key, texture)
+	return img, true
+}
+
+func freeGlibError(err error) {
+	if e, ok := err.(*glib.Error); ok && e != nil {
+		e.Free()
+	}
+}
+
+// cacheIcon takes ownership of tex. Callers only run on the GTK main thread.
+func (u *ui) cacheIcon(key iconKey, tex *gdk.Texture) {
+	if u.iconCache == nil {
+		u.iconCache = make(map[iconKey]*gdk.Texture)
+	}
+	if len(u.iconOrder) >= iconCacheLimit {
+		old := u.iconOrder[0]
+		u.iconOrder = u.iconOrder[1:]
+		if t, ok := u.iconCache[old]; ok {
+			delete(u.iconCache, old)
+			t.Unref()
+		}
+	}
+	u.iconCache[key] = tex
+	u.iconOrder = append(u.iconOrder, key)
+}
+
+var iconWarmOnce sync.Once
+
+// warmIconLoaders pays the gdk-pixbuf module load (librsvg/PNG/JPEG/GIF) once
+// at startup. The first SVG decode costs ~35ms (module init) and would otherwise
+// land in the first list batch; afterwards the same file decodes in ~3ms.
+func warmIconLoaders() {
+	iconWarmOnce.Do(func() {
+		warm := func(data []byte) {
+			loader := gdkpixbuf.NewPixbufLoader()
+			if loader == nil {
+				return
+			}
+			defer loader.Unref()
+			if ok, err := loader.Write(data, uint(len(data))); !ok {
+				freeGlibError(err)
+				return
+			}
+			if _, err := loader.Close(); err != nil {
+				freeGlibError(err)
+				return
+			}
+			if pb := loader.GetPixbuf(); pb != nil {
+				pb.Unref()
+			}
+		}
+		rgba := image.NewRGBA(image.Rect(0, 0, 1, 1))
+		rgba.Set(0, 0, color.NRGBA{R: 255, A: 255})
+		var buf bytes.Buffer
+		if err := png.Encode(&buf, rgba); err == nil {
+			warm(buf.Bytes())
+		}
+		buf.Reset()
+		if err := jpeg.Encode(&buf, rgba, nil); err == nil {
+			warm(buf.Bytes())
+		}
+		buf.Reset()
+		if err := gif.Encode(&buf, rgba, nil); err == nil {
+			warm(buf.Bytes())
+		}
+		warm([]byte(`<svg xmlns="http://www.w3.org/2000/svg" width="1" height="1"><rect width="1" height="1"/></svg>`))
+	})
 }
 
 // avatarInitial 给出头像里的一个字：中文取首字，拉丁字母转大写。
@@ -667,12 +944,15 @@ func (u *ui) appSub(a core.App, on bool) string {
 
 // reload 重新扫描应用与实例。扫描放到后台，结果回主线程再碰控件。
 func (u *ui) reload() {
+	if u.closed {
+		return
+	}
 	u.reloadNo++
 	gen := u.reloadNo
 	go func() {
 		apps, _ := u.env.ListApps(context.Background())
 		u.goIdle(func(uintptr) bool {
-			if gen != u.reloadNo {
+			if u.closed || gen != u.reloadNo {
 				return false // 已有更新的一轮，丢弃旧结果
 			}
 			first := !u.loaded
@@ -708,7 +988,7 @@ func (u *ui) reload() {
 // 跟随当前代数：更新的一轮 reload 会让在途的轮询结果作废，反之不行。
 // 另外刷新之间也要用自己的序号，避免两轮轮询乱序覆盖（旧快照后到）。
 func (u *ui) refreshRunning() {
-	if !u.loaded {
+	if u.closed || !u.loaded {
 		return // 首轮扫描还没回来，没有可刷新的基准
 	}
 	gen := u.reloadNo
@@ -738,7 +1018,7 @@ func (u *ui) refreshRunning() {
 			}
 		}
 		u.goIdle(func(uintptr) bool {
-			if gen != u.reloadNo || seq != u.refreshNo {
+			if u.closed || gen != u.reloadNo || seq != u.refreshNo {
 				return false
 			}
 			if !sameList(u.apps, updated) {
@@ -763,130 +1043,35 @@ func sameList(a, b []core.App) bool {
 	return true
 }
 
-// renderList 重建两个视图的组。分组键是"有没有实例"，不是"有没有档案"：
-// 关掉开关后应用必须回到「所有应用」，否则组名与行内状态自相矛盾。
-func (u *ui) renderList() {
-	// 先摘掉旧行，再关旧 scope：scope.close 会 Unref 本轮创建的 C 对象，
-	// 而父容器此时的引用还兜着它们——先 Remove 再 Unref 的顺序最不容易出错。
-	for _, g := range u.onGroups {
-		u.onPage.Remove(g)
-	}
-	for _, g := range u.offGroups {
-		u.offPage.Remove(g)
-	}
-	u.onGroups, u.offGroups = nil, nil
-	u.groups = nil
-	if u.listScope != nil {
-		u.listScope.close()
-	}
-	// 旧行从这一刻起不再有效：任何还握着它们指针的异步回调都要放弃写界面。
-	u.listGen++
-	// 旧代数的受理记录随旧行一起作废（旧行已被 Unref，不会再发 notify），
-	// 不清会让表随每轮轮询无限增长。
-	for k := range u.toggled {
-		if k.gen != u.listGen {
-			delete(u.toggled, k)
-		}
-	}
-	sc := &renderScope{c: u.cb}
-	u.listScope = sc
-
-	view := projectAppList(u.apps, u.query, u.expanded)
-	on, pool := view.on, view.off
-
-	// 空态只取代「分身」视图的列表，不影响「所有应用」——后者是首启用户
-	// 唯一能操作的入口，空态里的「选择应用」按钮也指向它。
-	empty := len(on) == 0
-	u.emptyPage.SetVisible(empty)
-	u.onPage.SetVisible(!empty)
-	if u.onPageObj != nil {
-		u.onPageObj.SetBadgeNumber(uint32(len(on)))
-	}
-	if !empty {
-		g := adw.NewPreferencesGroup()
-		sc.own(&g.Widget)
-		g.SetTitle(u.tr("ui.group.clones.title", nil))
-		g.SetDescription(u.tr("ui.group.clones.desc", nil))
-		for _, a := range on {
-			g.Add(&u.newAppRow(a, true, sc).Widget)
-		}
-		u.onPage.Add(g)
-		u.onGroups = append(u.onGroups, g)
-		u.groups = append(u.groups, g)
-
-		// 分身视图底部的「添加应用分身」：不切回另一个视图也能继续加，
-		// 与空态的「选择应用」是同一个动作的两种入口。
-		ag := adw.NewPreferencesGroup()
-		sc.own(&ag.Widget)
-		add := adw.NewActionRow()
-		sc.own(&add.Widget)
-		add.SetTitle(u.tr("ui.row.add_clone.title", nil))
-		add.SetSubtitle(u.tr("ui.row.add_clone.subtitle", nil))
-		ic := u.symbolicIcon("list-add-symbolic")
-		sc.own(&ic.Widget)
-		add.AddPrefix(&ic.Widget)
-		add.SetActivatable(true)
-		sc.row(add, func() { u.stack.SetVisibleChildName("all") })
-		ag.Add(&add.Widget)
-		u.onPage.Add(ag)
-		u.onGroups = append(u.onGroups, ag)
-		u.groups = append(u.groups, ag)
-	}
-
-	g := adw.NewPreferencesGroup()
-	sc.own(&g.Widget)
-	// 组名不再重复标题栏上的「所有应用」：视图名已经说了这是全部应用，
-	// 再写一遍只是噪声。留一句规则说明就够。
-	g.SetDescription(u.tr("ui.group.all.desc", nil))
-	var extra *adw.ActionRow
-	if view.tail == "more" {
-		extra = u.moreRow(u.tr("ui.row.show_all", map[string]any{"n": view.total}), sc)
-	} else if view.tail == "limited" {
-		// 搜索溢出说明是纯文本，不是可点的「显示全部」：搜索分支不读
-		// expanded，做成可点行就是一个点不动的死点击（设计稿也是纯文本）。
-		row := adw.NewActionRow()
-		row.SetTitle(u.tr("ui.row.search_limit", map[string]any{"shown": searchLimit, "total": view.total}))
-		row.SetSensitive(false)
-		sc.own(&row.Widget)
-		extra = row
-	}
-	for _, a := range pool {
-		g.Add(&u.newAppRow(a, false, sc).Widget)
-	}
-	if len(pool) == 0 {
-		row := adw.NewActionRow()
-		sc.own(&row.Widget)
-		if u.query != "" {
-			row.SetTitle(u.tr("ui.row.no_match", map[string]any{"query": u.query}))
-		} else {
-			row.SetTitle(u.tr("ui.row.all_clones", nil))
-		}
-		row.SetSensitive(false)
-		g.Add(&row.Widget)
-	} else if extra != nil {
-		g.Add(&extra.Widget)
-	}
-	u.offPage.Add(g)
-	u.offGroups = append(u.offGroups, g)
-	u.groups = append(u.groups, g)
-
-	// 首轮结果已落地、落点也已决定：这时才显示视图栈，避免"先看到所有应用
-	// 再跳分身"的闪变；切换器同时解禁（扫描期间它不可点，防止落点覆盖
-	// 用户刚做的选择）。放在 renderList 里而不是 reload 的回调里，是为了
-	// 结果被更新的一轮丢弃时也不会永久空白。
-	u.stack.SetVisible(true)
-	u.switcher.SetSensitive(true)
-}
-
 // focusCurrentView 把初始焦点交给当前视图的滚动页。
 // 不放在 ViewStack 上：它不是滚动容器，方向键/PageDown 滚不动列表。
 func (u *ui) focusCurrentView() {
+	// Follow the stack's current view, but never focus a page that the empty
+	// state has hidden: on the "clones" view emptyPage replaces onPage. If the
+	// current view has no visible page, fall back to the search box so keyboard
+	// users always have a focus target.
 	page := u.onPage
 	if u.stack.GetVisibleChildName() == "all" {
 		page = u.offPage
 	}
-	page.Widget.SetFocusable(true)
-	page.Widget.GrabFocus()
+	if page.GetVisible() {
+		page.Widget.SetFocusable(true)
+		page.Widget.GrabFocus()
+		return
+	}
+	if page == u.onPage && u.emptyPage.GetVisible() {
+		// Focus the empty state's action button, not the page container: it is
+		// the one keyboard target the user can actually act on there.
+		if u.emptyPick != nil {
+			u.emptyPick.SetFocusable(true)
+			u.emptyPick.GrabFocus()
+			return
+		}
+		u.emptyPage.SetFocusable(true)
+		u.emptyPage.Widget.GrabFocus()
+		return
+	}
+	u.search.GrabFocus()
 }
 
 func (u *ui) moreRow(title string, sc *renderScope) *adw.ActionRow {

@@ -97,30 +97,60 @@ fi
 # 阶段 dlopen GTK，没有 GTK 运行库的机器会在 init panic 而不是 skip）。
 LOG="$WORK/gtk-test.log"
 set +e
-# -skip：长稳用例（TestGtkSoakRenderList）的同名前缀会被 -run 命中；它默认
-# 因缺 APPCLONE_GTK_SOAK_MIN 而 SKIP，但开发者 shell 里残留该变量时会让
-# 180 秒的闸门静默跑成 30 分钟长稳。
-CGO_ENABLED=0 PATH="$WORK:$PATH" APPCLONE_GTK_TEST=1 \
-  go test -tags gtk_e2e -count=1 -timeout 180s -v \
-  -run 'TestGtk|TestSearchProjection|TestDetachedRunnerSpawn|TestDetachLogHelpers|TestDetachedTargetEnv|TestBuildProfileKeepsNonPathFieldsAndCredentials|TestBuildProfileKeyringExplicitAndRowSync|TestSaveProfileLeavesNoKeyringState|TestReadsBannerPartsStates|TestMergeWarnKeys|TestRetryActionReaderStuck' \
-  -skip '^TestGtkSoakRenderList$' ./cmd/appclone-gui \
+# -skip：长稳用例（TestGtkSoakRenderList）与性能用例（TestGtkSearchPerformance、
+# TestGtkDistinctIconBatches）会污染常规闸门——前者在残留 APPCLONE_GTK_SOAK_MIN
+# 时静默跑成 30 分钟长稳，后两者只经 design/perf.sh 手动跑。
+# 整闸门用 fatal-criticals：拆卸期对已销毁控件调用会产生 GTK critical，必须当场中止。
+# 不用 fatal-warnings 跑整闸门——本机 GL 上下文创建失败会间歇打出 Gdk-WARNING，
+# 那与产品无关却会 abort 无关用例；关窗用例另开一轮带 fatal-warnings，见下。
+CGO_ENABLED=0 PATH="$WORK:$PATH" APPCLONE_GTK_TEST=1 G_DEBUG=fatal-criticals \
+  go test -tags gtk_e2e -count=1 -timeout 240s -v \
+  -run 'TestGtk|TestIconPureHelpers|TestKeyringRowState|TestSearchProjection|TestDetachedRunnerSpawn|TestDetachLogHelpers|TestDetachedTargetEnv|TestBuildProfileKeepsNonPathFieldsAndCredentials|TestBuildProfileKeyringExplicitAndRowSync|TestSaveProfileLeavesNoKeyringState|TestReadsBannerPartsStates|TestMergeWarnKeys|TestRetryActionReaderStuck' \
+  -skip '^(TestGtkSoakRenderList|TestGtkSearchPerformance|TestGtkDistinctIconBatches)$' ./cmd/appclone-gui \
   2>&1 | tee "$LOG"
 rc=${PIPESTATUS[0]}
 set -e
 if [ "$rc" -ne 0 ]; then
   exit "$rc"
 fi
+# 关窗路径单跑一轮 fatal-warnings：整闸门不能带（宿主 GL warning 会误伤），
+# 这一轮固定 cairo 渲染，避免宿主 GL 上下文失败产生的无关 Gdk-WARNING。
+# 输出单独落 CLOSELOG 并逐条校验 PASS：主轮的 7 条 PASS 不能替这一轮作证，
+# 否则子轮正则漂移时会静默丢掉 fatal-warnings 覆盖。
+CLOSELOG="$WORK/gtk-close-warnings.log"
+if ! GSK_RENDERER=cairo G_DEBUG=fatal-warnings CGO_ENABLED=0 PATH="$WORK:$PATH" APPCLONE_GTK_TEST=1 \
+  APPCLONE_GTK_ROOT="$WORK/testroot-close-warnings" \
+  go test -tags gtk_e2e -count=1 -timeout 120s -v \
+  -run '^(TestGtkListRetireClose|TestGtkDetailOpenClose|TestGtkRenameDialogClose|TestGtkRenameConfirmedClose|TestGtkStopThenClose|TestGtkClosedIgnoresCalls|TestGtkSetupClose)$' \
+  ./cmd/appclone-gui >"$CLOSELOG" 2>&1; then
+  tail -n 40 "$CLOSELOG" >&2
+  exit 6
+fi
+cat "$CLOSELOG" >>"$LOG"
+for name in TestGtkListRetireClose TestGtkDetailOpenClose TestGtkRenameDialogClose \
+            TestGtkRenameConfirmedClose TestGtkStopThenClose TestGtkClosedIgnoresCalls \
+            TestGtkSetupClose; do
+  if ! grep -q -- "--- PASS: $name" "$CLOSELOG"; then
+    echo "guitest-gtk: fatal-warnings 子轮没有看到 $name 的 PASS" >&2
+    exit 6
+  fi
+done
 # `-run` 匹配不到任何测试时 `go test` 仍返回 0（输出只剩 "[no test files]"）：
 # 测试被改名/移走会静默假绿，所以必须真的看到每一条 PASS。
-for name in TestGtkScreensLifecycle TestGtkLandsOnClonesView TestGtkEmptyStateMapped \
+for name in TestGtkFinishProbeRound TestGtkScreensLifecycle TestGtkLandsOnClonesView TestGtkEmptyStateMapped \
             TestGtkSetupStates TestGtkErrorState TestGtkRetryableError \
             TestGtkRapidRepush TestGtkFatalBanner TestGtkEnglishStrings \
             TestGtkDetailShowsStopWhenRunning TestGtkForkTogglePersists \
             TestGtkForkDisabledWhenFuseUnavailable TestGtkAppIconFallback \
-            TestGtkConfirmReuseEvidence \
+            TestGtkConfirmReuseEvidence TestGtkSharedCertificates \
             TestGtkProbeProgress \
-            TestGtkSearchResults TestSearchProjection \
+            TestGtkSearchResults TestSearchProjection TestGtkListBatches \
+            TestGtkListRetireClose TestGtkDetailOpenClose TestGtkSetupClose \
+            TestGtkListEmptyBatchClearsFocusMarker TestGtkFocusTargets \
+            TestGtkIconBounds TestGtkIconCallbackSlots TestIconPureHelpers \
             TestGtkDialogResponses TestGtkCloseSwitchDialog \
+            TestGtkRenameDialogClose TestGtkRenameConfirmedClose TestGtkStopThenClose TestGtkClosedIgnoresCalls \
+            TestKeyringRowState \
             TestDetachedRunnerSpawn \
             TestDetachLogHelpers TestDetachedTargetEnv \
             TestBuildProfileKeepsNonPathFieldsAndCredentials \

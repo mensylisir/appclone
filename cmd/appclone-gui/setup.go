@@ -31,8 +31,11 @@ type setupView struct {
 	banner *adw.Banner
 	header *adw.HeaderBar
 
-	cancelBtn  *gtk.Button
-	confirmBtn *gtk.Button
+	cancelBtn      *gtk.Button
+	confirmBtn     *gtk.Button
+	finishRoundBtn *gtk.Button
+	probeControl   *core.ProbeControl
+	probeToken     uint64
 
 	spinner    *gtk.Spinner
 	countLabel *gtk.Label
@@ -116,6 +119,9 @@ func (u *ui) pushSetup(appKey, mode string, onClose func(bool)) bool {
 // 调用方。放在 popped 里而不是 Pop() 之后立刻调用，是因为在 pop 动画期间
 // 再 push 详情页会撞上导航视图的过渡态（§6.1 要求创建完落到详情页）。
 func (v *setupView) popped() {
+	if v.u.closed {
+		return
+	}
 	if !v.done {
 		// 用户用返回按钮/返回手势取消：等同于按了「取消」。
 		v.done = true
@@ -136,6 +142,27 @@ func (v *setupView) popped() {
 		v.onClose(v.success)
 	}
 	v.u.releasePage(v.page)
+}
+
+// abandon shuts a setup page down when the window is destroyed without a pop.
+// It closes handlers like popped, but neither calls onClose (which would push a
+// detail page) nor releasePage (the page dies with the window).
+func (v *setupView) abandon() {
+	v.done = true
+	if v.cancel != nil {
+		v.cancel()
+	}
+	if v.scope != nil {
+		v.scope.close()
+		v.scope = nil
+	}
+	if v.fixed != nil {
+		v.fixed.close()
+		v.fixed = nil
+	}
+	if v.page != nil {
+		delete(v.u.pages, v.page.GoPointer())
+	}
 }
 
 func (v *setupView) title() string {
@@ -213,6 +240,12 @@ func (v *setupView) build() {
 	probing.Append(&v.countLabel.Widget)
 	probing.Append(&v.retryLabel.Widget)
 	probing.Append(&phint.Widget)
+	v.finishRoundBtn = gtk.NewButtonWithLabel(v.u.tr("ui.setup.finish_round", nil))
+	v.finishRoundBtn.SetSensitive(false)
+	v.finishRoundBtn.SetHalign(gtk.AlignCenterValue)
+	v.fixed.own(&v.finishRoundBtn.Widget)
+	v.fixed.button(v.finishRoundBtn, v.finishProbeRound)
+	probing.Append(&v.finishRoundBtn.Widget)
 	v.stack.AddNamed(&probing.Widget, "probing")
 
 	// ---- error（AdwStatusPage：§4.5 要求失败是独立组件而不是两块裸标签）----
@@ -310,6 +343,10 @@ func (v *setupView) setState(s string) {
 	// 按钮文案按状态重置：§6.1 只有探测中叫「取消探测」，确认态与失败态都叫「取消」。
 	// 不重置的话，探测失败后按钮还挂着「取消探测」，用户不知道它已经不再是取消会话。
 	v.cancelBtn.SetLabel(v.u.tr("ui.setup.cancel", nil))
+	if s != "probing" {
+		v.probeToken = 0
+		v.finishRoundBtn.SetSensitive(false)
+	}
 	// 只有探测中才转圈：切到确认/失败态后后台还在转的 spinner 会让人以为
 	// 还有操作没结束（它也确实代表不了任何事）。
 	if s == "probing" {
@@ -452,6 +489,10 @@ func (v *setupView) probe() {
 		return
 	}
 	v.setState("probing")
+	v.probeControl = &core.ProbeControl{}
+	v.probeToken = 0
+	v.finishRoundBtn.SetSensitive(false)
+	v.finishRoundBtn.SetLabel(v.u.tr("ui.setup.finish_round", nil))
 	v.probeSeq++
 	seq := v.probeSeq
 	v.roundLabel.SetText(v.u.tr("ui.setup.probing.preparing", nil))
@@ -505,12 +546,12 @@ func (v *setupView) probe() {
 		}
 		defer st.Close()
 
-		// 闸门 2/3（fuse 降级、应用在跑）由 core.Probe 判定：降级不阻断，
-		// app_running 直接失败。自检与探测各写一套判据迟早会说不到一处去。
+		// 写层可用性和主应用运行状态统一由 core.Probe 判定，失败不开目标应用。
 		hints := v.u.env.StaticHints(ctx, d)
 		cmdline := core.ProbeCommand(d.Exec, d.ExecArgs, v.existing, v.hasExisting)
 		res, fin, cands, prefilled, perr := v.u.env.ProbeWithRetry(ctx, v.appKey, core.ProbeOptions{
 			Command:     cmdline,
+			Control:     v.probeControl,
 			LockFile:    hints.LockFiles,
 			StaticPaths: hints.Paths,
 			Progress: func(pp core.ProbeProgress) {
@@ -603,8 +644,7 @@ func (v *setupView) applyFinalized(res core.ProbeResult, p core.Profile, cands [
 	v.showReadsBanner()
 }
 
-// showDegraded 起降级横幅（看不到 fuse-overlayfs 时走 strace）。
-// 文案不承诺完整：strace 只记录实际跑到的路径。
+// showDegraded describes an existing legacy strace profile, not a new fallback session.
 func (v *setupView) showDegraded() {
 	v.degraded = true
 	v.showReadsBanner()
@@ -759,7 +799,7 @@ func (v *setupView) renderConfirm() {
 	}
 	v.scope = &renderScope{c: v.u.cb}
 
-	// 兜底：进度事件晚到或档案本身就是 strace 产物时，确认页仍要有那条横幅。
+	// Existing strace profiles remain usable, with their original coverage limitation.
 	if v.profile.ProbeMethod == "strace" {
 		v.showDegraded()
 	}
@@ -992,7 +1032,11 @@ func (v *setupView) renderConfirm() {
 		sh := adw.NewPreferencesGroup()
 		v.scope.own(&sh.Widget)
 		sh.SetTitle(v.u.tr("ui.setup.group.shared", nil))
-		sh.SetDescription(v.u.tr("ui.setup.group.shared.desc", nil))
+		desc := v.u.tr("ui.setup.group.shared.desc", nil)
+		if v.u.env.Resolver.HasSharedCertificates(derived) {
+			desc += " " + v.u.tr("ui.shared.certificates", nil)
+		}
+		sh.SetDescription(desc)
 		srow := adw.NewActionRow()
 		v.scope.own(&srow.Widget)
 		srow.SetTitle(v.u.tr("ui.setup.row.shared.title", nil))

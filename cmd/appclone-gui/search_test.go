@@ -40,6 +40,7 @@ func TestGtkSearchResults(t *testing.T) {
 		{"", 200, "Application 199", false},
 	}
 	step, gen := -1, 0
+	expanding := false
 	var sent time.Time
 	var runErr error
 	deadline := time.Now().Add(20 * time.Second)
@@ -61,8 +62,22 @@ func TestGtkSearchResults(t *testing.T) {
 			u.renderList()
 			step = 0
 		} else {
+			if expanding {
+				if !u.listSettled() {
+					return true
+				}
+				if !u.expanded || len(listRowTitles(u.offPage)) != 200 {
+					fail("show-all action did not finish expanding")
+					return false
+				}
+				expanding = false
+				step++
+				gen, sent = u.listGen, time.Now()
+				u.search.SetText(cases[step].query)
+				return true
+			}
 			c := cases[step]
-			if time.Since(sent) < 200*time.Millisecond || u.query != strings.ToLower(strings.TrimSpace(c.query)) {
+			if time.Since(sent) < 200*time.Millisecond || u.query != strings.ToLower(strings.TrimSpace(c.query)) || !u.listSettled() {
 				return true
 			}
 			titles := listRowTitles(u.offPage)
@@ -85,10 +100,9 @@ func TestGtkSearchResults(t *testing.T) {
 					return false
 				}
 				gobject.SignalEmitByName(&row.Object, "activated")
-				if !u.expanded || len(listRowTitles(u.offPage)) != 200 {
-					fail("show-all action did not expand")
-					return false
-				}
+				row.Unref()
+				expanding = true
+				return true
 			}
 			step++
 			if step == len(cases) {
@@ -119,6 +133,12 @@ func TestGtkSearchResults(t *testing.T) {
 }
 
 func TestSearchProjection(t *testing.T) {
+	bilingual := []core.App{{Key: "opaque", Name: "中文编辑器", EnglishName: "English Editor"}}
+	for _, q := range []string{"中文", "english", "opaque"} {
+		if got := projectAppList(bilingual, q, false); len(got.off) != 1 {
+			t.Fatalf("bilingual search %q: %+v", q, got)
+		}
+	}
 	apps := []core.App{{Key: "clone", Name: "Cloned", InstanceN: 1}}
 	for i := 0; i < 201; i++ {
 		apps = append(apps, core.App{Key: fmt.Sprintf("app%03d", i), Name: "应用"})

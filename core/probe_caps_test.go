@@ -29,9 +29,6 @@ func TestProbeCapsListsMatchSessionLists(t *testing.T) {
 	if got, want := st.readSyscalls(), probeCapsReadList(); !slices.Equal(got, want) {
 		t.Fatalf("读列表不一致：session=%v caps=%v", got, want)
 	}
-	if got, want := st.writeSyscalls(), probeCapsWriteList(); !slices.Equal(got, want) {
-		t.Fatalf("写列表不一致：session=%v caps=%v", got, want)
-	}
 }
 
 // bwrap 被删除时 strace 输出 `Can't stat 'bwrap'`（没有 "bwrap:" 前缀），

@@ -14,7 +14,7 @@ import (
 //
 // 返回新切片，调用方修改不会污染原命令或 ProbeResult。
 func ProbeRetryCommand(cmdline []string, res ProbeResult) []string {
-	if len(cmdline) == 0 || len(res.SelfRelaunchArgs) == 0 || res.SelfRelaunchUnknown {
+	if res.RoundMarkerDropped != 0 || len(cmdline) == 0 || len(res.SelfRelaunchArgs) == 0 || res.SelfRelaunchUnknown {
 		return nil
 	}
 	out := make([]string, 0, len(cmdline)+len(res.SelfRelaunchArgs))

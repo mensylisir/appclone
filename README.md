@@ -7,7 +7,7 @@
 
 ```
 主实例  ~/.config/微信        ← 两个实例互不可见
-分身    ~/.local/share/appclone/instances/wechat/main/root/.config/微信
+分身    ~/.local/share/appclone/instances/wechat/main/root/home/<用户>/.config/微信
 其他    ~/Downloads、~/Documents、桌面会话……   ← 照常共享
 ```
 
@@ -20,7 +20,7 @@
 | glib2（`gio`） | 删除实例移入回收站（必需；deb/rpm/Arch 包会自动装） |
 | GTK ≥ 4.14 + libadwaita ≥ 1.5 | 仅 GUI 需要（运行库，不需要开发包） |
 | fuse-overlayfs | 路径探测主后端（必需；deb/rpm/Arch 包会自动装） |
-| strace | 探测兜底后端（必需；deb/rpm/Arch 包会自动装）；只在 fuse 后端确实缺失时才降级使用 |
+| strace | 探测读证据采集器（deb/rpm/Arch 包会自动装）；缺失时明确提示读证据不完整 |
 | FUSE 挂载权限 | 普通桌面会话即可，无需 root：`fusermount3` 应以 setuid 安装。在 Flatpak/容器/`NoNewPrivs` 会话里会被系统拒绝，此时 appclone 会直接报权限错误，不静默降级 |
 
 Ubuntu 23.10+ 默认限制非特权 user namespace。deb / rpm / Arch 包的安装脚本都会在检测到该限制时安装
@@ -62,11 +62,14 @@ appclone doctor               # 环境自检
 appclone add wechat work2 --fork   # 从现有数据克隆起步（写时复制）
 ```
 
-`--fork` / GUI 的「从现有应用数据克隆起步」不复制文件：运行期用 `fuse-overlayfs` 把主实例
-数据作为只读底层，分身写过的内容落进自己的实例目录。**克隆是实时数据不是快照**——分身与主
-实例不要同时使用同一份应用数据；需要冻结起点时先复制数据。登录态目录（档案里的
-`credential_paths`）不参与克隆：浏览器这类「登录态与历史同目录」的应用会从空配置起步，
-宁可少继承业务数据，也不把主实例的登录带进分身。
+`--fork` / GUI 的「从现有应用数据克隆起步」在首次启动时准备独立的固定数据副本，
+之后主应用的修改不会改变这个起点，分身自己的改动保存在实例目录。首次准备前请完全退出主应用；
+准备过程中可以停止，复制失败会保留已有分身数据并报错。固定副本经过源文件稳定性检查，
+不提供数据库事务级快照。登录态目录（档案里的 `credential_paths`）不参与克隆：
+浏览器这类「登录态与历史同目录」的应用会从空配置起步。
+
+旧分身首次使用新克隆机制时保留已有改动，并将该应用的档案升级到 schema 2。
+**升级后的应用不能用旧版 appclone 运行**；普通非克隆应用的档案保持 schema 1。
 
 ### 登录状态是怎么被发现的
 
@@ -90,6 +93,9 @@ appclone add wechat work2 --fork   # 从现有数据克隆起步（写时复制�
   关掉设置窗口不会结束它们。
 - 删除实例、关闭应用开关都只把数据移入回收站（`gio trash`），永久删除由用户在回收站完成。
 - 应用自己的数据属于用户：本项目不收集、不上传任何内容。
+- 自动探测会把桌面应用入口、默认打开方式和共用证书库保留为共享项。证书库可能包含客户端证书及私钥，
+  分身可能使用同一客户端证书；开启独立密钥环不会隔离证书库。确认页和详情页会按实际共享范围显示说明。
+  已有档案的显式隔离路径保持原语义，重新探测才应用新的建议；不会删除已有分身数据。
 
 ## 排障
 
@@ -101,7 +107,7 @@ appclone doctor
   `.tar.gz` 时在解压目录执行
   `sudo cp bwrap.apparmor /etc/apparmor.d/bwrap && sudo apparmor_parser -r /etc/apparmor.d/bwrap`。
 - **「缺 fuse-overlayfs」横幅**：deb/rpm/Arch 包已把它和 `strace` 作为硬依赖自动安装；手工 `.tar.gz` 请自行装
-  `fuse-overlayfs` 与 `strace`。只有后端确实缺失时才会降级/报 `doctor` fail。
+  `fuse-overlayfs` 与 `strace`。写层不可用时不会启动被测应用，`doctor --strict` 会报错；不会用可写主目录替代独立写层。
 - **`fusermount3: mount failed: Permission denied` / `fuse-overlayfs: cannot mount: Operation not permitted`**：
   当前会话不允许非特权 FUSE 挂载，常见于 Flatpak、容器、`NoNewPrivs=yes` 的服务或 `fusermount3` 丢失 setuid。
   **不要用 sudo 跑 GUI**（会把实例数据变成 root 所有）；请在普通桌面会话启动，并确认

@@ -9,25 +9,40 @@ package core
 // 公共目录与凭证不在这里补：前者有独立的只读分组，后者要保留 kind/reason，
 // 由档案里的 unsupported 原样继承，绕一圈候选反而会丢信息。
 func (r *PathResolver) PrefillCandidates(tmpl Profile, existing []Candidate) []Candidate {
+	r = r.withSharedMIME()
+	if r.sharedMIME.err != nil {
+		return nil
+	}
 	seen := make(map[string]bool, len(existing))
 	for _, c := range existing {
-		seen[c.Path] = true
+		seen[realKey(c.Path)] = true
 	}
 	var out []Candidate
 	for _, raw := range tmpl.Paths {
 		abs, err := r.Expand(raw)
-		if err != nil || seen[abs] {
+		if err != nil {
 			continue
 		}
 		class, checked, why, warn := r.Classify(abs)
 		if class == ClassPublic || class == ClassKeyring {
 			continue
 		}
+		if class == ClassShared {
+			if boundary, ok := r.preciseSharedBoundary(abs); ok {
+				abs = boundary
+			}
+		}
+		if seen[realKey(abs)] {
+			continue
+		}
 		out = append(out, Candidate{
 			Path: abs, Class: class, DisplayClass: class,
 			Checked: checked, Why: why, Warning: warn,
 		})
-		seen[abs] = true
+		seen[realKey(abs)] = true
+	}
+	if r.sharedMIME.err != nil {
+		return nil
 	}
 	return out
 }

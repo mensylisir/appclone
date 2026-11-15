@@ -114,8 +114,14 @@ func BuildBwrapArgs(p Profile, in Instance, o BuildOptions) ([]string, error) {
 		if err != nil {
 			return nil, err
 		}
-		// fork 实例：源是 overlay 的挂载点（lower=主实例数据、upper=实例 root）。
-		// 只有挂载成功的路径才在表里；失败的路径退回普通实例目录，启动不中断。
+		// Runtime fork preparation supplies every frozen owner, including explicit
+		// empty starts. Missing entries mean identity drift, never permission to
+		// silently run a different upper. Doctor may omit the runtime table.
+		if in.Fork && o.ForkSources != nil {
+			if _, ok := o.ForkSources[abs]; !ok {
+				return nil, errInput("err.fork.scope_changed", nil)
+			}
+		}
 		if merged, ok := o.ForkSources[abs]; ok && merged != "" {
 			src = merged
 		}

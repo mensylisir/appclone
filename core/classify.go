@@ -109,6 +109,9 @@ func (r *PathResolver) sharedWriteDirs() []string {
 }
 
 func (r *PathResolver) isSharedWrite(abs string) bool {
+	if _, ok := r.preciseSharedBoundary(abs); ok {
+		return true
+	}
 	for _, dir := range r.sharedWriteDirs() {
 		if isUnderLoose(dir, abs) {
 			return true
@@ -207,6 +210,7 @@ func hasDataExt(abs string) bool {
 //	  那是演示简化，照抄等于把用户自己放在那里的文件也关进分身）
 //	8 数据库文件 → 默认勾选
 func (r *PathResolver) Classify(abs string) (PathClass, bool, string, bool) {
+	r = r.withSharedMIME()
 	abs = filepath.Clean(abs)
 	switch {
 	case r.isPublic(abs):
@@ -215,6 +219,8 @@ func (r *PathResolver) Classify(abs string) (PathClass, bool, string, bool) {
 		return ClassKeyring, false, "probe.why.keyring", false
 	case r.isSharedWrite(abs):
 		return ClassShared, false, "probe.why.shared", false
+	case r.sharedMIME.err != nil:
+		return ClassUnknown, false, "probe.why.unknown", true
 	case r.hasCacheComponent(abs):
 		return ClassCache, false, "probe.why.cache", false
 	case r.underXdgAppDirs(abs):

@@ -1,12 +1,7 @@
 package core
 
-// 克隆起步（§8.1）：`add --fork` 建的实例在每次 run 时，把主实例的真实数据
-// 目录当只读 lower、实例 root 当持久 upper，用 fuse-overlayfs 挂出一份写时
-// 复制的视图。应用第一次启动看到的就和主实例当前状态一致，之后的修改只落
-// 在分身自己的 upper 里——不需要 root，主实例数据也不会被碰。
-//
-// 为什么不复制文件：聊天/浏览器的数据动辄几 GB，复制既慢又占双份空间；
-// overlay 的 copy-up 是按需的。代价是每次 run 多几次挂载，run 结束就卸掉。
+// Fork instances use durable private snapshots as lower layers; root remains
+// the existing writable upper and .fork contains only temporary mount state.
 
 import (
 	"crypto/sha256"
@@ -18,149 +13,232 @@ import (
 	"syscall"
 )
 
-// forkDir 是实例内放临时挂载点的目录。它随时可删（不在 root/ 里），
-// 名字带点是为了让人一眼看出它不是用户数据。
 func forkDir(in Instance) string { return filepath.Join(in.Dir(), ".fork") }
 
-// forkMounts 为 fork 实例建立所有 overlay，返回 bind 源映射（宿主路径 →
-// 挂载点）与清理函数。任一路径挂不上只降级该路径并告警，不阻断启动：
-// “少继承一些数据”远好于“应用起不来”。
-// stop 在每条路径挂载前检查（ctx 取消或收到停止信号）。Mount 本身是同步
-// 5 秒上限，无法中途打断；这里保证不会把 N×5 秒全部走完才响应停止。
-func (e *Env) forkMounts(p Profile, in Instance, stop func() bool, warn func(string)) (map[string]string, func()) {
+// Any required snapshot/mount failure aborts before the application starts.
+func (e *Env) forkMounts(p Profile, in Instance, stop func() bool, warn func(string)) (map[string]string, func() error, func() error, error) {
+	noop := func() error { return nil }
 	if !in.Fork {
-		return nil, func() {}
+		return nil, noop, noop, nil
 	}
-	say := func(msg string) {
-		if warn != nil {
-			warn(msg)
-		}
+	var err error
+	e, in, err = e.pinForkInstance(in)
+	if err != nil {
+		return nil, noop, noop, forkPreparationError(err)
 	}
 	paths, err := normalizePaths(p.Paths, e.BuildOptions())
 	if err != nil {
-		say("无法解析隔离路径，这个分身将从空数据启动")
-		return nil, func() {}
+		return nil, noop, noop, err
 	}
-	if len(paths) == 0 {
-		return nil, func() {}
+	if err := checkForkHashes(paths); err != nil {
+		return nil, noop, noop, forkPreparationError(err)
 	}
-	// 凭据路径不参与克隆（§10.2）：lower 等于凭据路径、包含凭据路径或位于
-	// 凭据路径之下都不挂。粒度取舍是 owner——浏览器这类"登录态与历史同目录"
-	// 的应用会从空配置起步，宁可少继承业务数据，也不泄漏登录态。
-	//
-	// 词法形态必须与真实形态一起保留：`~/.config/App/credentials.json` 可能
-	// 是指向 `/mnt/token` 的软链，只比 Real 会让 fork 克隆整条 App 目录，
-	// 分身在 `--bind / /` 下打开软链仍读到宿主登录态。
-	creds, cerr := normalizePaths(p.CredentialPaths, e.BuildOptions())
-	if cerr != nil {
-		// 解析不了凭据范围时**不能**当作"没有凭据"继续克隆——那会把登录态
-		// 原样复制进分身。宁可这次不继承，让应用从空数据起步。
-		say("无法解析登录状态目录，这个分身将从空数据启动")
-		return nil, func() {}
+	aliases, err := e.forkAliases(p, paths)
+	if err != nil {
+		return nil, noop, noop, err
 	}
-	creds = append(creds, e.lexicalCredentialPaths(p.CredentialPaths)...)
+	creds, err := e.forkCredentials(p)
+	if err != nil {
+		return nil, noop, noop, err
+	}
 	mounter := e.Mounter
 	if mounter == nil {
 		mounter = fuseOverlayMounter{}
 	}
 	if err := mounter.Available(); err != nil {
-		say("fuse-overlayfs 不可用，这个分身无法继承主实例数据，将从空数据启动")
-		return nil, func() {}
+		return nil, noop, noop, err
 	}
-	base := forkDir(in)
-	// 上次 run 被 SIGKILL 时可能留下挂载点。必须先卸再删：带着挂载
-	// RemoveAll 会顺着 merged 遍历 lower，删的是主实例的用户数据。
-	if err := resetForkBase(base); err != nil {
-		say("无法清理上次运行留下的挂载点，这个分身将从空数据启动")
-		return nil, func() {}
+	if err := e.forkRun.check(); err != nil {
+		return nil, noop, noop, forkPreparationError(err)
 	}
-	if err := os.MkdirAll(base, 0o700); err != nil {
-		say("无法创建克隆挂载目录，这个分身将从空数据启动")
-		return nil, func() {}
+	instPath := e.forkRun.instance.canonical
+	inst, err := openForkRoot(instPath)
+	if err != nil {
+		return nil, noop, noop, forkPreparationError(err)
 	}
-
-	sources := map[string]string{}
-	var unmounts []func() error
-	cleanup := func() {
-		ok := true
+	base := filepath.Join(instPath, ".fork")
+	guard := newForkRuntimeGuard(inst, instPath)
+	guard.identity = e.forkRun
+	type ownedMount struct {
+		path string
+		stop func() error
+	}
+	var unmounts []ownedMount
+	closed := false
+	var cleanupErr error
+	cleanup := func() error {
+		if closed {
+			return cleanupErr
+		}
+		closed = true
+		defer inst.Close()
+		e.forkCheckpoint("before-fork-cleanup")
+		if err := guard.check(); err != nil {
+			cleanupErr = err
+			return err
+		}
 		for i := len(unmounts) - 1; i >= 0; i-- {
-			if err := unmounts[i](); err != nil {
-				ok = false
+			if err := guard.check(); err != nil {
+				cleanupErr = err
+				return err
+			}
+			if err := unmounts[i].stop(); err != nil {
+				cleanupErr = err
+			} else {
+				delete(guard.mounts, unmounts[i].path)
 			}
 		}
-		// 有卸载失败、或 mountinfo 里仍有 base 之下的挂载点时不碰 base：
-		// merged 可能仍挂着，RemoveAll 会穿过它（与 resetForkBase 同一硬不变量）。
-		if ok && !mountUnder(base) {
-			_ = os.RemoveAll(base)
-		}
-	}
-
-	for _, abs := range paths {
-		if stop != nil && stop() {
-			break
-		}
-		// keyring 不参与克隆（ADR-035）：分身的密钥由自己的 keyring daemon
-		// 管理，把主实例的 keyring 文件复制/克隆进来等于让两个分身共用密钥。
-		// ValidateProfile 已经禁止 keyring 进 paths，这里是第二道防线。
-		if e.Resolver != nil && e.Resolver.isKeyring(abs) {
-			continue
-		}
-		if blocked, msg := credentialBlocksFork(abs, creds); blocked {
-			say(msg)
-			continue
-		}
-		// 只对“主实例里已经有内容”的目录做 overlay：空目录挂一份空视图
-		// 除了多一次挂载没有任何收益。
-		if st, serr := os.Stat(abs); serr != nil || !st.IsDir() || !dirHasEntries(abs) {
-			continue
-		}
-		upper, err := instanceChild(in.Root, abs)
+		mounted, err := checkedMountUnder(base)
 		if err != nil {
-			continue
+			cleanupErr = err
 		}
-		// upper 落在 lower 之内会让 overlay 递归（挂载不报错，视图 ELOOP）。
-		// 典型触发：AC_BASE 位于档案声明的某个目录之下。两种路径形态都要比：
-		// AC_BASE 经软链、档案写的是解析后祖先时，纯词法比较会漏。
-		if lowerContainsUpper(abs, upper) {
-			say("「" + abs + "」包含分身自己的数据目录，无法克隆起步，该路径将不继承主实例数据")
-			continue
+		if mounted {
+			cleanupErr = errors.New("fork mount remains active")
 		}
-		if err := os.MkdirAll(upper, 0o700); err != nil {
-			say("无法为「" + abs + "」准备分身数据目录，该路径将不继承主实例数据")
-			continue
-		}
-		wd := filepath.Join(base, forkHash(abs))
-		work := filepath.Join(wd, "work")
-		merged := filepath.Join(wd, "merged")
-		if err := os.MkdirAll(work, 0o700); err != nil {
-			say("无法为「" + abs + "」准备挂载工作区，该路径将不继承主实例数据")
-			continue
-		}
-		if err := os.MkdirAll(merged, 0o700); err != nil {
-			say("无法为「" + abs + "」准备挂载点，该路径将不继承主实例数据")
-			continue
-		}
-		unmount, merr := mounter.Mount(abs, upper, work, merged)
-		if merr != nil {
-			say("无法为「" + abs + "」挂载主实例数据，该路径将不继承")
-			// 极窄竞态：Mount 已报错（典型是超时），但挂载点刚好生效了。
-			// 这时删 wd 会穿过 merged 遍历 lower（§3.2.3 同一事故）。挂着
-			// 就交给 cleanup 先卸；卸不掉则保留 .fork/ 等下一轮 reset。
-			if mountPointIn(merged) {
-				unmounts = append(unmounts, func() error { return umount(merged) })
-				continue
+		if cleanupErr == nil {
+			cleanupErr = guard.check()
+			if cleanupErr == nil {
+				cleanupErr = inst.RemoveAll(".fork")
 			}
-			_ = os.RemoveAll(wd)
+		}
+		return cleanupErr
+	}
+	fail := func(err error) (map[string]string, func() error, func() error, error) {
+		if cerr := cleanup(); cerr != nil {
+			return nil, noop, noop, forkCleanupError(cerr)
+		}
+		return nil, noop, noop, forkPreparationError(err)
+	}
+	e.forkCheckpoint("before-fork-reset")
+	if err := e.forkRun.check(); err != nil {
+		inst.Close()
+		return nil, noop, noop, forkPreparationError(err)
+	}
+	if err := resetForkRoot(inst, instPath, ".fork", e.forkRun); err != nil {
+		inst.Close()
+		return nil, noop, noop, forkPreparationError(err)
+	}
+	lowers, err := e.prepareForkSnapshot(p, in, paths, creds, stop)
+	if err != nil {
+		return fail(err)
+	}
+	if err := forkMkdirAll(inst, ".fork"); err != nil {
+		return fail(err)
+	}
+	if err := guard.remember(".fork"); err != nil {
+		return fail(err)
+	}
+	sources := map[string]string{}
+	for _, abs := range paths {
+		if err := forkStopped(stop); err != nil {
+			return fail(err)
+		}
+		upper, err := instanceChild(filepath.Join(instPath, "root"), abs)
+		if err != nil {
+			return fail(err)
+		}
+		sources[abs] = upper // Explicit empty/file/credential decisions also have a bind.
+		upperRel, err := filepath.Rel(instPath, upper)
+		if err != nil {
+			return fail(err)
+		}
+		if err := prepareForkUpper(inst, upperRel, abs); err != nil {
+			return fail(err)
+		}
+		if err := guard.remember(upperRel); err != nil {
+			return fail(err)
+		}
+		lower := lowers[abs]
+		if lower == "" {
 			continue
 		}
+		workRel := filepath.Join(".fork", forkHash(abs), "work")
+		mergedRel := filepath.Join(".fork", forkHash(abs), "merged")
+		ids := map[string]os.FileInfo{}
+		for _, rel := range []string{upperRel, workRel, mergedRel} {
+			if err := forkMkdirAll(inst, rel); err != nil {
+				return fail(err)
+			}
+			fi, err := inst.Lstat(rel)
+			if err != nil {
+				return fail(err)
+			}
+			ids[rel] = fi
+			if err := guard.remember(rel); err != nil {
+				return fail(err)
+			}
+		}
+		lowerRel, err := filepath.Rel(instPath, lower)
+		if err != nil {
+			return fail(err)
+		}
+		fi, err := inst.Lstat(lowerRel)
+		if err != nil {
+			return fail(err)
+		}
+		ids[lowerRel] = fi
+		if err := guard.remember(lowerRel); err != nil {
+			return fail(err)
+		}
+		rootID, err := inst.Stat(".")
+		if err != nil {
+			return fail(err)
+		}
+		e.forkCheckpoint("before-mount")
+		if err := e.checkForkPaths(p, paths, aliases); err != nil {
+			return fail(err)
+		}
+		current, err := os.Lstat(instPath)
+		if err != nil {
+			return fail(err)
+		}
+		if !os.SameFile(rootID, current) {
+			return fail(errors.New("instance root changed before mount"))
+		}
+		for rel, want := range ids {
+			if err := forkNoSymlinks(inst, rel); err != nil {
+				return fail(err)
+			}
+			got, err := inst.Lstat(rel)
+			if err != nil {
+				return fail(err)
+			}
+			if !os.SameFile(want, got) {
+				return fail(errors.New("mount path changed"))
+			}
+		}
+		work, merged := filepath.Join(instPath, workRel), filepath.Join(instPath, mergedRel)
+		if err := guard.beginMount(); err != nil {
+			return fail(err)
+		}
+		unmount, err := mounter.Mount(lower, upper, work, merged)
+		if err != nil {
+			if mounted, merr := checkedMountUnder(merged); merr != nil {
+				guard.retain = errors.Join(err, merr)
+			} else if mounted {
+				guard.retain = errEnv("err.fork.mount_pending", nil, err)
+			}
+			return fail(err)
+		}
+		if gerr := guard.mounted(mergedRel); gerr != nil {
+			guard.retain = gerr
+			return fail(gerr)
+		}
+		if err := guard.confirmMount(); err != nil {
+			guard.retain = err
+			return fail(err)
+		}
+		unmounts = append(unmounts, ownedMount{path: merged, stop: unmount})
 		sources[abs] = merged
-		unmounts = append(unmounts, unmount)
 	}
-	if len(sources) == 0 {
-		cleanup()
-		return nil, func() {}
+	e.forkCheckpoint("after-mount")
+	if err := e.checkForkPaths(p, paths, aliases); err != nil {
+		return fail(err)
 	}
-	return sources, cleanup
+	if err := guard.check(); err != nil {
+		return fail(err)
+	}
+	return sources, cleanup, guard.check, nil
 }
 
 // lexicalCredentialPaths 返回凭据路径的词法绝对形态（不解析软链）。
@@ -196,9 +274,51 @@ func credentialBlocksFork(lower string, creds []string) (bool, string) {
 // 顺序不能反：先卸挂载，再删目录。带挂载的 RemoveAll 会进入 merged 视图，
 // 把 lower（主实例的真实数据）当成待删文件——这正是 §3.2.3 踩过的坑。
 func resetForkBase(base string) error {
+	parent, err := checkedOrdinaryPath(filepath.Dir(base), true)
+	if err != nil {
+		return err
+	}
+	root, err := openForkRoot(parent)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	defer root.Close()
+	return resetForkRoot(root, parent, filepath.Base(base), nil)
+}
+
+func resetForkRoot(root *os.Root, parent, rel string, identity *forkRunIdentity) error {
+	if err := identity.check(); err != nil {
+		return err
+	}
+	base := filepath.Join(parent, rel)
+	table, err := checkedMountTable()
+	if err != nil {
+		return err
+	}
+	if err := checkForkStarting(root, parent, table); err != nil {
+		return err
+	}
+	if err := checkedRootPath(root, parent); err != nil {
+		return err
+	}
+	if st, err := os.Lstat(base); err == nil && st.Mode()&os.ModeSymlink != 0 {
+		return errors.New("fork mount root is a symbolic link")
+	}
+	if _, err := root.Lstat(filepath.Join(rel, "mount-pending")); err == nil {
+		for point := range table {
+			if IsUnder(base, point) {
+				return errEnv("err.fork.mount_pending", nil, nil)
+			}
+		}
+	} else if !os.IsNotExist(err) {
+		return err
+	}
 	// 布局是 <base>/<hash>/merged（每个 paths 条目的挂载点各占一层），
 	// 所以先扫 hash 目录，再判断里面的 merged。
-	ents, err := os.ReadDir(base)
+	f, err := root.Open(rel)
 	if err != nil {
 		// 不存在 = 没跑过；不是目录 = 应用自己在实例目录里建了个叫 .fork
 		// 的文件（整条 `--bind / /` 是 rw，它做得到）。两种都不承载挂载，
@@ -208,6 +328,26 @@ func resetForkBase(base string) error {
 		}
 		return err
 	}
+	ents, err := f.ReadDir(-1)
+	f.Close()
+	if err != nil {
+		return err
+	}
+	guard := newForkRuntimeGuard(root, parent)
+	guard.identity = identity
+	if err := guard.remember(rel); err != nil {
+		return err
+	}
+	for path, record := range table {
+		if IsUnder(base, path) {
+			guard.mounts[path] = record
+		}
+	}
+	for _, ent := range ents {
+		if err := guard.remember(filepath.Join(rel, ent.Name())); err != nil {
+			return err
+		}
+	}
 	// 一条卸不掉不能挡住其余路径：先把所有能卸的都卸掉，再报第一个错误。
 	var firstErr error
 	for _, ent := range ents {
@@ -215,9 +355,24 @@ func resetForkBase(base string) error {
 		// stale 现场只看 mountinfo：fuse daemon 已死时任何 stat 都返回
 		// ENOTCONN，会把仍挂着的条目误判成"没挂载"，接着 RemoveAll 就会
 		// 穿过挂载点遍历 lower。
-		if mountPointIn(p) {
-			if err := umount(p); err != nil && firstErr == nil {
-				firstErr = err
+		present := false
+		for mp := range table {
+			for _, form := range pathForms(p) {
+				if mp == form {
+					present = true
+				}
+			}
+		}
+		if present {
+			if err := guard.check(); err != nil {
+				return err
+			}
+			if err := umount(p); err != nil {
+				if firstErr == nil {
+					firstErr = err
+				}
+			} else {
+				delete(guard.mounts, p)
 			}
 		}
 	}
@@ -226,45 +381,21 @@ func resetForkBase(base string) error {
 	}
 	// 兜底：即使目录布局变了或出现未知条目，只要 mountinfo 里还有 base
 	// 之下的挂载点就绝不 RemoveAll。
-	if mountUnder(base) {
+	remaining, err := checkedMountUnder(base)
+	if err != nil {
+		return err
+	}
+	if remaining {
 		return errors.New("仍有挂载点在 " + base + " 下，拒绝删除")
 	}
-	return os.RemoveAll(base)
+	if err := guard.check(); err != nil {
+		return err
+	}
+	return root.RemoveAll(rel)
 }
 
 // procMountInfo 是 mountinfo 路径（测试可替换成 fixture）。
 var procMountInfo = "/proc/self/mountinfo"
-
-// mountPointIn 只查 mountinfo，不碰挂载点本身：判断 stale 挂载时任何
-// 对 merged 的 stat/open 都会得到 ENOTCONN。
-func mountPointIn(path string) bool {
-	data, err := os.ReadFile(procMountInfo)
-	if err != nil {
-		return false
-	}
-	return mountInfoHas(string(data), path)
-}
-
-// mountUnder 报告 mountinfo 里是否有挂载点等于 base 或位于 base 之下。
-func mountUnder(base string) bool {
-	data, err := os.ReadFile(procMountInfo)
-	if err != nil {
-		return false
-	}
-	forms := pathForms(base)
-	for _, line := range strings.Split(string(data), "\n") {
-		mp, ok := mountPointOf(line)
-		if !ok {
-			continue
-		}
-		for _, form := range forms {
-			if IsUnder(form, mp) {
-				return true
-			}
-		}
-	}
-	return false
-}
 
 // mountInfoHas 逐行比对挂载点字段。不能直接 strings.Contains 拼路径：
 // 内核会把空格/制表符/换行/反斜杠转义成 \040 \011 \012 \134，AC_BASE 或
@@ -332,19 +463,6 @@ func realPathBestEffort(path string) (string, bool) {
 		base = filepath.Join(filepath.Base(d), base)
 		dir = parent
 	}
-}
-
-// lowerContainsUpper 判断上层目录是否落在下层之内（overlay 递归）。
-// 词法与真实形态各比一次：AC_BASE 经软链、档案写解析后祖先时，纯词法会漏。
-func lowerContainsUpper(lower, upper string) bool {
-	for _, l := range pathForms(lower) {
-		for _, u := range pathForms(upper) {
-			if IsUnder(l, u) {
-				return true
-			}
-		}
-	}
-	return false
 }
 
 // mountEscapes 按 proc(5) 规定的四种转义解码挂载点。单遍替换即可：

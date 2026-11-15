@@ -44,8 +44,8 @@ type BuildOptions struct {
 	Audit *AuditLayers
 	// ForkSources 把 paths 的 bind 源从实例目录换成 overlay 挂载点
 	// （`add --fork` 的实例，§8.1）。键是 normalizePaths 之后的宿主绝对路径；
-	// 没有条目的路径仍绑定实例目录。BuildBwrapArgs 仍是纯函数：挂载由
-	// core.Run 在调用前完成，这里只消费结果。
+	// 运行时必须含全部路径（不继承的路径显式填普通 upper），缺项报错；
+	// nil 仅供静态预览。BuildBwrapArgs 保持纯函数，挂载由 core.Run 完成。
 	ForkSources map[string]string
 	// KeyringTargets 是本次实际要 bind 的 keyring 目标（由 BuildOptions 用
 	// 文件系统现状解析：软链目标解析后与同组另一个目标指向同一目录时跳过，
@@ -74,9 +74,9 @@ func isReservedEnv(k string) bool {
 // ValidateProfile 校验档案本身是否自洽、是否触碰红线。
 // 无写副作用（只读 user-dirs.dirs 取公共目录清单），因此可以被表驱动测试反复调用。
 func ValidateProfile(p Profile, o BuildOptions) error {
-	if p.Version > ProfileVersion {
+	if p.Version > MaxProfileVersion {
 		return errInput("err.profile.version_ahead", map[string]any{
-			"app": p.App, "version": p.Version, "current": ProfileVersion,
+			"app": p.App, "version": p.Version, "current": MaxProfileVersion,
 		})
 	}
 	if strings.TrimSpace(p.Exec) == "" {
@@ -248,6 +248,25 @@ func ValidateProfile(p Profile, o BuildOptions) error {
 
 	// 同一路径不能既隔离又共享：bwrap 里两条 bind 的先后决定谁生效，
 	// 结果取决于参数顺序 —— 那是"看起来设置过、实际不确定"的状态（§3.1 ⑦）。
+	if err := validateSharedPathConflicts(p, o); err != nil {
+		return err
+	}
+	// shared_writes 的源会被 --bind-try 原样绑回真实位置：源是 Base 的祖先
+	// （如 `$HOME/.local/share`）时，应用经共享项重新读到实例目录。
+	for _, sw := range p.SharedWrites {
+		sabs, err := o.expand(sw)
+		if err != nil {
+			return err
+		}
+		if err := checkBaseExposure(sabs, o, "shared_writes"); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// Probe finalization uses the same narrow conflict check as profile validation.
+func validateSharedPathConflicts(p Profile, o BuildOptions) error {
 	for _, pp := range p.Paths {
 		pabs, err := o.expand(pp)
 		if err != nil {
@@ -263,17 +282,6 @@ func ValidateProfile(p Profile, o BuildOptions) error {
 					"path": pabs, "other": sabs,
 				})
 			}
-		}
-	}
-	// shared_writes 的源会被 --bind-try 原样绑回真实位置：源是 Base 的祖先
-	// （如 `$HOME/.local/share`）时，应用经共享项重新读到实例目录。
-	for _, sw := range p.SharedWrites {
-		sabs, err := o.expand(sw)
-		if err != nil {
-			return err
-		}
-		if err := checkBaseExposure(sabs, o, "shared_writes"); err != nil {
-			return err
 		}
 	}
 	return nil

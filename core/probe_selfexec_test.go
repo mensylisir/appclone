@@ -97,23 +97,6 @@ func TestProbeSessionSelfRelaunchAfterRerun(t *testing.T) {
 	}
 }
 
-func TestProbeStraceSelfRelaunchArgs(t *testing.T) {
-	e := probeEnv(t)
-	// 兜底路径：读能力不可用，只有写能力；exec 证据仍要采集。
-	e.ProbeCapsOverride = &ProbeCaps{Read: false, Write: true}
-	q := "/opt/Qoder CN/qoder-cn"
-	r := &execFifoRunner{q: q}
-	res, err := e.probeStrace(context.Background(), "qoder", ProbeOptions{
-		Command: []string{q}, Rounds: 2,
-	}, r)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !slices.Equal(res.Profile.ExecArgs, []string{"--ozone-platform=x11"}) {
-		t.Fatalf("兜底路径应自动预填，得到 %q", res.Profile.ExecArgs)
-	}
-}
-
 func TestProbeSessionSelfRelaunchUnknownDoesNotPrefill(t *testing.T) {
 	e := probeEnv(t)
 	q := "/opt/Qoder CN/qoder-cn"
@@ -135,25 +118,6 @@ func TestProbeSessionSelfRelaunchUnknownDoesNotPrefill(t *testing.T) {
 	}
 	if !slices.Equal(res.SelfRelaunchArgs, []string{"--ozone-platform=x11"}) {
 		t.Fatalf("诊断字段仍应带出增量，得到 %q", res.SelfRelaunchArgs)
-	}
-}
-
-func TestProbeStraceSelfRelaunchUnknownDoesNotPrefill(t *testing.T) {
-	e := probeEnv(t)
-	e.ProbeCapsOverride = &ProbeCaps{Read: false, Write: true}
-	q := "/opt/Qoder CN/qoder-cn"
-	r := &execFifoRunner{q: q, unknown: true}
-	res, err := e.probeStrace(context.Background(), "qoder", ProbeOptions{
-		Command: []string{q}, Rounds: 2,
-	}, r)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(res.Profile.ExecArgs) != 0 || res.Profile.execArgsFromEvidence {
-		t.Fatalf("unknown 证据不能预填 exec_args：%q", res.Profile.ExecArgs)
-	}
-	if !res.SelfRelaunchUnknown {
-		t.Fatal("应标记 SelfRelaunchUnknown")
 	}
 }
 
@@ -235,5 +199,45 @@ func TestProbeSessionSelfRelaunchAmbiguous(t *testing.T) {
 	}
 	if res.SelfRelaunchUnknown {
 		t.Fatal("ambiguous 不是 unknown，不能混用诊断位")
+	}
+}
+
+// Remove the FIFO pathname after round one while keeping its old inode open.
+// Round two can still write evidence, but its marker must fail, so no cross-round
+// self-relaunch argument may be trusted or drive an automatic retry.
+type markerDropRunner struct {
+	calls int
+	fd    *os.File
+	q     string
+}
+
+func (r *markerDropRunner) Run(_ context.Context, argv []string, _ io.Writer) (SessionResult, error) {
+	r.calls++
+	if r.fd == nil {
+		path := argvLogPath(argv)
+		f, err := os.OpenFile(path, os.O_WRONLY, 0)
+		if err != nil {
+			return SessionResult{}, err
+		}
+		r.fd = f
+		if err := os.Remove(path); err != nil {
+			return SessionResult{}, err
+		}
+	}
+	_, err := fmt.Fprintf(r.fd, "1 execve(%q, [%q], 0x0) = 0\n1 execve(%q, [%q, %q], 0x0) = 0\n", r.q, r.q, r.q, r.q, "--ozone-platform=x11")
+	return SessionResult{Started: true}, err
+}
+func TestProbeRoundMarkerFailureSuppressesPrefillAndRetry(t *testing.T) {
+	e := probeEnv(t)
+	m := &fakeMounter{}
+	r := &markerDropRunner{q: "/synthetic/app"}
+	defer func() {
+		if r.fd != nil {
+			r.fd.Close()
+		}
+	}()
+	res, _, _, _, err := e.ProbeWithRetry(context.Background(), "marker", ProbeOptions{Command: []string{r.q}, Runner: r, Mounter: m, Rounds: 2}, ProbeFinalize{})
+	if !isNoWritesErr(err) || r.calls != 2 || res.RoundMarkerDropped != 1 || len(res.Profile.ExecArgs) != 0 || len(res.SelfRelaunchArgs) != 0 || !containsString(res.ReadsWarns, "round_marker_dropped") {
+		t.Fatalf("unsafe marker evidence: err=%v calls=%d dropped=%d args=%v warns=%v", err, r.calls, res.RoundMarkerDropped, res.Profile.ExecArgs, res.ReadsWarns)
 	}
 }

@@ -4,6 +4,7 @@ import (
 	"sync"
 
 	"codeberg.org/puregotk/puregotk/v4/adw"
+	"codeberg.org/puregotk/puregotk/v4/gdkpixbuf"
 	"codeberg.org/puregotk/puregotk/v4/glib"
 	"codeberg.org/puregotk/puregotk/v4/gobject"
 	"codeberg.org/puregotk/puregotk/v4/gtk"
@@ -18,7 +19,7 @@ import (
 // 这不是内存泄漏，是运行一小时后必崩。
 //
 // 因此渲染路径只登记**处理器**（纯 Go，随页面重建自由增删），C 槽只由下面
-// 五个稳定回调占用：它们是 callbacks 的字段，地址在进程内恒定，注册一次后
+// 六个稳定回调占用：它们是 callbacks 的字段，地址在进程内恒定，注册一次后
 // 永不重新赋值。
 //
 // 这里容易写反的一个事实：puregotk 的 Connect* 以**变量地址**为键缓存
@@ -32,6 +33,9 @@ type callbacks struct {
 	rowFn     func(adw.ActionRow)           // activated（可点行）
 	dialogFn  func(adw.AlertDialog, string) // response（对话框）
 	idleFn    glib.SourceFunc               // 从后台线程切回主线程
+	// sizePrepFn is the sixth stable slot: a per-decode closure would consume
+	// one of purego's 2000 permanent callback slots per icon.
+	sizePrepFn func(gdkpixbuf.PixbufLoader, int32, int32)
 
 	mu      sync.Mutex
 	switchN map[uintptr]func()             // 开关行指针 → 处理器
@@ -39,6 +43,14 @@ type callbacks struct {
 	dialog  map[uintptr]func(string)       // 对话框指针 → 处理器
 	idle    map[uintptr]func(uintptr) bool // idle 序号 → 任务
 	idleSeq uintptr
+	loaders map[uintptr]*iconLoadState // pixbuf loader 指针 → 解码状态
+}
+
+// iconLoadState 是一次文件图标解码的跨回调状态：size-prepared 可能在
+// Write 或 Close 内触发，两处都要能读到同一份判定结果。
+type iconLoadState struct {
+	sized    bool
+	oversize bool
 }
 
 func newCallbacks() *callbacks {
@@ -47,6 +59,7 @@ func newCallbacks() *callbacks {
 		action:  map[uintptr]func(){},
 		dialog:  map[uintptr]func(string){},
 		idle:    map[uintptr]func(uintptr) bool{},
+		loaders: map[uintptr]*iconLoadState{},
 	}
 	c.notifyFn = func(obj gobject.Object, pspec uintptr) {
 		// 只认 active：行在挂载/换父时会发 parent、root 等无关 notify，
@@ -79,6 +92,28 @@ func newCallbacks() *callbacks {
 			fn(resp)
 		}
 	}
+	c.sizePrepFn = func(loader gdkpixbuf.PixbufLoader, w, h int32) {
+		ptr := loader.GoPointer()
+		c.mu.Lock()
+		st := c.loaders[ptr]
+		kind, sw, sh := iconSizeNone, int32(0), int32(0)
+		if st != nil && !st.sized {
+			st.sized = true
+			kind, sw, sh = iconTargetSize(w, h)
+			if kind == iconSizeReject {
+				st.oversize = true
+			}
+		}
+		c.mu.Unlock()
+		switch kind {
+		case iconSizeReject:
+			// A 1x1 request tells the backend to stop allocating for the declared
+			// dimensions; the decode is rejected after Close either way.
+			loader.SetSize(1, 1)
+		case iconSizeScale:
+			loader.SetSize(sw, sh)
+		}
+	}
 	c.idleFn = func(id uintptr) bool {
 		// 先摘掉再执行：任务里再排一个 idle 是正常用法，不能互相顶掉。
 		c.mu.Lock()
@@ -103,6 +138,31 @@ func (c *callbacks) actionHandler(ptr uintptr) func() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.action[ptr]
+}
+
+// loaderBegin/loaderEnd bracket one decode. The size-prepared callback looks the
+// state up by loader pointer, so registration never creates a new C callback.
+func (c *callbacks) loaderBegin(ptr uintptr) {
+	c.mu.Lock()
+	c.loaders[ptr] = &iconLoadState{}
+	c.mu.Unlock()
+}
+
+func (c *callbacks) loaderEnd(ptr uintptr) *iconLoadState {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	st := c.loaders[ptr]
+	delete(c.loaders, ptr)
+	return st
+}
+
+// clearDialogs forgets pending responses when the window is destroyed: GTK does
+// not emit response for a dialog whose window is gone, and the handlers would
+// keep old widgets alive until process exit.
+func (c *callbacks) clearDialogs() {
+	c.mu.Lock()
+	c.dialog = map[uintptr]func(string){}
+	c.mu.Unlock()
 }
 
 // idleAdd 可以从任意后台线程调用：任务表自带锁，C 槽由 idleFn 独占。

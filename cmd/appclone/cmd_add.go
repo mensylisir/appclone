@@ -39,8 +39,8 @@ func newAddCmd(a *app) *cobra.Command {
   add <app> --rediscover --profile-only
                                    只重跑探测并保存档案，不建实例（= GUI「重新探测」）
   add <app> --profile-only         只保存档案
-  add <app> --fork                 新分身从主实例现有数据克隆起步（写时复制，
-                                   不收主实例数据副本；run 时挂 overlay，无 root）`,
+  add <app> --fork                 首次运行建立应用数据的固定副本，
+                                   后续分身写入独立；无需 root`,
 		Args: cobra.RangeArgs(1, 2),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if err := a.applyOverrides(cmd); err != nil {

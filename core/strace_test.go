@@ -1,12 +1,6 @@
 package core
 
 import (
-	"context"
-	"io"
-	"os"
-	"os/exec"
-	"path/filepath"
-	"slices"
 	"strings"
 	"testing"
 )
@@ -110,80 +104,5 @@ func TestStraceCommandShape(t *testing.T) {
 	}
 	if strings.Contains(strings.Join(innerArgs, " "), "--bind  /home/u") {
 		t.Fatalf("NoOverlay 时不该有 merged→HOME 的 bind：%v", innerArgs)
-	}
-}
-
-// logRunner 模拟"应用跑完了、strace 写好日志"：从 argv 里找出 -o 的目标写进去。
-type logRunner struct {
-	body  string
-	calls int
-}
-
-func (l *logRunner) Run(_ context.Context, argv []string, _ io.Writer) (SessionResult, error) {
-	l.calls++
-	for i := 0; i < len(argv)-1; i++ {
-		if argv[i] == "-o" {
-			if err := os.WriteFile(argv[i+1], []byte(l.body), 0o600); err != nil {
-				return SessionResult{}, err
-			}
-		}
-	}
-	return SessionResult{}, nil
-}
-
-// 降级模式的完整链路：strace → 解析 → 归并 → 档案（probe_method = strace）。
-func TestProbeStraceBuildsProfile(t *testing.T) {
-	e := probeEnv(t)
-	home := e.Resolver.Home
-	body := "1  openat(AT_FDCWD, \"" + filepath.Join(home, ".config", "App", "config.ini") + "\", O_WRONLY|O_CREAT, 0666) = 3\n" +
-		"1  openat(AT_FDCWD, \"" + filepath.Join(home, ".cache", "App", "blob") + "\", O_WRONLY|O_CREAT, 0666) = 4\n"
-	r := &logRunner{body: body}
-	res, err := e.probeStrace(context.Background(), "testapp", ProbeOptions{
-		Command: []string{"/nonexistent/zz-probe-test-app"},
-		Runner:  r,
-		Rounds:  1,
-	}, r)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if res.Profile.ProbeMethod != "strace" {
-		t.Fatalf("降级路径必须记 probe_method=strace，得到 %q", res.Profile.ProbeMethod)
-	}
-	if res.Profile.Exec != "/nonexistent/zz-probe-test-app" {
-		t.Fatalf("档案必须自带 exec：%q", res.Profile.Exec)
-	}
-	paths := strings.Join(res.Profile.Paths, ",")
-	if !strings.Contains(paths, "~/.config/App") {
-		t.Fatalf("写入的配置目录应进 paths：%v", res.Profile.Paths)
-	}
-	if strings.Contains(paths, ".cache") {
-		t.Fatalf("缓存不该进 paths：%v", res.Profile.Paths)
-	}
-	if r.calls != 1 {
-		t.Fatalf("Rounds=1 时只该跑一轮，实际 %d", r.calls)
-	}
-}
-
-// 降级不是实现细节：界面要靠这条事件起常驻横幅，否则用户拿到的是一份
-// 低置信度档案却看不出来（tech-stack §4.5 探测页）。
-func TestProbeReportsFallbackToGUI(t *testing.T) {
-	if _, err := exec.LookPath("strace"); err != nil {
-		t.Skip("没有 strace，降级路径不可达")
-	}
-	e := probeEnv(t)
-	r := &logRunner{body: ""}
-	var stages []string
-	_, err := e.Probe(context.Background(), "testapp", ProbeOptions{
-		Command:  []string{"/nonexistent/zz-probe-test-app"},
-		Mounter:  &fakeMounter{failOn: "available"},
-		Runner:   r,
-		Rounds:   1,
-		Progress: func(p ProbeProgress) { stages = append(stages, p.Stage) },
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !slices.Contains(stages, "fallback") {
-		t.Fatalf("降级必须上报 fallback 事件，实际事件：%v", stages)
 	}
 }

@@ -9,7 +9,7 @@ const path = require('path');
 const fs = require('fs');
 const { pathToFileURL } = require('url');
 
-const EXPECTED = 82;   // 断言总数；改动断言必须同步改这里（否则退出码永远是 1）
+const EXPECTED = 88;   // 断言总数；改动断言必须同步改这里（否则退出码永远是 1）
 
 function loadPuppeteer() {
   const cands = [
@@ -264,6 +264,27 @@ const pp = loadPuppeteer();
     }); });
   /* 登录状态（ADR-035）：观测到使用系统密钥环 → 默认开。开启即隐含私有总线与
      runtime，单例行同步点亮并锁住，界面状态与 bwrap 实际行为一致 */
+  await t('共享证书提示在确认/详情可见，密钥环开关不消除，移除共享范围后消失', async () => {
+    return ev(() => {
+      const a = currentApp;
+      a.sharedCertificates = true;
+      renderDialog();
+      const before = document.querySelector('#dlgBody').textContent.includes(sharedCertificateNotice);
+      const kr = document.querySelector('[data-kind="keyring"]');
+      const original = kr.checked;
+      kr.checked = !original;
+      syncKeyringRows();
+      const toggled = document.querySelector('#dlgBody').textContent.includes(sharedCertificateNotice);
+      renderDetail();
+      const detail = document.querySelector('#detShared').textContent.includes(sharedCertificateNotice);
+      delete a.sharedCertificates;
+      renderDialog();
+      renderDetail();
+      return before && toggled && detail
+        && !document.querySelector('#dlgBody').textContent.includes(sharedCertificateNotice)
+        && !document.querySelector('#detShared').textContent.includes(sharedCertificateNotice);
+    });
+  });
   await t('登录状态组始终出现：观测到使用 → 默认开启并锁住单例行', async () => {
     return ev(() => {
       const g = document.querySelector('[data-group="keyring"]');
@@ -317,7 +338,7 @@ const pp = loadPuppeteer();
       if (!f) return 'missing';
       if (f.checked) return 'default-on';
       f.click();
-      return f.checked && document.querySelector('#dlgBody').textContent.includes('写时复制');
+      return f.checked && document.querySelector('#dlgBody').textContent.includes('独立的数据副本');
     });
     return r === true || '克隆起步开关异常：' + r;
   });
@@ -365,6 +386,17 @@ const pp = loadPuppeteer();
       const a = apps.find(x => x.name === '钉钉');
       return !!a && a.instances.length === 1 && a.instances[0].fork === true;
     });
+  });
+
+  await t('克隆首次启动：显示准备数据，停止后旧回调不恢复运行', async () => {
+    await click('[data-launch="0"]');
+    const preparing = await ev(() => document.querySelector('#instBox').textContent.includes('正在准备数据')
+      && !!document.querySelector('[data-stop="0"]') && document.querySelector('[data-del="0"]').disabled);
+    await click('[data-stop="0"]');
+    await click('#alertOk');
+    await new Promise(resolve => setTimeout(resolve, 1600));
+    return preparing && await ev(() => !currentApp.instances[0].running && !currentApp.instances[0].prepared
+      && !!document.querySelector('[data-launch="0"]'));
   });
 
   // —— 屏1 搜索（397 个应用的入场券）——
@@ -483,22 +515,22 @@ const pp = loadPuppeteer();
     await click('#dlgCancel');
     return ok || '链接线索被当成证据默认开启，或没有单例组时该组消失了';
   });
-  await t('降级横幅 → 可"了解"关闭，且不影响开关', async () => { await click('#btnSoftBanner');
+  await t('配置不可用横幅 → 可收起，列表仍可操作', async () => { await click('#btnSoftBanner');
     const shown = await ev(() => document.querySelector('#bannerSoft').classList.contains('show')
       && !document.body.classList.contains('blocked'));
     await click('#bannerSoftDismiss');
     return shown && await ev(() => !document.querySelector('#bannerSoft').classList.contains('show')); });
-  /* 「了解」只收起列表那条横幅，**不改变降级这个事实**：探测页里必须照旧说明"结果可能不完整"，
-     否则用户在最需要知道这一点的时刻（确认勾选之前）看不到任何提示。
-     原生里窗口顶部那条被 push 页遮住，所以探测页有自己的 AdwBanner */
-  await t('降级横幅在探测页常驻（关掉列表那条也不消失）', async () => {
+  /* 收起列表提示不改变后端不可用状态，配置页仍须阻止目标应用启动。 */
+  await t('收起横幅后仍阻止缺少写层的新探测', async () => {
     await click('[data-sw="slack"]');
     /* 断言"可见"而不是"有 class"：class 在、CSS 却 display:none 的情况一样是没提示 */
     const shown = await ev(() => document.querySelector('#overlay').classList.contains('open')
       && !!document.querySelector('#dlgBanner').offsetParent
-      && document.querySelector('#dlgBanner').textContent.includes('兼容模式'));
+      && document.querySelector('#dlgBanner').textContent.includes('无法安全')
+      && dlgState === 'error' && probeTimer === null && probeTick === null);
     await click('#dlgCancel');
-    return shown || '探测页里看不到降级说明';
+    await click('#btnSoftBanner'); // 恢复写层可用，再执行后续正常探测用例
+    return shown || '缺少写层仍然启动了探测';
   });
   /* 取"第一行"是弱断言：`#unconfBox` 的首行可能是"没有匹配/全部已开启"提示行，
      点提示行当然不进详情。必须点一个**真实应用**行 */
@@ -528,10 +560,38 @@ const pp = loadPuppeteer();
       && document.querySelector('[data-scr="2"]').getAttribute('aria-selected') === 'true'
       && document.querySelector('[data-scr="3"]').getAttribute('aria-selected') === 'false'); });
 
+  await t('结束本轮：应用未启动时禁用', async () => {
+    await click('[data-sw="slack"]');
+    const ok = await ev(() => !!document.querySelector('#finishProbeRound')?.disabled && probeSessionToken === 0);
+    await click('#dlgCancel'); return ok;
+  });
+  await t('结束本轮：双击幂等，保持探测而不创建档案', async () => {
+    await click('[data-sw="slack"]');
+    await waitFor(() => probeSessionToken !== 0);
+    return ev(() => {
+      const token = probeSessionToken;
+      return finishProbeRound(token) && !finishProbeRound(token) && dlgState === 'probing'
+        && document.querySelector('#finishProbeRound').disabled;
+    });
+  });
+  await t('结束本轮：旧令牌不能结束下一轮', async () => {
+    const old = await ev(() => probeTokenSerial);
+    await waitFor(() => probeRound === 2 && probeSessionToken !== 0);
+    return ev((old) => !finishProbeRound(old) && probePhase === 'running', old);
+  });
+  await t('结束本轮：确认页保留路径并标明部分证据', async () => {
+    await waitFor(() => dlgState === 'confirm');
+    const ok = await ev(() => !!document.querySelector('[data-banner="manual-finish"]')
+      && !!document.querySelector('[data-banner="reads-partial"]') && !!document.querySelector('[data-chk]'));
+    await click('#dlgCancel'); return ok;
+  });
+
   // —— 屏3 失败态：零写入 → error，不生成空档案 ——
   await t('探测零写入 → 失败态，且不生成空档案', async () => {
     await click('[data-sw="chrome"]');
-    const arrived = await waitFor(() => document.querySelector('#dlgConfirm').textContent === '重试');
+    const arrived = await waitFor(() => dlgState === 'error'
+      && !!document.querySelector('#dlgConfirm').offsetParent
+      && document.querySelector('#dlgConfirm').textContent === '重试');
     return arrived && await ev(() => document.querySelector('#dlgBody').textContent.includes('这次没有跟踪到任何写入')
       && !document.querySelector('[data-chk]')      // 没有可确认的路径
       && !document.querySelector('#dlgConfirm').disabled); });   // 「重试」必须点得动

@@ -46,8 +46,7 @@ func TestOverlayAvailableUsesInjectedMounter(t *testing.T) {
 	}
 }
 
-// ADR-032：只有后端确实缺失且 strace 可用才降级；挂载被拒（权限/沙盒）
-// 不算降级——GUI 不能挂"已改用 strace"的横幅骗用户。
+// ADR-039：任何后端错误均不得启用可写真实 HOME 的 strace 降级。
 func TestProbeFallsBackToStrace(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("PATH", dir)
@@ -58,8 +57,8 @@ func TestProbeFallsBackToStrace(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "strace"), []byte("#!/bin/sh\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if !ProbeFallsBackToStrace(missing) {
-		t.Fatal("后端缺失 + strace 可用时应降级")
+	if ProbeFallsBackToStrace(missing) {
+		t.Fatal("strace 可用也不能代替安全写层")
 	}
 	denied := errEnv("err.probe.mount_failed", map[string]any{"output": "Permission denied"}, nil)
 	if ProbeFallsBackToStrace(denied) {

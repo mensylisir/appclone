@@ -3,6 +3,7 @@ package core
 import (
 	"context"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -16,8 +17,8 @@ func TestProbeLiveProgressE2E(t *testing.T) {
 	if os.Getenv("APPCLONE_PROBE_LIVE_E2E") != "1" {
 		t.Skip("set APPCLONE_PROBE_LIVE_E2E=1 for real probe acceptance")
 	}
-	for _, cancelDuringRound := range []bool{false, true} {
-		t.Run(map[bool]string{false: "complete", true: "cancel"}[cancelDuringRound], func(t *testing.T) {
+	for _, mode := range []string{"complete", "cancel", "finish"} {
+		t.Run(mode, func(t *testing.T) {
 			e := probeEnv(t)
 			e.UID, e.Resolver.UID = os.Getuid(), os.Getuid()
 			e.ProbeCapsOverride = nil
@@ -52,18 +53,24 @@ func TestProbeLiveProgressE2E(t *testing.T) {
 			defer cancel()
 			live := map[int]bool{}
 			var stages []string
-			res, err := e.Probe(ctx, "progressdemo", ProbeOptions{Command: []string{app},
+			control := &ProbeControl{}
+			capture := &probeCaptureRunner{}
+			finished := map[int]bool{}
+			res, err := e.Probe(ctx, "progressdemo", ProbeOptions{Command: []string{app}, Control: control, Runner: capture,
 				Progress: func(p ProbeProgress) {
 					stages = append(stages, p.Stage)
 					if p.Stage == "round_running" && p.Elapsed >= time.Second {
 						live[p.Round] = p.ReadAvailable && p.Reads > 0
-						if cancelDuringRound {
+						if mode == "finish" && p.CanFinish {
+							finished[p.Round] = control.Finish(p.SessionToken)
+						}
+						if mode == "cancel" {
 							cancel()
 						}
 					}
 				},
 			})
-			if cancelDuringRound {
+			if mode == "cancel" {
 				if !errors.Is(err, ErrCanceled) {
 					t.Fatalf("cancel: %v", err)
 				}
@@ -77,6 +84,9 @@ func TestProbeLiveProgressE2E(t *testing.T) {
 				if res.Profile.ProbeMethod != "overlay" || len(res.Profile.Paths) == 0 || !live[1] || !live[2] {
 					t.Fatalf("incomplete overlay/round evidence: method=%s paths=%d live=%v", res.Profile.ProbeMethod, len(res.Profile.Paths), live)
 				}
+				if mode == "finish" && (res.ReadTrace != ReadTracePartial || !finished[1] || !finished[2] || !containsString(res.ReadsWarns, "manual_finish")) {
+					t.Fatalf("manual evidence: trace=%s finished=%v warns=%v", res.ReadTrace, finished, res.ReadsWarns)
+				}
 				if stages[len(stages)-1] != "round_done" {
 					t.Fatal(stages)
 				}
@@ -86,6 +96,11 @@ func TestProbeLiveProgressE2E(t *testing.T) {
 			}
 			if _, err := os.Stat(filepath.Join(e.Resolver.Home, "Downloads", "progress-shared")); err != nil {
 				t.Fatalf("shared file missing: %v", err)
+			}
+			for _, p := range capture.processes {
+				if !sessionGroupGone(p.PGID) {
+					t.Fatalf("session group remains: %d", p.PGID)
+				}
 			}
 			items, err := os.ReadDir(e.TmpRoot)
 			if err != nil {
@@ -98,4 +113,20 @@ func TestProbeLiveProgressE2E(t *testing.T) {
 			}
 		})
 	}
+}
+
+// The wrapper records process identities without changing the real runner path.
+type probeCaptureRunner struct{ processes []SessionProcess }
+
+func (r *probeCaptureRunner) Run(ctx context.Context, argv []string, w io.Writer) (SessionResult, error) {
+	return r.RunWithStart(ctx, argv, w, nil)
+}
+func (r *probeCaptureRunner) RunWithStart(ctx context.Context, argv []string, w io.Writer, start func(SessionProcess) error) (SessionResult, error) {
+	return (setsidRunner{}).RunWithStart(ctx, argv, w, func(p SessionProcess) error {
+		r.processes = append(r.processes, p)
+		if start != nil {
+			return start(p)
+		}
+		return nil
+	})
 }

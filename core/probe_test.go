@@ -390,20 +390,6 @@ func TestProbeSessionCancelUnmountsBeforeCleanup(t *testing.T) {
 	}
 }
 
-// strace 降级路径没有可保留的写层现场：超时必须用自己的文案，不能复用
-// overlay 的 err.probe.timeout（那条带 {quarantine}，这里没有参数可填，
-// 会直接给用户显示字面量）。
-func TestProbeStraceTimeoutUsesOwnKey(t *testing.T) {
-	e := probeEnv(t)
-	r := &fakeRunner{err: context.DeadlineExceeded}
-	_, err := e.probeStrace(context.Background(), "testapp",
-		ProbeOptions{Command: []string{"/nonexistent/zz-probe-test-app"}, Runner: r}, r)
-	var ce *Error
-	if !errors.As(err, &ce) || ce.Key != "err.probe.timeout_strace" {
-		t.Fatalf("strace 超时应返回 err.probe.timeout_strace，得到 %v", err)
-	}
-}
-
 // 取消时写层为空：没有现场可保留，不能留一个空 quarantine 目录。
 func TestProbeSessionCancelEmptyUpperLeavesNoScene(t *testing.T) {
 	e := probeEnv(t)
