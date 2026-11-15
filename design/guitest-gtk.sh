@@ -13,9 +13,16 @@
 #     额外跑 TestGtkRealInputUinput：真实触摸点切换器、真实按键输入搜索框，
 #     事件走 libinput → GDK → 控件。窗口在用例期间全屏，结束即恢复。
 #     X11/Xvfb 下不启用：事件进宿主 seat，可能落到别的应用上。
+#   - 第三层：调用者先手动把桌面输入法切到中文，并额外给 APPCLONE_GTK_IME=1，
+#     才跑 TestGtkRealInputChineseIME（拼音 → 空格提交候选 → 逐字退格）。
+#     门禁不读取也不改写用户 IME 配置；没给该变量时按 SKIP 校验，给了则必须
+#     PASS。显式请求真实输入但环境不满足时，闸门以退出码 5 失败，不把 SKIP
+#     记成通过。
 #
 # 注意：这个闸门在当前桌面**真的开窗口**（uinput 用例还会全屏并抢焦点）。
-# 不要在有用户操作的会话里循环重跑；无人值守时用 xvfb-run（真实输入会自动 SKIP）。
+# 不要在有用户操作的会话里循环重跑；无人值守时用 xvfb-run——未显式 opt-in 时
+# 真实输入自动 SKIP，显式给出 APPCLONE_GTK_UINPUT=1/APPCLONE_GTK_IME=1 但环境
+# 不满足时闸门以退出码 5 失败，不会把降级记成通过。
 #
 # 需要可用的显示与宿主 `bwrap`（缺任何一个都直接报错，不要让它跑 45 秒
 # 超时后才发现环境不对）；在假 HOME 下运行（不碰真实主目录），并临时构建
@@ -62,6 +69,9 @@ export APPCLONE_GTK_GUI_BIN="$WORK/appclone-gui"
 # 在自己的 server 里 active，事件却落到宿主的其他应用上。默认关闭，宁可 SKIP
 # 也不冒险；CI 没有 /dev/uinput，该用例会 SKIP——门禁检查这一行，不允许它静默消失。
 CALLER_UINPUT="${APPCLONE_GTK_UINPUT:-}"
+# 中文输入法用例还要求调用者先把桌面输入法切到中文：IME 引擎与激活态属于
+# 用户配置，门禁不改写它。未显式给出 APPCLONE_GTK_IME=1 时该用例 SKIP。
+CALLER_IME="${APPCLONE_GTK_IME:-0}"
 UINPUT=0
 UINPUT_WHY=""
 if [ "$CALLER_UINPUT" = 1 ]; then
@@ -78,6 +88,21 @@ if [ "$CALLER_UINPUT" = 1 ]; then
   else
     UINPUT=1
   fi
+fi
+# 显式请求与自动降级必须分开：调用者已经声明要跑真实输入，却因环境不满足
+# 而全部 SKIP 时，退出码 0 会被验收脚本记成「闸门通过」。此时直接失败；
+# 默认未 opt-in 的 SKIP 仍然放行（CI/Xvfb 不设置这些变量）。
+if [ "$CALLER_UINPUT" = 1 ] && [ "$UINPUT" != 1 ]; then
+  echo "guitest-gtk: 已请求真实注入（APPCLONE_GTK_UINPUT=1）但未启用：$UINPUT_WHY" >&2
+  exit 5
+fi
+if [ "$CALLER_IME" = 1 ] && [ "$UINPUT" != 1 ]; then
+  IME_WHY="$UINPUT_WHY"
+  if [ "$CALLER_UINPUT" != 1 ]; then
+    IME_WHY="未设置 APPCLONE_GTK_UINPUT=1（中文用例依赖真实注入）"
+  fi
+  echo "guitest-gtk: 已请求中文输入法用例（APPCLONE_GTK_IME=1），但真实注入未启用：$IME_WHY" >&2
+  exit 5
 fi
 export APPCLONE_GTK_UINPUT="$UINPUT"
 
@@ -163,8 +188,12 @@ for name in TestGtkFinishProbeRound TestGtkScreensLifecycle TestGtkLandsOnClones
             TestReadsBannerPartsStates TestMergeWarnKeys \
             TestRetryActionReaderStuck \
             TestGtkRealInputUinput \
-            TestGtkRealInputStartStop; do
+            TestGtkRealInputStartStop \
+            TestGtkRealInputChineseIME; do
   if { [ "$name" = TestGtkRealInputUinput ] || [ "$name" = TestGtkRealInputStartStop ]; } && [ "$UINPUT" != 1 ]; then
+    continue
+  fi
+  if [ "$name" = TestGtkRealInputChineseIME ] && { [ "$UINPUT" != 1 ] || [ "$CALLER_IME" != 1 ]; }; then
     continue
   fi
   if ! grep -q -- "--- PASS: $name" "$LOG"; then
@@ -185,5 +214,14 @@ if [ "$UINPUT" != 1 ]; then
     echo "guitest-gtk: 已请求真实注入但未启用：$UINPUT_WHY，用例 SKIP" >&2
   else
     echo "guitest-gtk: 未设置 APPCLONE_GTK_UINPUT=1（真实注入默认关闭），用例 SKIP" >&2
+  fi
+fi
+if [ "$UINPUT" != 1 ] || [ "$CALLER_IME" != 1 ]; then
+  if ! grep -q -- "--- SKIP: TestGtkRealInputChineseIME" "$LOG"; then
+    echo "guitest-gtk: 中文输入法用例未启用，但也没看到它的 SKIP" >&2
+    exit 5
+  fi
+  if [ "$UINPUT" = 1 ] && [ "$CALLER_IME" != 1 ]; then
+    echo "guitest-gtk: 未设置 APPCLONE_GTK_IME=1（中文输入法用例默认关闭，需先把桌面输入法切到中文），用例 SKIP" >&2
   fi
 fi
