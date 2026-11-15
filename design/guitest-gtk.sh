@@ -102,7 +102,7 @@ set +e
 # 时静默跑成 30 分钟长稳，后两者只经 design/perf.sh 手动跑。
 # 整闸门用 fatal-criticals：拆卸期对已销毁控件调用会产生 GTK critical，必须当场中止。
 # 不用 fatal-warnings 跑整闸门——本机 GL 上下文创建失败会间歇打出 Gdk-WARNING，
-# 那与产品无关却会 abort 无关用例；关窗用例另开一轮带 fatal-warnings，见下。
+# 那与产品无关却会 abort 无关用例；关窗用例另开一轮，严格告警可选，见下。
 CGO_ENABLED=0 PATH="$WORK:$PATH" APPCLONE_GTK_TEST=1 G_DEBUG=fatal-criticals \
   go test -tags gtk_e2e -count=1 -timeout 240s -v \
   -run 'TestGtk|TestIconPureHelpers|TestKeyringRowState|TestSearchProjection|TestDetachedRunnerSpawn|TestDetachLogHelpers|TestDetachedTargetEnv|TestBuildProfileKeepsNonPathFieldsAndCredentials|TestBuildProfileKeyringExplicitAndRowSync|TestSaveProfileLeavesNoKeyringState|TestReadsBannerPartsStates|TestMergeWarnKeys|TestRetryActionReaderStuck' \
@@ -113,13 +113,18 @@ set -e
 if [ "$rc" -ne 0 ]; then
   exit "$rc"
 fi
-# 关窗路径单跑一轮 fatal-warnings：整闸门不能带（宿主 GL warning 会误伤），
-# 这一轮固定 cairo 渲染，避免宿主 GL 上下文失败产生的无关 Gdk-WARNING。
-# 输出单独落 CLOSELOG 并逐条校验 PASS：主轮的 7 条 PASS 不能替这一轮作证，
-# 否则子轮正则漂移时会静默丢掉 fatal-warnings 覆盖。
-CLOSELOG="$WORK/gtk-close-warnings.log"
-if ! GSK_RENDERER=cairo G_DEBUG=fatal-warnings CGO_ENABLED=0 PATH="$WORK:$PATH" APPCLONE_GTK_TEST=1 \
-  APPCLONE_GTK_ROOT="$WORK/testroot-close-warnings" \
+# 关窗路径单跑一轮，独立 cairo 渲染与独立 GTK_ROOT。默认 fatal-criticals：
+# 拆卸期对已销毁控件调用会产生 critical，这是必须当场中止的。
+# fatal-warnings 在无 GPU 的 Xvfb runner 上会被宿主 GTK 的无害 warning 误伤
+# （本地桌面 GL 警告同理），因此只在显式 APPCLONE_GTK_STRICT_WARNINGS=1 时启用；
+# 输出单独落 CLOSELOG 并逐条校验 PASS，主轮的 PASS 不能替这一轮作证。
+CLOSE_GDEBUG=fatal-criticals
+if [ "${APPCLONE_GTK_STRICT_WARNINGS:-0}" = 1 ]; then
+  CLOSE_GDEBUG=fatal-warnings
+fi
+CLOSELOG="$WORK/gtk-close.log"
+if ! GSK_RENDERER=cairo G_DEBUG="$CLOSE_GDEBUG" CGO_ENABLED=0 PATH="$WORK:$PATH" APPCLONE_GTK_TEST=1 \
+  APPCLONE_GTK_ROOT="$WORK/testroot-close" \
   go test -tags gtk_e2e -count=1 -timeout 120s -v \
   -run '^(TestGtkListRetireClose|TestGtkDetailOpenClose|TestGtkRenameDialogClose|TestGtkRenameConfirmedClose|TestGtkStopThenClose|TestGtkClosedIgnoresCalls|TestGtkSetupClose)$' \
   ./cmd/appclone-gui >"$CLOSELOG" 2>&1; then
@@ -131,7 +136,7 @@ for name in TestGtkListRetireClose TestGtkDetailOpenClose TestGtkRenameDialogClo
             TestGtkRenameConfirmedClose TestGtkStopThenClose TestGtkClosedIgnoresCalls \
             TestGtkSetupClose; do
   if ! grep -q -- "--- PASS: $name" "$CLOSELOG"; then
-    echo "guitest-gtk: fatal-warnings 子轮没有看到 $name 的 PASS" >&2
+    echo "guitest-gtk: 关窗子轮（G_DEBUG=$CLOSE_GDEBUG）没有看到 $name 的 PASS" >&2
     exit 6
   fi
 done

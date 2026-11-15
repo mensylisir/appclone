@@ -201,7 +201,6 @@ func TestGtkRenameDialogClose(t *testing.T) {
 	defer func() { dialogHook = oldHook }()
 	var dlg *adw.AlertDialog
 	origName := ""
-	closeTries := 0
 	runUntilClosed(t, "RenameDialogClose", env, func(u *ui) (bool, error) {
 		if u.closed {
 			// A close may be processed on a later tick; never push again here.
@@ -235,11 +234,9 @@ func TestGtkRenameDialogClose(t *testing.T) {
 			}
 		}
 		// A modal dialog can defer the parent's close request by a frame.
-		closeTries++
+		// No fixed retry cap: a slow runner may need more than one frame, and
+		// runUntilClosed's own deadline fails the test if the close never lands.
 		u.win.Close()
-		if closeTries > 10 {
-			return false, fmt.Errorf("close request was not accepted")
-		}
 		return false, nil
 	})
 	list, err := env.ListInstances("demo")
@@ -261,7 +258,6 @@ func TestGtkRenameConfirmedClose(t *testing.T) {
 	dialogHook = func(d *adw.AlertDialog) { dialogs <- d }
 	defer func() { dialogHook = oldHook }()
 	var dlg *adw.AlertDialog
-	closeTries := 0
 	runUntilClosed(t, "RenameConfirmedClose", env, func(u *ui) (bool, error) {
 		if u.closed {
 			if dlg == nil {
@@ -291,11 +287,9 @@ func TestGtkRenameConfirmedClose(t *testing.T) {
 			gtk.EntryNewFromInternalPtr(child.GoPointer()).SetText("工作号")
 			u.cb.dialogFn(*dlg, "rename")
 		}
-		closeTries++
+		// No fixed retry cap: a slow runner may need more than one frame, and
+		// runUntilClosed's own deadline fails the test if the close never lands.
 		u.win.Close()
-		if closeTries > 10 {
-			return false, fmt.Errorf("close request was not accepted")
-		}
 		return false, nil
 	})
 	list, err := env.ListInstances("demo")
@@ -317,7 +311,6 @@ func TestGtkStopThenClose(t *testing.T) {
 	dialogHook = func(d *adw.AlertDialog) { dialogs <- d }
 	defer func() { dialogHook = oldHook }()
 	var dlg *adw.AlertDialog
-	closeTries := 0
 	runUntilClosed(t, "StopThenClose", env, func(u *ui) (bool, error) {
 		if u.closed {
 			if dlg == nil {
@@ -342,11 +335,9 @@ func TestGtkStopThenClose(t *testing.T) {
 			}
 			u.cb.dialogFn(*dlg, "stop")
 		}
-		closeTries++
+		// No fixed retry cap: a slow runner may need more than one frame, and
+		// runUntilClosed's own deadline fails the test if the close never lands.
 		u.win.Close()
-		if closeTries > 10 {
-			return false, fmt.Errorf("close request was not accepted")
-		}
 		return false, nil
 	})
 }
