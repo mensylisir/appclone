@@ -125,13 +125,15 @@ set +e
 # -skip：长稳用例（TestGtkSoakRenderList）与性能用例（TestGtkSearchPerformance、
 # TestGtkDistinctIconBatches）会污染常规闸门——前者在残留 APPCLONE_GTK_SOAK_MIN
 # 时静默跑成 30 分钟长稳，后两者只经 design/perf.sh 手动跑。
+# TestGtkLegacyReprobeRealProbe 会真启动假应用跑完整探测会话（需要 bwrap +
+# FUSE），只在手动冒烟时用 APPCLONE_GTK_REAL_PROBE=1 单独跑，不进 CI 闸门。
 # 整闸门用 fatal-criticals：拆卸期对已销毁控件调用会产生 GTK critical，必须当场中止。
 # 不用 fatal-warnings 跑整闸门——本机 GL 上下文创建失败会间歇打出 Gdk-WARNING，
 # 那与产品无关却会 abort 无关用例；关窗用例另开一轮，严格告警可选，见下。
 CGO_ENABLED=0 PATH="$WORK:$PATH" APPCLONE_GTK_TEST=1 G_DEBUG=fatal-criticals \
   go test -tags gtk_e2e -count=1 -timeout 240s -v \
   -run 'TestGtk|TestIconPureHelpers|TestKeyringRowState|TestSearchProjection|TestDetachedRunnerSpawn|TestDetachLogHelpers|TestDetachedTargetEnv|TestBuildProfileKeepsNonPathFieldsAndCredentials|TestBuildProfileKeyringExplicitAndRowSync|TestSaveProfileLeavesNoKeyringState|TestReadsBannerPartsStates|TestMergeWarnKeys|TestRetryActionReaderStuck' \
-  -skip '^(TestGtkSoakRenderList|TestGtkSearchPerformance|TestGtkDistinctIconBatches)$' ./cmd/appclone-gui \
+  -skip '^(TestGtkSoakRenderList|TestGtkSearchPerformance|TestGtkDistinctIconBatches|TestGtkLegacyReprobeRealProbe)$' ./cmd/appclone-gui \
   2>&1 | tee "$LOG"
 rc=${PIPESTATUS[0]}
 set -e
@@ -187,6 +189,8 @@ for name in TestGtkFinishProbeRound TestGtkScreensLifecycle TestGtkLandsOnClones
             TestBuildProfileKeyringExplicitAndRowSync TestSaveProfileLeavesNoKeyringState \
             TestReadsBannerPartsStates TestMergeWarnKeys \
             TestRetryActionReaderStuck \
+            TestGtkLegacyReprobeBanner TestGtkLegacyReprobeCancel \
+            TestGtkLegacyReprobeLanded TestGtkLegacyReprobeErrorPaths \
             TestGtkRealInputUinput \
             TestGtkRealInputStartStop \
             TestGtkRealInputChineseIME; do

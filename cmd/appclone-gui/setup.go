@@ -85,6 +85,27 @@ type setupView struct {
 	// degraded 记录降级横幅是否已起：读证据告警要拼在它后面，不能把它顶掉。
 	degraded bool
 
+	// probeEpoch 标识"当前这一场探测"。取消、重探、重试都会自增；旧 goroutine
+	// 排队到主线程的进度/告警/失败/结果一律按 epoch 丢弃。只看 done 不够：
+	// 就地重探取消后页面仍然活着，旧探测的迟到回调会污染恢复后的确认页。
+	probeEpoch    uint64
+	probeInFlight bool
+	// probeHook 是测试注入点：非 nil 时 probe() 进入探测态后立即调用它并返回，
+	// 不启动真实探测会话（生产恒为 nil）。闸门用它钉住「横幅按钮 → reprobeLegacy
+	// → probe」的正向接线，而不在 CI 里真启动目标应用。
+	probeHook func()
+	// 旧档案就地重探：reprobeSnap 是「点重新探测前确认页」的完整快照（取消时
+	// 原样恢复）；reprobeFromConfirm 表示当前确认页来自一次就地重探（用于展示
+	// 范围变化告警）；reprobeBaseline 是重探前的旧隔离范围。
+	reprobeSnap        *confirmSnapshot
+	reprobeFromConfirm bool
+	reprobeBaseline    []string
+	reprobeDropped     []string
+	// reprobeDraining：取消重探后旧探测仍在回收（最长约 2s）。此时确认页可见，
+	// 但禁止再发一场探测/保存/创建——旧探测还持着 OpenState 锁，抢跑只会撞
+	// 锁超时；也避免早退的 idle 把新探测的 Hold 提前 Release。
+	reprobeDraining bool
+
 	state  string
 	cancel context.CancelFunc
 	done   bool
@@ -100,6 +121,251 @@ type setupView struct {
 	// scope 是确认页这一轮的处理器，重建确认页时整体注销。
 	fixed *renderScope
 	scope *renderScope
+}
+
+// confirmSnapshot 是「点重新探测前确认页」的完整快照。取消重探 = 什么都没
+// 发生：路径勾选、非路径开关、读证据与登录态证据都必须回到原样，页面也不能
+// 被 pop。字段只收会被重探改掉或恢复时要用到的状态。
+type confirmSnapshot struct {
+	profile         core.Profile
+	cands           []core.Candidate // selectedCandidates()：行勾选已写回 Checked
+	existing        core.Profile
+	hasExisting     bool
+	readTrace       string
+	readsWarns      []string
+	keyringEvidence string
+	prefilled       int
+	fork            bool
+	rowsActive      map[int]bool // 路径行 index → active
+	lockActive      bool
+	dbusActive      bool
+	runtimeActive   bool
+	keyringActive   bool
+	// 重探状态也属于「原确认页」：第二次重探可能发生在第一次已落案（读证据仍
+	// 不完整）之后，那一页带着「N 条旧路径不再隔离」的告警。取消第二次重探
+	// 必须把告警与原始基线一起带回来，否则用户会在没有任何提示的情况下确认
+	// 一份已经被收窄的范围（对抗复审 P1）。
+	reprobeFromConfirm bool
+	reprobeBaseline    []string
+	reprobeDropped     []string
+}
+
+func (v *setupView) captureConfirmSnapshot() *confirmSnapshot {
+	snap := &confirmSnapshot{
+		profile:         v.profile,
+		cands:           v.selectedCandidates(),
+		existing:        v.existing,
+		hasExisting:     v.hasExisting,
+		readTrace:       v.readTrace,
+		readsWarns:      append([]string{}, v.readsWarns...),
+		keyringEvidence: v.keyringEvidence,
+		prefilled:       v.prefilled,
+		fork:            v.fork,
+		rowsActive:      map[int]bool{},
+
+		reprobeFromConfirm: v.reprobeFromConfirm,
+		// 必须用 slices.Clone：append([]string{}, nil...) 得到非 nil 空切片，
+		// 恢复后「基线尚未取」的 nil 哨兵会被击穿，第二次重探不再计算基线，
+		// 范围收窄将无告警落盘（复审 P1）。
+		reprobeBaseline: slices.Clone(v.reprobeBaseline),
+		reprobeDropped:  slices.Clone(v.reprobeDropped),
+	}
+	for i, row := range v.rows {
+		snap.rowsActive[i] = row.GetActive()
+	}
+	if v.lockRow != nil {
+		snap.lockActive = v.lockRow.GetActive()
+	}
+	if v.dbusRow != nil {
+		snap.dbusActive = v.dbusRow.GetActive()
+	}
+	if v.runtimeRow != nil {
+		snap.runtimeActive = v.runtimeRow.GetActive()
+	}
+	if v.keyringRow != nil {
+		snap.keyringActive = v.keyringRow.GetActive()
+	}
+	return snap
+}
+
+// restoreConfirmSnapshot 把页面恢复成点重新探测之前的样子。
+//
+// 顺序是契约：**先清本场探测的状态，再还原快照里的重探状态，最后重建页面**。
+// renderConfirm 末尾会按 reprobeFromConfirm 重算范围告警；这里必须用快照的
+// 值而不是无条件清空——第二次重探取消要回到第一次落案后那个带告警的确认页，
+// 否则用户会在没有范围变化提示的情况下确认一份已收窄的档案（复审 P1）。
+func (v *setupView) restoreConfirmSnapshot() {
+	snap := v.reprobeSnap
+	if snap == nil {
+		return
+	}
+	v.reprobeSnap = nil
+	v.reprobeFromConfirm = snap.reprobeFromConfirm
+	v.reprobeBaseline = slices.Clone(snap.reprobeBaseline)
+	v.reprobeDropped = slices.Clone(snap.reprobeDropped)
+	v.retry = nil
+	v.cancel = nil
+	v.probeControl = nil
+
+	v.profile = snap.profile
+	v.cands = snap.cands
+	v.existing = snap.existing
+	v.hasExisting = snap.hasExisting
+	v.readTrace = snap.readTrace
+	v.readsWarns = snap.readsWarns
+	v.keyringEvidence = snap.keyringEvidence
+	v.prefilled = snap.prefilled
+	v.fork = snap.fork
+	// 探测期间自检可能已把 FUSE 判成不可用并撤销了克隆起步；快照里的 true
+	// 不能把它点亮回来——那会得到一个「勾了克隆但没有克隆数据」的空实例。
+	if v.u.fuseBlocked || v.u.fatal {
+		v.fork = false
+	}
+	// 不盲抄快照：按恢复后的档案重算，strace 档案才保留降级说明。
+	v.degraded = snap.profile.ProbeMethod == "strace"
+
+	v.setState("confirm")
+	v.renderConfirm()
+	for i, active := range snap.rowsActive {
+		if row := v.rows[i]; row != nil {
+			row.SetActive(active)
+		}
+	}
+	if v.lockRow != nil {
+		v.lockRow.SetActive(snap.lockActive)
+	}
+	if v.dbusRow != nil {
+		v.dbusRow.SetActive(snap.dbusActive)
+	}
+	if v.runtimeRow != nil {
+		v.runtimeRow.SetActive(snap.runtimeActive)
+	}
+	if v.keyringRow != nil {
+		v.keyringRow.SetActive(snap.keyringActive)
+	}
+	v.syncKeyringRows()
+	v.updateConfirmGate()
+	v.syncReadsBanner()
+}
+
+// canStartReprobe 是重探入口的唯一条款：入口守卫、横幅按钮可见性都调它，
+// 两处各写一份条件迟早出现"按钮在、点了没反应"。
+func (v *setupView) canStartReprobe() bool {
+	return !v.done && !v.u.closed && v.state == "confirm" && v.mode == "open" &&
+		v.readTrace != core.ReadTraceOK && !v.u.fuseBlocked && !v.u.fatal &&
+		v.reprobeSnap == nil && !v.reprobeDraining && !v.probeInFlight
+}
+
+// cancelReprobe 取消一场就地重探并恢复确认页。返回 false 表示当前没有可恢复
+// 的重探（调用方按普通取消处理）。
+func (v *setupView) cancelReprobe() bool {
+	if v.done || v.reprobeSnap == nil {
+		return false
+	}
+	if v.state != "probing" && v.state != "error" {
+		return false
+	}
+	// 先作废旧探测，再恢复页面：旧 goroutine 在取消回收期间仍会排队回调，
+	// epoch 不匹配的一律丢弃。
+	v.probeEpoch++
+	v.probeSeq++
+	v.probeInFlight = false
+	if v.cancel != nil {
+		v.cancel()
+		v.cancel = nil
+	}
+	// 探测已结束的 error 态不需要 drain：settleProbe 早已跑过。
+	if v.state == "probing" {
+		v.reprobeDraining = true
+	}
+	v.restoreConfirmSnapshot()
+	return true
+}
+
+// cancelAction 是所有"取消"入口（HeaderBar 按钮、Esc、确认页取消）的唯一语义。
+func (v *setupView) cancelAction() {
+	// 创建中是事务态：任何取消都无效（§6.1），与 Esc/返回同一规则。
+	if v.state == "creating" {
+		return
+	}
+	if v.cancelReprobe() {
+		return
+	}
+	v.finish(false)
+}
+
+// prepareProbeBases 为一次探测准备 existing 与 bundled。返回 false 表示已经
+// 展示了错误页（调用方直接退出）。
+//
+// loadExisting：start 的 reconfig/rediscover 从磁盘读旧档案；就地重探的
+// existing 来自当前确认页内存（用户刚拨的非路径开关就在里面），不能再被
+// 磁盘版本覆盖。
+func (v *setupView) prepareProbeBases(loadExisting bool) bool {
+	if loadExisting {
+		// 重新配置/重新探测只重定案**路径**：既有档案的 env、extra_binds、
+		// isolate_runtime、audit、未知字段是用户的显式配置，探测产物里没有它们。
+		// 不先把它们收好，重建出来的档案会把它们整片抹掉（P1，复审发现）。
+		if p, err := v.u.env.LoadProfile(v.appKey); err == nil {
+			v.existing = p
+			v.hasExisting = true
+		} else if errorKey(err) != "err.profile.not_found" {
+			// 版本超前 / 档案损坏不是"没有档案"：继续探测会把这份档案覆盖掉
+			// （§5.5 要求拒绝加载并提示）。
+			v.showProfileRejected(err)
+			return false
+		}
+	}
+	if b, ok, berr := v.u.env.BundledProfile(v.appKey); berr != nil {
+		// 内置模板是编译进二进制的常量，读不出来说明构建坏了：重探也好不了，
+		// 所以不给「重试」，只把原因说清楚。描述不复用 i18n 的"请重新探测
+		// 生成"——这里恰恰是重探解决不了的场景（复审 P3）。
+		v.retry = nil
+		v.showErrorTitle(v.u.tr("ui.setup.bundled_error.title", nil), berr)
+		v.errPage.SetDescription(v.u.tr("ui.setup.bundled_error.desc", nil))
+		return false
+	} else if ok {
+		v.bundled = b
+		v.hasBundled = true
+	}
+	return true
+}
+
+// reprobeLegacy 是旧档案/读证据不完整横幅上的「重新探测」动作：在同一页就地
+// 重跑探测。确认前不写档案、不建实例；取消则完整回到原确认页。
+func (v *setupView) reprobeLegacy() {
+	if !v.beginLegacyReprobe() {
+		return
+	}
+	v.probe()
+}
+
+// beginLegacyReprobe 取快照、准备探测基线并置 flag；真正起探测由 probe() 做。
+// 拆开是为了让 GTK 用例能确定性地验证"取消 = 什么都没发生"，而不必在闸门里
+// 启动一次真实应用（真实链路由手动用例 TestGtkLegacyReprobeRealProbe 覆盖）。
+func (v *setupView) beginLegacyReprobe() bool {
+	if !v.canStartReprobe() {
+		return false
+	}
+	// 快照必须在任何字段被改动之前取：existing 下面会被换成 buildProfile 的结果。
+	v.reprobeSnap = v.captureConfirmSnapshot()
+	// 基线只在第一次重探时取：第二次起确认页已经是收窄后的档案，若跟着重算，
+	// 第一次报过的「旧路径不再隔离」会消失。保留原始基线才能让告警在整页
+	// 生命周期内持续成立（对抗复审 P2）；取消时按快照恢复同一份基线。
+	if v.reprobeBaseline == nil {
+		v.reprobeBaseline = core.BaselineIsolatedPaths(v.u.env.Resolver,
+			v.reprobeSnap.profile.Paths, v.reprobeSnap.cands)
+	}
+	// 上一轮的范围变化属于旧结果：探测中/错误页不再展示（确认页会按基线重算）。
+	v.reprobeDropped = nil
+	// 当前确认页看到的就是用户对非路径字段的选择；路径仍由本次探测重新定案。
+	v.existing = v.buildProfile()
+	v.hasExisting = true
+	if !v.prepareProbeBases(false) {
+		// bundled 读取失败会直接展示错误页；快照保留，取消可恢复确认页。
+		return false
+	}
+	v.reprobeFromConfirm = true
+	return true
 }
 
 func (u *ui) pushSetup(appKey, mode string, onClose func(bool)) bool {
@@ -282,6 +548,9 @@ func (v *setupView) build() {
 	v.banner = adw.NewBanner("")
 	v.banner.SetRevealed(false)
 	v.fixed.own(&v.banner.Widget)
+	// 旧档案/读证据不完整时横幅上的「重新探测」：横幅是固定控件，处理器只登记
+	// 一次；按钮文案为空时 libadwaita 会把按钮隐藏（实测 visible=false）。
+	v.fixed.banner(v.banner, v.reprobeLegacy)
 
 	v.header = adw.NewHeaderBar()
 	v.fixed.own(&v.header.Widget)
@@ -292,7 +561,8 @@ func (v *setupView) build() {
 	v.fixed.own(&v.confirmBtn.Widget)
 
 	// HeaderBar 的两个按钮活到页面结束：处理器登记一次，随 popped 注销。
-	v.fixed.button(v.cancelBtn, func() { v.finish(false) })
+	// 取消统一走 cancelAction：就地重探期间它是「取消探测并回到确认页」。
+	v.fixed.button(v.cancelBtn, v.cancelAction)
 	v.fixed.button(v.confirmBtn, func() { v.submit() })
 	v.header.PackStart(&v.cancelBtn.Widget)
 	v.header.PackEnd(&v.confirmBtn.Widget)
@@ -336,7 +606,9 @@ func (v *setupView) setState(s string) {
 	v.state = s
 	v.stack.SetVisibleChildName(s)
 	// 创建中是事务态：返回手势也要挡住（§6.1「关闭路径统一判 creating 后拒绝」）。
-	v.page.SetCanPop(s != "creating")
+	// 就地重探有快照（probing/error）时同样挡住返回手势——那一下应当"取消探测
+	// 并回到确认页"，不能把整页 pop 掉；drain 期间快照已清，允许用户直接离开。
+	v.page.SetCanPop(s != "creating" && v.reprobeSnap == nil)
 	v.confirmBtn.SetVisible(s == "confirm" || s == "error" || s == "creating")
 	v.confirmBtn.SetSensitive(true)
 	v.cancelBtn.SetSensitive(s != "creating")
@@ -379,6 +651,8 @@ func (v *setupView) setState(s string) {
 		v.confirmBtn.SetLabel(v.confirmLabel())
 		v.updateConfirmGate()
 	}
+	// 横幅文案与按钮随状态走：probing/creating/error 下按钮必须不可见。
+	v.syncReadsBanner()
 }
 
 // creatingLabel 区分"在写什么"：保存档案与创建实例耗时不同，用户需要知道
@@ -407,7 +681,8 @@ func (v *setupView) updateConfirmGate() {
 			n++
 		}
 	}
-	v.confirmBtn.SetSensitive(n > 0)
+	// drain 期间旧探测还持着全局写锁：确认按钮先灰着，等旧 idle 清 drain。
+	v.confirmBtn.SetSensitive(n > 0 && !v.reprobeDraining)
 }
 
 // start 决定这一页是直接确认（open/clone）还是先探测。
@@ -434,7 +709,7 @@ func (v *setupView) start() {
 			v.u.setProfileWarns(v.appKey, v.profile.Warnings)
 			v.setState("confirm")
 			v.renderConfirm()
-			v.showReadsBanner()
+			v.syncReadsBanner()
 			return
 		case errorKey(err) == "err.profile.not_found":
 			// 列表扫描与用户拨开关之间档案被删（另一个 CLI 执行了
@@ -454,26 +729,8 @@ func (v *setupView) start() {
 	// 重新配置/重新探测只重定案**路径**：既有档案的 env、extra_binds、
 	// isolate_runtime、audit、未知字段是用户的显式配置，探测产物里没有它们。
 	// 不先把它们收好，重建出来的档案会把它们整片抹掉（P1，复审发现）。
-	if p, err := v.u.env.LoadProfile(v.appKey); err == nil {
-		v.existing = p
-		v.hasExisting = true
-	} else if errorKey(err) != "err.profile.not_found" {
-		// 版本超前 / 档案损坏不是"没有档案"：继续探测会把这份档案覆盖掉
-		// （§5.5 要求拒绝加载并提示）。
-		v.showProfileRejected(err)
+	if !v.prepareProbeBases(true) {
 		return
-	}
-	if b, ok, berr := v.u.env.BundledProfile(v.appKey); berr != nil {
-		// 内置模板是编译进二进制的常量，读不出来说明构建坏了：重探也好不了，
-		// 所以不给「重试」，只把原因说清楚。描述不复用 i18n 的"请重新探测
-		// 生成"——这里恰恰是重探解决不了的场景（复审 P3）。
-		v.retry = nil
-		v.showErrorTitle(v.u.tr("ui.setup.bundled_error.title", nil), berr)
-		v.errPage.SetDescription(v.u.tr("ui.setup.bundled_error.desc", nil))
-		return
-	} else if ok {
-		v.bundled = b
-		v.hasBundled = true
 	}
 	v.probe()
 }
@@ -482,13 +739,20 @@ func (v *setupView) start() {
 // 会起 flatpak 子进程、OpenState 可能等锁 5 秒——任何一项放主线程，窗口
 // 都会在这几秒里画不出帧。
 func (v *setupView) probe() {
-	// pop 动画期间错误页上的「重试」仍可能被点到：页面已经 finish，再跑
-	// 一场探测会重新挂 overlay、起 dbus、甚至再拉起一次应用，而结果只会
-	// 被 done 检查丢掉。入口处挡掉（对抗复审 P3）。
-	if v.done {
+	// 同一时刻只允许一场探测：pop 动画期间的「重试」、drain 期间残留的横幅
+	// 信号都不该再起一场。probeEpoch 在这里自增，旧 goroutine 的迟到回调
+	// 全部按 epoch 丢弃（就地重探取消后页面仍然活着，只查 done 不够）。
+	if v.done || v.state == "probing" || v.probeInFlight || v.reprobeDraining {
 		return
 	}
+	v.probeEpoch++
+	epoch := v.probeEpoch
+	v.probeInFlight = true
 	v.setState("probing")
+	if v.probeHook != nil {
+		v.probeHook()
+		return
+	}
 	v.probeControl = &core.ProbeControl{}
 	v.probeToken = 0
 	v.finishRoundBtn.SetSensitive(false)
@@ -502,6 +766,13 @@ func (v *setupView) probe() {
 	ctx, cancel := context.WithCancel(context.Background())
 	v.cancel = cancel
 
+	// 起 goroutine 之前把输入固化成局部变量：被取消/作废的 goroutine 不能再读
+	// 主线程正在改的 existing/bundled/control（取消恢复后用户可以继续拨开关）。
+	existing, hasExisting := v.existing, v.hasExisting
+	bundled, hasBundled := v.bundled, v.hasBundled
+	control := v.probeControl
+	allowEmpty := v.mode == "setup" && !v.hasExisting
+
 	// 探测期间 Hold 住 GApplication：用户直接关窗时 use count 若归零，
 	// main 会在 Probe 的 defer 之前退出——overlay 没人卸载、setsid 出来的
 	// 应用也不会收到 SIGTERM。Release 在探测返回后的 idle 里做（P1，复审发现）。
@@ -510,17 +781,7 @@ func (v *setupView) probe() {
 	go func() {
 		fail := func(err error) {
 			v.u.goIdle(func(uintptr) bool {
-				v.release()
-				if v.done {
-					return false
-				}
-				if errors.Is(err, core.ErrCanceled) {
-					v.notifyCanceledScene(err)
-					v.finish(false)
-					return false
-				}
-				v.retry = v.retryAction(err)
-				v.showError(err)
+				v.handleProbeFailure(epoch, err)
 				return false
 			})
 		}
@@ -548,23 +809,26 @@ func (v *setupView) probe() {
 
 		// 写层可用性和主应用运行状态统一由 core.Probe 判定，失败不开目标应用。
 		hints := v.u.env.StaticHints(ctx, d)
-		cmdline := core.ProbeCommand(d.Exec, d.ExecArgs, v.existing, v.hasExisting)
+		cmdline := core.ProbeCommand(d.Exec, d.ExecArgs, existing, hasExisting)
 		res, fin, cands, prefilled, perr := v.u.env.ProbeWithRetry(ctx, v.appKey, core.ProbeOptions{
 			Command:     cmdline,
-			Control:     v.probeControl,
+			Control:     control,
 			LockFile:    hints.LockFiles,
 			StaticPaths: hints.Paths,
 			Progress: func(pp core.ProbeProgress) {
 				v.u.goIdle(func(uintptr) bool {
+					if v.done || epoch != v.probeEpoch {
+						return false
+					}
 					v.applyProbeProgress(seq, pp)
 					return false
 				})
 			},
 			OnReadsWarn: func(reason string) {
 				// 读证据不完整必须在探测过程中就告诉用户，而不是等确认页
-				// 落定后才补一条横幅（§11.1）。
+				// 落定后才补一条横幅（§11.1）。取消后的恢复页不能再收告警。
 				v.u.goIdle(func(uintptr) bool {
-					if v.done {
+					if v.done || v.state != "probing" || epoch != v.probeEpoch {
 						return false
 					}
 					v.addReadsWarn(reason)
@@ -575,7 +839,7 @@ func (v *setupView) probe() {
 				// 零写入 + 自重启证据：说明应用会被多启动两轮。写进独立的
 				// retryLabel，Progress 的进度更新不会把它冲掉。
 				v.u.goIdle(func(uintptr) bool {
-					if v.done || v.state != "probing" {
+					if v.done || v.state != "probing" || epoch != v.probeEpoch {
 						return false
 					}
 					v.retryLabel.SetText(v.u.tr("probe.retry.self_relaunch",
@@ -584,31 +848,82 @@ func (v *setupView) probe() {
 				})
 			},
 		}, core.ProbeFinalize{
-			Bundled:     v.bundled,
-			HasBundled:  v.hasBundled,
-			Existing:    v.existing,
-			HasExisting: v.hasExisting,
-			AllowEmpty:  v.mode == "setup" && !v.hasExisting,
+			Bundled:     bundled,
+			HasBundled:  hasBundled,
+			Existing:    existing,
+			HasExisting: hasExisting,
+			AllowEmpty:  allowEmpty,
 		})
 		v.u.goIdle(func(uintptr) bool {
-			v.release()
-			if v.done {
-				return false
-			}
-			if perr != nil {
-				if errors.Is(perr, core.ErrCanceled) {
-					v.notifyCanceledScene(perr)
-					v.finish(false)
-					return false
-				}
-				v.retry = v.retryAction(perr)
-				v.showError(perr)
-				return false
-			}
-			v.applyFinalized(res, fin, cands, prefilled)
+			v.handleProbeDone(epoch, perr, res, fin, cands, prefilled)
 			return false
 		})
 	}()
+}
+
+// handleProbeFailure 处理探测在启动阶段/回收阶段的失败（主线程）。epoch 是
+// 发起探测时领的号：取消或新一轮探测之后到达的失败一律只收尾、不改页面。
+func (v *setupView) handleProbeFailure(epoch uint64, err error) {
+	v.settleProbe()
+	if v.done || epoch != v.probeEpoch {
+		v.notifyCanceledIfAny(err)
+		return
+	}
+	if errors.Is(err, core.ErrCanceled) {
+		v.notifyCanceledScene(err)
+		v.finish(false)
+		return
+	}
+	v.retry = v.retryAction(err)
+	v.showError(err)
+}
+
+// handleProbeDone 处理后台探测的最终结果（主线程）。同一套 epoch 判据：
+// 被取消/被取代的结果不能把恢复后的确认页覆盖成错误页或新候选。
+func (v *setupView) handleProbeDone(epoch uint64, perr error, res core.ProbeResult,
+	fin core.Profile, cands []core.Candidate, prefilled int) {
+	v.settleProbe()
+	if v.done || epoch != v.probeEpoch {
+		v.notifyCanceledIfAny(perr)
+		return
+	}
+	if perr != nil {
+		if errors.Is(perr, core.ErrCanceled) {
+			v.notifyCanceledScene(perr)
+			v.finish(false)
+			return
+		}
+		v.retry = v.retryAction(perr)
+		v.showError(perr)
+		return
+	}
+	v.applyFinalized(res, fin, cands, prefilled)
+}
+
+// settleProbe 收尾一场探测。第一条语句必须是 release：取消后早退的 idle 也
+// 要真的 Release，否则 held 永远为 true，关窗后进程不退出。
+func (v *setupView) settleProbe() {
+	v.release()
+	v.probeInFlight = false
+	if v.done || v.u.closed {
+		// 页面/窗口已退场：只收事务，不碰已 Unref 的控件。
+		v.reprobeDraining = false
+		return
+	}
+	if v.reprobeDraining {
+		v.reprobeDraining = false
+		v.syncReadsBanner()
+		v.updateConfirmGate()
+	}
+}
+
+// notifyCanceledIfAny 只在页面还活着时提示取消现场（quarantine 里的公共目录
+// 写入要能被找到），页面退场后不再弹 toast。
+func (v *setupView) notifyCanceledIfAny(err error) {
+	if err == nil || v.done || v.u.closed || !errors.Is(err, core.ErrCanceled) {
+		return
+	}
+	v.notifyCanceledScene(err)
 }
 
 // hold 让进程在事务完成前不被"窗口关闭"结束：GUI 没有 daemon，窗口一销毁
@@ -639,15 +954,20 @@ func (v *setupView) applyFinalized(res core.ProbeResult, p core.Profile, cands [
 	v.keyringEvidence = res.KeyringEvidence
 	v.profile, v.cands, v.prefilled = p, cands, prefilled
 	v.u.setProfileWarns(v.appKey, p.Warnings)
+	// 降级横幅跟着当前展示的档案走：旧 strace 档案重探成功后不能残留。
+	v.degraded = p.ProbeMethod == "strace"
+	// 结果已落案：恢复点不再需要，快照清掉；基线保留到确认页结束——用户
+	// 拨动勾选时要按它重算范围变化（很小的一张路径表）。
+	v.reprobeSnap = nil
 	v.setState("confirm")
 	v.renderConfirm()
-	v.showReadsBanner()
+	v.syncReadsBanner()
 }
 
 // showDegraded describes an existing legacy strace profile, not a new fallback session.
 func (v *setupView) showDegraded() {
 	v.degraded = true
-	v.showReadsBanner()
+	v.syncReadsBanner()
 }
 
 // addReadsWarn 记一条读证据告警并立刻刷新横幅（去重，保持到达顺序）。
@@ -656,7 +976,7 @@ func (v *setupView) addReadsWarn(reason string) {
 		return
 	}
 	v.readsWarns = append(v.readsWarns, reason)
-	v.showReadsBanner()
+	v.syncReadsBanner()
 }
 
 // mergeWarnKeys 合并两组告警键并去重，保持先到顺序（探测告警在前，
@@ -676,15 +996,34 @@ func mergeWarnKeys(a, b []string) []string {
 	return out
 }
 
-// showReadsBanner 把降级原因与读证据告警拼成一条常驻横幅（§11.1：多条
-// 原因不能只显示最后一条）。
-func (v *setupView) showReadsBanner() {
-	parts := v.readsBannerParts()
-	if len(parts) == 0 {
+// showReadsBanner 已由 syncReadsBanner 取代：横幅不只是文案，还要按状态决定
+// 是否显示「重新探测」按钮，早退实现会留下过期按钮。
+//
+// refreshReprobeDropped 重算「旧隔离范围里本次不再覆盖的路径」。只在就地重探
+// 落案后的确认页有意义；用户拨动勾选会改变哪些路径仍被覆盖，所以每次重建
+// 与每次开关变化都要重算，文案不能承诺与实际落盘相反的结果。
+func (v *setupView) refreshReprobeDropped() {
+	if !v.reprobeFromConfirm {
+		v.reprobeDropped = nil
 		return
 	}
+	v.reprobeDropped = core.DroppedIsolatedPaths(v.u.env.Resolver,
+		v.reprobeBaseline, v.selectedCandidates())
+	v.syncReadsBanner()
+}
+
+// syncReadsBanner 把降级原因、读证据四态与告警拼成一条常驻横幅（§11.1：
+// 多条原因不能只显示最后一条），并同步决定「重新探测」按钮是否出现。
+func (v *setupView) syncReadsBanner() {
+	parts := v.readsBannerParts()
 	v.banner.SetTitle(strings.Join(parts, " · "))
-	v.banner.SetRevealed(true)
+	v.banner.SetRevealed(len(parts) > 0)
+	label := ""
+	if v.canStartReprobe() {
+		label = v.u.tr("ui.setup.reads.reprobe.action", nil)
+	}
+	// 空标签时 libadwaita 把 banner 内部按钮设为不可见，不是留一个空按钮。
+	v.banner.SetButtonLabel(label)
 }
 
 // readsBannerParts 是横幅的纯文本来源，便于在无 GTK 的单测里逐态断言。
@@ -722,7 +1061,16 @@ func (v *setupView) readsBannerParts() []string {
 		// 与 CLI 的 `credential_scope_narrowed` 对齐：告警键只说"范围收缩"，
 		// 用户还需要看到具体丢了哪条旧路径才能核对自动决策。
 		parts = append(parts, v.u.tr("ui.setup.reads.dropped",
-			map[string]any{"paths": strings.Join(v.profile.CredentialDropped, "、")}))
+			map[string]any{"paths": v.profile.CredentialDropped}))
+	}
+	// 就地重探的范围变化：旧档案路径整条失去隔离必须逐条可见，不能静默收窄。
+	// 只在确认页展示——探测中/错误页上的 dropped 属于上一轮结果，与本次无关。
+	if v.state == "confirm" && len(v.reprobeDropped) > 0 {
+		// 切片交给 i18n 渲染，分隔符跟界面语言走（英文界面不能出现「、」）。
+		parts = append(parts, v.u.tr("ui.setup.reads.reprobe_dropped", map[string]any{
+			"count": len(v.reprobeDropped),
+			"paths": v.reprobeDropped,
+		}))
 	}
 	return parts
 }
@@ -883,7 +1231,11 @@ func (v *setupView) renderConfirm() {
 		row.SetActive(c.Checked)
 		v.rows[i] = row
 		// 门禁只看「应用自身数据」的勾选数：单例行与缓存行不改变结论。
-		v.scope.switchRow(row, func() { v.updateConfirmGate() })
+		// 重探后的确认页还要按新勾选重算范围变化。
+		v.scope.switchRow(row, func() {
+			v.updateConfirmGate()
+			v.refreshReprobeDropped()
+		})
 		own.Add(&row.Widget)
 	}
 	if len(v.rows) == 0 {
@@ -1060,6 +1412,9 @@ func (v *setupView) renderConfirm() {
 	v.stack.SetVisibleChildName("confirm")
 	v.state = "confirm"
 	v.updateConfirmGate()
+	// 行与勾选都已就位：范围变化告警与横幅按钮按最终状态刷新一次。
+	v.refreshReprobeDropped()
+	v.syncReadsBanner()
 }
 
 // selectedCandidates 把用户在界面上的勾选回填进候选集。
@@ -1138,6 +1493,10 @@ func (v *setupView) buildProfile() core.Profile {
 func (v *setupView) submit() {
 	if v.done {
 		// 页面已在退场（取消/返回）：confirmation 动画里的点击不能再建实例。
+		return
+	}
+	if v.reprobeDraining || v.probeInFlight {
+		// 旧探测仍在回收并持着全局写锁：确认按钮本来是灰的，这里再挡一道。
 		return
 	}
 	if v.state == "error" {

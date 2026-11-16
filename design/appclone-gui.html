@@ -636,6 +636,7 @@
       <tr><td>确认按钮</td><td><span class="w">suggested-action</span>：创建分身（setup/reconfig/clone）/ 开启分身（open）/ 保存档案（rediscover）；<b>门禁只数「应用自身数据」</b>——只勾缓存或单例时仍禁用，否则会生成一个什么都不隔离的空档案；探测中与创建中该按钮不存在/不可用</td></tr>
       <tr><td>失败态的「重试」</td><td>恒可用——<b>不能沿用上一轮 confirm 的 disabled</b>。失败态只有「重试」与「取消」两条出路，一个点不动的重试等于让用户关窗口</td></tr>
       <tr><td>配置不可用横幅</td><td>对话框里另有一条 <span class="w">AdwBanner</span>：窗口顶部那条已被遮罩盖住。列表那条可「了解」收掉，<b>这条不能</b>——环境限制是事实，不是通知</td></tr>
+      <tr><td>旧档案就地重探</td><td>确认页读证据为 <code>""</code>/partial/unavailable 时，<b>open 入口</b>的横幅右侧给「重新探测」（<span class="w">AdwBanner.set_button_label</span>；空标签时 libadwaita 隐藏内部按钮，不是空按钮；FUSE 不可用、致命态、探测在飞/回收中时不给）。点击在同一页重跑，确认前不写档案、不建实例；取消按钮与 <b>Esc</b> = 回到原确认页（勾选与非路径开关原样恢复），不是关闭流程；落案后逐条报出「不再被勾选」的原隔离路径（本次未观察到、按公共/缓存规则改为共享，或用户取消勾选），基线按真实路径去重，第二次重探取消也保留首次基线（HTML 原型只模拟一次落案；二次重探取消保留基线与范围告警由 GTK 用例覆盖）</td></tr>
     </table>
     <div class="states">态：<span>probing</span><span>confirm</span><span>creating</span><span>error</span>　入口：<span>首次配置（无档案）</span><span>重新配置（档案失效）</span><span>开启分身（档案可用）</span><span>新建分身（详情页 ＋）</span><span>重新探测</span></div>
     入口标题必须点名当前在做哪件事：<b>从没配过</b>才叫「首次配置」（要跑探测），<b>配过但关掉了</b>叫「开启分身」（复用档案、跳过探测），
@@ -682,6 +683,15 @@ const apps = [
   /* 主实例正在运行：探测的第一道闸门就会挡住（最高频的首启失败） */
   { id:'obsidian', name:'Obsidian',    letter:'O', color:'#7c3aed',
     hasProfile:false, creatable:false, hostRunning:true, instances:[] },
+  /* 旧版本生成的档案：路径仍可用、可以直接开启，但档案里没有 read_trace。
+     确认页必须给出**就地重新探测**的入口——文案承诺了动作，就必须有按钮；
+     否则用户只能带着不完整的隔离范围一路点下去。probeMethod:'strace' 对应
+     旧版探测方式，重探成功后才升级为 overlay。 */
+  { id:'zhipu',    name:'智谱清言',    letter:'智', color:'#0ea5e9',
+    hasProfile:true,  creatable:true,  probeMethod:'strace', readTrace:'', instances:[],
+    /* 旧档案记过 ~/.zhipu，但本次探测没有观察到它：就地重探后必须在确认页
+       逐条报告「不再属于隔离范围」，不能静默收窄。 */
+    oldPaths:['~/.config/zhipu', '~/.local/share/zhipu', '~/.zhipu'] },
 ];
 
 /* 探测会失败的应用：用于演示 error 态（"没跟踪到任何写入"不生成空档案，方案设计 §6.3） */
@@ -735,6 +745,11 @@ const pathCandidates = {
     { path:'~/.config/notion-desktop',  chip:'config', checked:true,  observed:88, why:'应用配置目录 — 旧档案记的 ~/.config/Notion 已不存在' },
     { path:'~/.cache/notion-desktop',   chip:'cache',  locked:true, checked:false, observed:241, why:'缓存 — 不隔离（锁定）' },
   ],
+  zhipu: [
+    { path:'~/.config/zhipu',           chip:'config', checked:true,  observed:36, reads:0, why:'应用配置目录 — 旧档案只记录了写入，读证据缺失' },
+    { path:'~/.local/share/zhipu',      chip:'config', checked:true,  observed:214, reads:0, containsCredential:true, why:'应用数据目录 — 旧档案未覆盖登录态路径' },
+    { path:'~/.cache/zhipu',            chip:'cache',  locked:true, checked:false, observed:73, why:'缓存 — 不隔离（锁定）' },
+  ],
   obsidian: [
     { path:'~/.config/obsidian',        chip:'config', checked:true,  observed:19, why:'应用配置目录 — 建议隔离' },
     { path:'~/.cache/obsidian',         chip:'cache',  locked:true, checked:false, observed:74, why:'缓存 — 不隔离（锁定）' },
@@ -775,6 +790,23 @@ let dlgState = 'probing';
    --fork 一致；只有真正建实例的入口才显示，且每次打开对话框重置。 */
 let forkOn = false;
 let probeReason = 'no_writes';   // error 态的原因，决定文案；所有失败共用一句"探测失败"等于没告诉用户任何事
+/* 旧档案确认页横幅上的「重新探测」：这是"就地重探"，取消要回到确认页而不是
+   关闭对话框。flag 在完成、取消、关闭对话框三处都会清掉。 */
+let legacyProbeFromConfirm = false;
+/* 就地重探后旧档案里不再被新候选覆盖的路径。确认页必须逐条展示，不能静默收窄；
+   属于"上一轮结果"，新的探测开始/对话框关闭时清空。 */
+let legacyProbeDropped = [];
+function legacyPathCovered(covers, old) {
+  const norm = s => s.replace(/\/+$/, '');
+  const o = norm(old);
+  return covers.some(c => { const p = norm(c); return o === p || o.startsWith(p + '/'); });
+}
+function computeLegacyDropped(app) {
+  const covers = (pathCandidates[app.id] || [])
+    .filter(p => p.chip === 'config' && p.checked && !p.locked)
+    .map(p => p.path);
+  return (app.oldPaths || []).filter(o => !legacyPathCovered(covers, o));
+}
 let probeTimer = null, probeTick = null, createTimer = null;
 let foundCount = 0;
 let probeRound = 1, probeRoundStarted = 0, probePhase = 'preparing';
@@ -1035,6 +1067,15 @@ function startProbe(app) {
     /* 零写入不是成功：不生成空档案，走失败态 */
     if (probeFails.has(app.id) || target === 0) { dlgState = 'error'; probeReason = 'no_writes'; }
     else dlgState = 'confirm';
+    /* 就地重探落案：读证据从"旧档案"变成"本次探测"。真实 GUI 里这来自
+       ProbeResult.ReadTrace；稿子用固定值模拟，标志在成功落案时清掉。 */
+    if (legacyProbeFromConfirm && dlgState === 'confirm') {
+      app.readTrace = 'ok';
+      legacyProbeDropped = computeLegacyDropped(app);
+      legacyProbeFromConfirm = false;
+    }
+    /* 失败时保留 flag：错误页的取消仍要回到原确认页，「重试」成功后还要按
+       就地重探落案（否则会退回"旧档案"横幅并丢掉范围变化提示）。 */
     renderDialog();
   }, 1200);
 }
@@ -1142,12 +1183,21 @@ function renderDialog() {
   const rawRT = a.readTrace === undefined ? 'ok' : a.readTrace;
   const manual = probeManualFinish && PROBE_MODES.has(dlgMode);
   const rt = manual && rawRT !== 'unavailable' ? 'partial' : rawRT;
-  const readsBanner = (manual ? '<div class="banner soft inline show" data-banner="manual-finish">已主动结束本轮并保留已采集结果；尚未写入的数据可能未被覆盖。</div>' : '') + (rt === 'partial'
-    ? `<div class="banner soft inline show" data-banner="reads-partial">⚠ 本次读证据不完整，登录态可能未覆盖。确认前请核对带「登录态」标记的路径。</div>`
+  /* 读证据不完整（空/partial/unavailable）时，横幅文案承诺了「可重新探测」，
+     open 入口就必须给按钮；clone/rediscover/setup 入口不给（它们本来就重探，
+     或语义不是"补证据"）。 */
+  const reprobeBtn = dlgMode === 'open' && rt !== 'ok'
+    ? '<button type="button" id="btnLegacyReprobe">重新探测</button>' : '';
+  const droppedBanner = legacyProbeDropped.length
+    ? `<div class="banner soft inline show" data-banner="reads-reprobe-dropped">有 ${legacyProbeDropped.length} 条原先纳入隔离的路径现在不再被勾选（本次未观察到、已按公共/缓存规则改为共享，或被你取消勾选）：${legacyProbeDropped.join('、')}</div>`
+    : '';
+  const readsBanner = droppedBanner
+    + (manual ? '<div class="banner soft inline show" data-banner="manual-finish">已主动结束本轮并保留已采集结果；尚未写入的数据可能未被覆盖。</div>' : '') + (rt === 'partial'
+    ? `<div class="banner soft inline show" data-banner="reads-partial">⚠ 本次读证据不完整，登录态可能未覆盖。确认前请核对带「登录态」标记的路径。${reprobeBtn}</div>`
     : rt === 'unavailable'
-      ? `<div class="banner soft inline show" data-banner="reads-unavailable">⚠ 本次读证据不完整，登录态可能未覆盖。请至少勾选一条要隔离的路径。</div>`
+      ? `<div class="banner soft inline show" data-banner="reads-unavailable">⚠ 本次读证据不完整，登录态可能未覆盖。请至少勾选一条要隔离的路径。${reprobeBtn}</div>`
       : rt === ''
-        ? `<div class="banner soft inline show" data-banner="reads-legacy">旧档案，重新探测可获取读证据。</div>`
+        ? `<div class="banner soft inline show" data-banner="reads-legacy">旧档案，重新探测可获取读证据。${reprobeBtn}</div>`
         : `<div class="banner soft inline show" data-banner="reads-ok">读证据只覆盖 open/openat 观察到的路径；openat2 被移除、setuid 子进程等盲区不在其中。</div>`);
   const noHomeReads = a.noHomeReads
     ? `<div class="banner soft inline show" data-banner="no-home-reads" id="no-home-reads">本次没有观察到读取路径；登录态可能仍然未被覆盖。</div>`
@@ -1329,6 +1379,8 @@ function openDialog(app, mode) {
     : mode;
   $('#overlay').classList.add('open');
   forkOn = false;
+  legacyProbeDropped = [];
+  legacyProbeFromConfirm = false;
   /* 只有"从没配过"（setup）、"档案失效"（reconfig）、"重新探测"（rediscover）要真跑探测；
      open/clone 都复用现有档案——配过一次的应用每次重开都重跑探测是白花十秒到一分钟 */
   if (PROBE_MODES.has(dlgMode)) {
@@ -1338,6 +1390,18 @@ function openDialog(app, mode) {
     renderDialog();
   }
 }
+/* 「取消」的单一语义入口：对话框、遮罩、Esc 都走这里。就地重探期间取消 =
+   回到原确认页（什么都没发生），其余情况才是关闭整个流程。 */
+function cancelDialogFromUser() {
+  if (legacyProbeFromConfirm && (dlgState === 'probing' || dlgState === 'error')) {
+    stopProbeTimers();
+    legacyProbeFromConfirm = false;
+    dlgState = 'confirm';
+    renderDialog();
+    return;
+  }
+  closeDialog();
+}
 function closeDialog(force) {
   /* 没开着就什么都不做：Esc 在没有对话框时也会打到这里，无谓重建列表会丢滚动位置与焦点 */
   if (!$('#overlay').classList.contains('open')) return;
@@ -1345,6 +1409,8 @@ function closeDialog(force) {
      否则会留下"档案写了、实例没建成"的半成品。事务完成由内部传 force 关 */
   if (dlgState === 'creating' && !force) return;
   stopProbeTimers();
+  legacyProbeFromConfirm = false;
+  legacyProbeDropped = [];
   $('#overlay').classList.remove('open');
   /* tab 高亮跟实际可见屏走：从列表点亮开关进探测、再取消时仍应停在列表，
      不能因为 currentApp 非空就把高亮丢到屏2（那会与可见内容不符） */
@@ -1486,7 +1552,15 @@ document.addEventListener('click', e => {
     return;
   }
   /* 对话框 */
-  if (t.closest('#dlgCancel') || t.id === 'overlay') { closeDialog(); return; }
+  if (t.closest('#btnLegacyReprobe')) {
+    /* 就地重探：保持 open 模式、留在同一页；取消回到确认页而不是关掉流程。
+       上一轮的范围变化告警属于旧结果，重新探测时先收起，落案后重算。 */
+    legacyProbeFromConfirm = true;
+    legacyProbeDropped = [];
+    startProbe(currentApp);
+    return;
+  }
+  if (t.closest('#dlgCancel') || t.id === 'overlay') { cancelDialogFromUser(); return; }
   if (t.closest('#dlgConfirm')) {
     if (dlgState === 'error') { startProbe(currentApp); return; }   // error 态的唯一主操作是重试
     if (dlgState === 'creating') return;                            // 重复提交：不得建出两个实例
@@ -1581,11 +1655,12 @@ document.addEventListener('keydown', e => {
   if (e.key === 'Escape') {
     /* 三级语义，从最上层往下：
        ① 确认框开着 → 关确认框（等同「取消」，不改任何状态）
-       ② 探测页开着 → 关探测页（等同「取消探测」，契约是"什么都没发生"；creating 态在内部被拒）
+       ② 探测页开着 → 等同「取消探测」：就地重探回到原确认页，其余关闭探测页
+          （契约是"什么都没发生"；creating 态在内部被拒）
        ③ 都没有 → **不做任何导航**：Esc 不是"返回"，返回靠 HeaderBar 的后退按钮
           （AdwNavigationView 不响应 Esc；把 Esc 也做成返回，等于给"随手按 Esc"加一条退屏路径） */
     if ($('#alertOverlay').classList.contains('open')) { closeAlert(true); return; }
-    if ($('#overlay').classList.contains('open')) { closeDialog(); return; }
+    if ($('#overlay').classList.contains('open')) { cancelDialogFromUser(); return; }
     return;
   }
   if (e.key === 'Enter') {

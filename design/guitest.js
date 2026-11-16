@@ -1,4 +1,4 @@
-// 交互回归（82 项）：三屏 + 探测四态（probing/confirm/creating/error）+ 五入口 + 三处破坏性确认
+// 交互回归（91 项）：三屏 + 探测四态（probing/confirm/creating/error）+ 五入口 + 三处破坏性确认
 //                    + 门禁 + 搜索 + 横幅语义 + 空态可达性 + 运行/停止状态
 //                    + 读证据四态/锁定缓存行/credential 徽标/confirm-empty
 //                    + 登录状态（独立密钥环）：默认策略/隐含锁定/能力缺失/迁移提示
@@ -9,7 +9,7 @@ const path = require('path');
 const fs = require('fs');
 const { pathToFileURL } = require('url');
 
-const EXPECTED = 88;   // 断言总数；改动断言必须同步改这里（否则退出码永远是 1）
+const EXPECTED = 91;   // 断言总数；改动断言必须同步改这里（否则退出码永远是 1）
 
 function loadPuppeteer() {
   const cands = [
@@ -844,6 +844,83 @@ const pp = loadPuppeteer();
     });
     await click('#dlgCancel');
     return ok || '旧档案没有独立文案';
+  });
+
+  /* 旧档案在 open 确认页就地重探：横幅文案承诺了动作就必须有按钮；取消重探
+     回到原确认页（不关对话框），成功落案后横幅变成"读证据完整"、流程仍在确认页 */
+  await t('旧档案 open 确认页 → 横幅可就地重探，取消回确认页', async () => {
+    await showView('all');
+    await click('[data-sw="zhipu"]');
+    const arrived = await waitFor(() => !!document.querySelector('#btnLegacyReprobe'));
+    if (!arrived) return '旧档案确认页没有「重新探测」入口';
+    await click('#btnLegacyReprobe');
+    const probing = await waitFor(() => document.querySelector('#dlgBody')?.textContent.includes('正在跟踪'));
+    await click('#dlgCancel');
+    const back = await waitFor(() => document.querySelector('#overlay').classList.contains('open')
+      && !!document.querySelector('#btnLegacyReprobe')
+      && !document.querySelector('#dlgBody')?.textContent.includes('正在跟踪'));
+    await click('#btnLegacyReprobe');
+    const landed = await waitFor(() => !!document.querySelector('[data-banner="reads-ok"]')
+      && !document.querySelector('[data-banner="reads-legacy"]'), 6000);
+    const stillOpen = await ev(() => document.querySelector('#overlay').classList.contains('open')
+      && document.querySelector('#dlgConfirm').textContent.includes('开启分身'));
+    /* 旧档案里 ~/.zhipu 本次没观察到：必须逐条报告它不再被隔离，不能静默收窄 */
+    const dropped = await ev(() => {
+      const el = document.querySelector('[data-banner="reads-reprobe-dropped"]');
+      return !!el && el.textContent.includes('~/.zhipu');
+    });
+    await click('#dlgCancel');
+    return (probing && back && landed && stillOpen && dropped)
+      || '就地重探的入口/取消恢复/落案状态/范围变化提示不对';
+  });
+
+  /* partial/unavailable 同样是「读证据不完整」：open 确认页也必须给重探入口。
+     Esc 在探测中等于「取消重探」——回到原确认页，不关闭整个流程。 */
+  await t('读证据 partial/unavailable 的旧档案 → 也有就地重探入口，Esc 取消回确认页', async () => {
+    await showView('all');
+    await ev(() => { apps.find(a => a.id === 'zhipu').readTrace = 'partial'; });
+    await click('[data-sw="zhipu"]');
+    const partialBtn = await waitFor(() => !!document.querySelector('#btnLegacyReprobe'));
+    await click('#btnLegacyReprobe');
+    const probing = await waitFor(() => document.querySelector('#dlgBody')?.textContent.includes('正在跟踪'));
+    await page.keyboard.press('Escape');
+    const back = await waitFor(() => document.querySelector('#overlay').classList.contains('open')
+      && !!document.querySelector('[data-banner="reads-partial"]')
+      && !!document.querySelector('#btnLegacyReprobe'));
+    await click('#dlgCancel');
+    await ev(() => { apps.find(a => a.id === 'zhipu').readTrace = 'unavailable'; });
+    await showView('all');
+    await click('[data-sw="zhipu"]');
+    const unavailableBtn = await waitFor(() => !!document.querySelector('#btnLegacyReprobe')
+      && !!document.querySelector('[data-banner="reads-unavailable"]'));
+    await click('#dlgCancel');
+    await ev(() => { apps.find(a => a.id === 'zhipu').readTrace = ''; });
+    return (partialBtn && probing && back && unavailableBtn)
+      || 'partial/unavailable 的重探入口或 Esc 取消语义不对';
+  });
+
+  /* 失败路径同样是「取消 = 回原确认页」；错误页「重试」成功后仍按就地重探
+     落案，不能退回旧档案横幅、丢掉范围变化提示 */
+  await t('就地重探失败 → 取消回确认页；错误页重试成功 → 仍按重探落案', async () => {
+    await showView('all');
+    await ev(() => { apps.find(a => a.id === 'zhipu').readTrace = ''; probeFails.add('zhipu'); });
+    await click('[data-sw="zhipu"]');
+    const entry = await waitFor(() => !!document.querySelector('#btnLegacyReprobe'));
+    await click('#btnLegacyReprobe');
+    const failed = await waitFor(() => document.querySelector('#dlgBody')?.textContent.includes('没有可确认的路径'), 6000);
+    await click('#dlgCancel');
+    const back = await waitFor(() => document.querySelector('#overlay').classList.contains('open')
+      && !!document.querySelector('[data-banner="reads-legacy"]')
+      && !!document.querySelector('#btnLegacyReprobe'));
+    await click('#btnLegacyReprobe');
+    await waitFor(() => document.querySelector('#dlgBody')?.textContent.includes('没有可确认的路径'), 6000);
+    await ev(() => probeFails.delete('zhipu'));
+    await click('#dlgConfirm');   // error 态的唯一主操作是「重试」
+    const landed = await waitFor(() => !!document.querySelector('[data-banner="reads-ok"]')
+      && !!document.querySelector('[data-banner="reads-reprobe-dropped"]'), 6000);
+    await click('#dlgCancel');
+    await ev(() => { apps.find(a => a.id === 'zhipu').readTrace = ''; });
+    return (entry && failed && back && landed) || '失败后的取消/重试落案语义不对';
   });
 
   /* 升级后私有总线不再激活宿主 keyring：只有"已开私有总线、未开独立密钥环"的

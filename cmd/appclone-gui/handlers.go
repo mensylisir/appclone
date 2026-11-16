@@ -19,7 +19,7 @@ import (
 // 这不是内存泄漏，是运行一小时后必崩。
 //
 // 因此渲染路径只登记**处理器**（纯 Go，随页面重建自由增删），C 槽只由下面
-// 六个稳定回调占用：它们是 callbacks 的字段，地址在进程内恒定，注册一次后
+// 七个稳定回调占用：它们是 callbacks 的字段，地址在进程内恒定，注册一次后
 // 永不重新赋值。
 //
 // 这里容易写反的一个事实：puregotk 的 Connect* 以**变量地址**为键缓存
@@ -36,11 +36,15 @@ type callbacks struct {
 	// sizePrepFn is the sixth stable slot: a per-decode closure would consume
 	// one of purego's 2000 permanent callback slots per icon.
 	sizePrepFn func(gdkpixbuf.PixbufLoader, int32, int32)
+	// bannerFn is the seventh stable slot: AdwBanner 的按钮是确认页横幅上的
+	// 「重新探测」入口，但它随固定横幅只连接一次。
+	bannerFn func(adw.Banner)
 
 	mu      sync.Mutex
 	switchN map[uintptr]func()             // 开关行指针 → 处理器
 	action  map[uintptr]func()             // 按钮/可点行指针 → 处理器
 	dialog  map[uintptr]func(string)       // 对话框指针 → 处理器
+	banner  map[uintptr]func()             // banner 指针 → 处理器
 	idle    map[uintptr]func(uintptr) bool // idle 序号 → 任务
 	idleSeq uintptr
 	loaders map[uintptr]*iconLoadState // pixbuf loader 指针 → 解码状态
@@ -58,6 +62,7 @@ func newCallbacks() *callbacks {
 		switchN: map[uintptr]func(){},
 		action:  map[uintptr]func(){},
 		dialog:  map[uintptr]func(string){},
+		banner:  map[uintptr]func(){},
 		idle:    map[uintptr]func(uintptr) bool{},
 		loaders: map[uintptr]*iconLoadState{},
 	}
@@ -114,6 +119,11 @@ func newCallbacks() *callbacks {
 			loader.SetSize(sw, sh)
 		}
 	}
+	c.bannerFn = func(b adw.Banner) {
+		if fn := c.bannerHandler(b.GoPointer()); fn != nil {
+			fn()
+		}
+	}
 	c.idleFn = func(id uintptr) bool {
 		// 先摘掉再执行：任务里再排一个 idle 是正常用法，不能互相顶掉。
 		c.mu.Lock()
@@ -138,6 +148,12 @@ func (c *callbacks) actionHandler(ptr uintptr) func() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.action[ptr]
+}
+
+func (c *callbacks) bannerHandler(ptr uintptr) func() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.banner[ptr]
 }
 
 // loaderBegin/loaderEnd bracket one decode. The size-prepared callback looks the
@@ -214,6 +230,7 @@ func (c *callbacks) drop(keys []uintptr) {
 	for _, k := range keys {
 		delete(c.switchN, k)
 		delete(c.action, k)
+		delete(c.banner, k)
 	}
 	c.mu.Unlock()
 }
@@ -262,6 +279,15 @@ func (s *renderScope) row(r *adw.ActionRow, fn func()) {
 	s.c.onAction(ptr, fn)
 	s.keys = append(s.keys, ptr)
 	r.ConnectActivated(&s.c.rowFn)
+}
+
+func (s *renderScope) banner(b *adw.Banner, fn func()) {
+	ptr := b.GoPointer()
+	s.c.mu.Lock()
+	s.c.banner[ptr] = fn
+	s.c.mu.Unlock()
+	s.keys = append(s.keys, ptr)
+	b.ConnectButtonClicked(&s.c.bannerFn)
 }
 
 func (s *renderScope) close() {

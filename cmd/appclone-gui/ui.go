@@ -427,9 +427,9 @@ func (u *ui) buildWindow() {
 		}
 		if v := u.activeSetup; v != nil {
 			// 创建中是事务态：§6.1 要求 Esc 也不生效（半成品比多点一次更糟）。
-			if v.state != "creating" {
-				v.finish(false)
-			}
+			// 其余状态统一走 cancelAction：就地重探时是「取消探测并回到确认页」，
+			// 普通探测/确认页仍是取消整页。
+			v.cancelAction()
 		}
 		return true
 	}
@@ -549,6 +549,12 @@ func (u *ui) checkEnv() {
 					v.forkRow.SetActive(false)
 				}
 				v.forkRow.SetSensitive(!u.fuseBlocked)
+			}
+			// 横幅按钮的可用条件含 fuse 状态：自检结果变化后同步一次，否则
+			// 环境从不可用恢复时按钮要等到下一次状态切换才出现。
+			if v := u.activeSetup; v != nil {
+				v.syncReadsBanner()
+				v.updateConfirmGate()
 			}
 			if wasFatal != u.fatal {
 				// 只有可操作性变了才重建列表：每 30 秒无条件重建会打断滚动与焦点。
